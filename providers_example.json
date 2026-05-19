@@ -1,0 +1,7 @@
+{
+  "name": "NeuroGate API",
+  "model": "gpt-5.5",
+  "base_url": "https://api.107.172.62.211.sslip.io/v1",
+  "wire_api": "responses",
+  "model_reasoning_effort": "medium"
+}

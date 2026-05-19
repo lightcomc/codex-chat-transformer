@@ -1,0 +1,1561 @@
+#!/usr/bin/env python3
+"""
+Codex Chat Transformer — migrates sessions between model_provider types.
+
+When you switch Codex from subscription (openai) to API key (custom provider),
+old sessions become invisible because the UI filters by model_provider.
+
+This tool:
+  1. Creates a full backup (DB + JSONL files)
+  2. Updates model_provider in state_5.sqlite (threads table)
+  3. Updates model_provider in JSONL rollout files (session_meta events)
+
+Usage:
+  python codex_chat_transformer.py --from openai --to MyProvider [--dry-run] [--thread ID]
+  python codex_chat_transformer.py --from MyProvider --to openai [--dry-run]
+  python codex_chat_transformer.py --list                          # show current breakdown
+  python codex_chat_transformer.py --restore BACKUP_DIR            # restore from backup
+  python codex_chat_transformer.py --pin-top 10 [--project DIR]   # pin N most recent threads
+  python codex_chat_transformer.py --unpin-all                     # clear all pins
+  python codex_chat_transformer.py --pin-list                      # show currently pinned threads
+  python codex_chat_transformer.py --backup                        # full ZIP backup of .codex
+  python codex_chat_transformer.py --restore-zip FILE              # restore from ZIP backup
+"""
+
+import argparse
+import base64
+import datetime
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import zipfile
+from pathlib import Path
+
+CODEX_DIR = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+STATE_DB = CODEX_DIR / "state_5.sqlite"
+GLOBAL_STATE = CODEX_DIR / ".codex-global-state.json"
+PROVIDERS_FILE = CODEX_DIR / "providers.json"
+SESSIONS_DIR = CODEX_DIR / "sessions"
+ARCHIVED_DIR = CODEX_DIR / "archived_sessions"
+
+
+def get_db_conn(exit_on_error=True):
+    if not STATE_DB.exists():
+        if exit_on_error:
+            print(f"ERROR: Database not found: {STATE_DB}")
+            sys.exit(1)
+        return None
+    conn = sqlite3.connect(str(STATE_DB))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def list_threads(conn):
+    """Show breakdown of threads by model_provider."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT model_provider, COUNT(*) as cnt,
+               MIN(created_at_ms) as earliest,
+               MAX(created_at_ms) as latest
+        FROM threads
+        GROUP BY model_provider
+        ORDER BY cnt DESC
+    """)
+    rows = cur.fetchall()
+
+    print("\n=== Thread breakdown by model_provider ===\n")
+    print(f"{'Provider':<20} {'Count':>6}  {'Earliest':<22}  {'Latest':<22}")
+    print("-" * 75)
+    for row in rows:
+        earliest = datetime.datetime.fromtimestamp(row["earliest"] / 1000).strftime("%Y-%m-%d %H:%M") if row["earliest"] else "N/A"
+        latest = datetime.datetime.fromtimestamp(row["latest"] / 1000).strftime("%Y-%m-%d %H:%M") if row["latest"] else "N/A"
+        print(f"{row['model_provider']:<20} {row['cnt']:>6}  {earliest:<22}  {latest:<22}")
+
+    # Also show non-archived vs archived
+    cur.execute("SELECT archived, COUNT(*) FROM threads GROUP BY archived")
+    arch_rows = cur.fetchall()
+    print()
+    for ar in arch_rows:
+        status = "archived" if ar[0] else "active"
+        print(f"  {status}: {ar[1]} threads")
+
+    # Show source breakdown
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN source IN ('cli', 'exec', 'vscode') THEN source
+                WHEN source LIKE '%subagent%' THEN 'subagent'
+                ELSE 'other'
+            END as src_group,
+            model_provider, COUNT(*) as cnt
+        FROM threads
+        GROUP BY src_group, model_provider
+        ORDER BY src_group, model_provider
+    """)
+    src_rows = cur.fetchall()
+    print(f"\n{'Source':<15} {'Provider':<20} {'Count':>6}")
+    print("-" * 45)
+    for row in src_rows:
+        print(f"{row[0]:<15} {row[1]:<20} {row[2]:>6}")
+
+
+def get_thread_stats():
+    """Return thread statistics for GUI consumption."""
+    conn = get_db_conn(exit_on_error=False)
+    if not conn:
+        return {}, 0, 0
+    cur = conn.cursor()
+    cur.execute("SELECT model_provider, COUNT(*) as cnt FROM threads GROUP BY model_provider")
+    stats = {row["model_provider"]: row["cnt"] for row in cur.fetchall()}
+    cur.execute("SELECT archived, COUNT(*) FROM threads GROUP BY archived")
+    active = 0
+    archived = 0
+    for row in cur.fetchall():
+        if row[0]:
+            archived = row[1]
+        else:
+            active = row[1]
+    conn.close()
+    return stats, active, archived
+
+
+def create_backup(from_provider):
+    """Create timestamped backup of DB and affected JSONL files."""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = CODEX_DIR / f"backup_{timestamp}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    # Backup DB
+    db_backup = backup_dir / "state_5.sqlite"
+    shutil.copy2(str(STATE_DB), str(db_backup))
+    # Also copy WAL and SHM if they exist
+    for ext in ("-shm", "-wal"):
+        src = str(STATE_DB) + ext
+        if os.path.exists(src):
+            shutil.copy2(src, str(db_backup) + ext)
+
+    # Backup providers.json
+    if PROVIDERS_FILE.exists():
+        shutil.copy2(str(PROVIDERS_FILE), str(backup_dir / "providers.json"))
+
+    print(f"Backup created: {backup_dir}")
+    return backup_dir
+
+
+def _get_timestamp_from_filename(filepath):
+    """Extract creation timestamp from rollout filename."""
+    fname = os.path.basename(filepath)
+    try:
+        ts_part = fname.replace("rollout-", "").split("-019")[0]
+        dt = datetime.datetime.strptime(ts_part, "%Y-%m-%dT%H-%M-%S")
+        return dt.timestamp()
+    except (ValueError, IndexError):
+        return None
+
+
+def _get_last_event_ts(filepath):
+    """Get timestamp of last event in a JSONL rollout file."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            last_line = None
+            for line in f:
+                line = line.strip()
+                if line:
+                    last_line = line
+            if not last_line:
+                return None
+            obj = json.loads(last_line)
+            ts = obj.get("timestamp", "")
+            if ts:
+                dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                return dt.timestamp()
+    except Exception:
+        pass
+    return None
+
+
+def transform_jsonl_file(filepath, from_provider, to_provider, dry_run=False, from_model=None, to_model=None):
+    """Update model_provider in a JSONL rollout file."""
+    if not filepath or not os.path.exists(filepath):
+        return False
+
+    # Normalize path (handle \\?\ prefix on Windows)
+    filepath = filepath.replace("\\\\?\\", "")
+    if not os.path.exists(filepath):
+        return False
+
+    # Save original timestamps before modification
+    orig_atime = os.path.getatime(filepath)
+    orig_mtime = os.path.getmtime(filepath)
+
+    changed = False
+    lines_out = []
+
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                lines_out.append(line)
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                lines_out.append(line)
+                continue
+
+            # Only update session_meta events with matching provider
+            if (obj.get("type") == "session_meta"
+                    and obj.get("payload", {}).get("model_provider") == from_provider):
+                obj["payload"]["model_provider"] = to_provider
+                if from_model and obj.get("payload", {}).get("model") == from_model:
+                    obj["payload"]["model"] = to_model
+                changed = True
+                lines_out.append(json.dumps(obj, ensure_ascii=False))
+            else:
+                lines_out.append(line)
+
+    if changed and not dry_run:
+        with open(filepath, "w", encoding="utf-8") as f:
+            for line in lines_out:
+                f.write(line + "\n")
+        # Restore original file timestamps
+        os.utime(filepath, (orig_atime, orig_mtime))
+
+    return changed
+
+
+def transform(conn, from_provider, to_provider, dry_run=False, thread_id=None, skip_pinned=False, from_model=None, to_model=None, project=None):
+    """Main transformation: update DB and JSONL files."""
+    if is_codex_running():
+        print("WARNING: Codex Desktop is running. Restart Codex after conversion.")
+    cur = conn.cursor()
+
+    pinned_ids = set()
+    if skip_pinned:
+        state = load_global_state()
+        pinned_ids = set(state.get("pinned-thread-ids", []))
+
+    # Find threads to transform
+    if thread_id:
+        cur.execute(
+            "SELECT id, rollout_path, title, model_provider FROM threads WHERE id = ? AND model_provider = ?",
+            (thread_id, from_provider),
+        )
+    elif project:
+        cur.execute(
+            "SELECT id, rollout_path, title, model_provider FROM threads WHERE model_provider = ? AND project LIKE ?",
+            (from_provider, f"%{project}%"),
+        )
+    else:
+        cur.execute(
+            "SELECT id, rollout_path, title, model_provider FROM threads WHERE model_provider = ?",
+            (from_provider,),
+        )
+
+    threads = cur.fetchall()
+    if not threads:
+        print(f"No threads found with model_provider='{from_provider}'"
+              + (f" and id='{thread_id}'" if thread_id else ""))
+        return
+
+    print(f"\nFound {len(threads)} threads with model_provider='{from_provider}'")
+    if dry_run:
+        print("[DRY RUN] No changes will be made.\n")
+
+    # Create backup (unless dry run)
+    backup_dir = None
+    if not dry_run:
+        backup_dir = create_backup(from_provider)
+
+    jsonl_updated = 0
+    jsonl_not_found = 0
+    jsonl_no_change = 0
+
+    for i, thread in enumerate(threads):
+        tid = thread["id"]
+        rollout = thread["rollout_path"]
+        title = (thread["title"] or "")[:60]
+
+        if tid in pinned_ids:
+            continue
+
+        if not dry_run:
+            # Update DB
+            cur.execute(
+                "UPDATE threads SET model_provider = ? WHERE id = ?",
+                (to_provider, tid),
+            )
+
+        # Update JSONL rollout file
+        if rollout:
+            changed = transform_jsonl_file(rollout, from_provider, to_provider, dry_run, from_model, to_model)
+            if changed:
+                jsonl_updated += 1
+            elif os.path.exists(rollout.replace("\\\\?\\", "")):
+                jsonl_no_change += 1
+            else:
+                jsonl_not_found += 1
+
+        # Also check archived_sessions
+        archived_pattern = f"rollout-*{tid}.jsonl"
+        if os.path.isdir(str(ARCHIVED_DIR)):
+            for fname in os.listdir(str(ARCHIVED_DIR)):
+                if tid in fname:
+                    fpath = os.path.join(str(ARCHIVED_DIR), fname)
+                    transform_jsonl_file(fpath, from_provider, to_provider, dry_run)
+
+        if (i + 1) % 50 == 0 or i == len(threads) - 1:
+            print(f"  Processed {i + 1}/{len(threads)} threads...")
+
+    skipped_pinned = sum(1 for t in threads if t["id"] in pinned_ids)
+    converted = [t for t in threads if t["id"] not in pinned_ids]
+
+    if not dry_run:
+        conn.commit()
+        print(f"\nDatabase updated: {len(converted)} threads changed from '{from_provider}' to '{to_provider}'"
+              + (f" ({skipped_pinned} pinned skipped)" if skipped_pinned else ""))
+        print(f"Backup saved to: {backup_dir}")
+    else:
+        print(f"\n[DRY RUN] Would change {len(converted)} threads from '{from_provider}' to '{to_provider}'"
+              + (f" ({skipped_pinned} pinned would be skipped)" if skipped_pinned else ""))
+
+    print(f"\nJSONL files: {jsonl_updated} updated, {jsonl_no_change} no change needed, {jsonl_not_found} not found")
+
+    # Verification: spot-check a few converted threads
+    if not dry_run and converted:
+        cur.execute(
+            "SELECT COUNT(*) as cnt FROM threads WHERE model_provider = ?",
+            (to_provider,),
+        )
+        total_to = cur.fetchone()["cnt"]
+        cur.execute(
+            "SELECT COUNT(*) as cnt FROM threads WHERE model_provider = ?",
+            (from_provider,),
+        )
+        remaining_from = cur.fetchone()["cnt"]
+        print(f"\nVerification: {total_to} threads now with '{to_provider}', {remaining_from} remaining with '{from_provider}'")
+
+    # Swap config and auth files to match target provider
+    if not dry_run:
+        swap_configs(to_provider)
+
+
+def is_codex_running():
+    """Check if Codex Desktop process is running."""
+    import platform
+    try:
+        if platform.system() == "Windows":
+            result = os.popen('tasklist /FI "IMAGENAME eq Codex.exe" /NH 2>NUL').read()
+            return "Codex.exe" in result
+        else:
+            result = os.popen("pgrep -f 'codex' 2>/dev/null").read()
+            return len(result.strip()) > 0
+    except Exception:
+        return False
+
+
+def _read_config_info():
+    """Read current config.toml provider/model info."""
+    cfg_path = CODEX_DIR / "config.toml"
+    info = {"provider": "?", "model": "?"}
+    if cfg_path.exists():
+        with open(str(cfg_path), "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("model_provider"):
+                    info["provider"] = s.split("=", 1)[1].strip().strip('"')
+                elif s.startswith("model") and "=" in s and not s.startswith("model_"):
+                    info["model"] = s.split("=", 1)[1].strip().strip('"')
+    return info
+
+
+def _read_auth_info():
+    """Read current auth.json info."""
+    auth_path = CODEX_DIR / "auth.json"
+    if not auth_path.exists():
+        return {"mode": "none", "has_key": False}
+    try:
+        with open(str(auth_path), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {
+            "mode": data.get("auth_mode", "unknown"),
+            "has_key": bool(data.get("OPENAI_API_KEY")),
+        }
+    except Exception:
+        return {"mode": "error", "has_key": False}
+
+
+def doctor():
+    """Read-only health check of Codex state."""
+    print("Codex Chat Transformer - Doctor")
+    print("-" * 50)
+
+    running = is_codex_running()
+    cfg = _read_config_info()
+    auth = _read_auth_info()
+
+    print(f"  Codex running:     {'YES (restart recommended)' if running else 'no'}")
+    print(f"  Active provider:   {cfg['provider']}")
+    print(f"  Active model:      {cfg['model']}")
+    print(f"  Auth mode:         {auth['mode']}")
+    print(f"  API key:           {'present' if auth['has_key'] else 'MISSING'}")
+    print(f"  DB:                {'OK' if STATE_DB.exists() else 'NOT FOUND'}")
+
+    # Provider profiles
+    prov_data = _load_providers()
+    profiles = prov_data.get("profiles", {})
+    active_saved = prov_data.get("active", "none")
+    print(f"  Saved profiles:    {len(profiles)}")
+    print(f"  Last active slot:  {active_saved}")
+
+    # Thread stats
+    if STATE_DB.exists():
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT model_provider, COUNT(*) as cnt FROM threads GROUP BY model_provider ORDER BY cnt DESC")
+        rows = cur.fetchall()
+        total_threads = sum(r[1] for r in rows)
+
+        print()
+        print(f"  Threads by provider ({total_threads} total):")
+        for row in rows:
+            marker = " <<<" if row[0] == cfg["provider"] else ""
+            print(f"    {row[0]:<25} {row[1]:>6}{marker}")
+
+        # DB ↔ JSONL consistency
+        cur.execute("SELECT id, rollout_path, model_provider FROM threads")
+        threads = cur.fetchall()
+        missing = 0
+        mismatch = 0
+        for t in threads:
+            rollout = t[1]
+            if not rollout:
+                missing += 1
+                continue
+            path = rollout.replace("\\\\?\\", "")
+            if not os.path.exists(path):
+                missing += 1
+                continue
+            # Check provider match in first session_meta
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        obj = json.loads(line)
+                        if obj.get("type") == "session_meta":
+                            jsonl_provider = obj.get("payload", {}).get("model_provider", "")
+                            if jsonl_provider and jsonl_provider != t[2]:
+                                mismatch += 1
+                            break
+            except Exception:
+                pass
+
+        # Pinned threads
+        state = load_global_state()
+        pinned = len(state.get("pinned-thread-ids", []))
+
+        print()
+        print(f"  DB <-> JSONL consistency:")
+        print(f"    Missing rollout:   {missing}")
+        print(f"    Provider mismatch: {mismatch}")
+        print(f"  Pinned threads:      {pinned}")
+        conn.close()
+    else:
+        print("\n  [!] Database not found - cannot check threads.")
+
+    print("-" * 50)
+    status = "OK" if not running and auth["has_key"] else "ISSUES DETECTED"
+    print(f"  Status: {status}")
+
+
+def _detect_provider_in_config(filepath):
+    """Read a config.toml and return the model_provider value (or 'openai' for default)."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("model_provider"):
+                    return stripped.split("=", 1)[1].strip().strip('"').strip("'")
+        return "openai"
+    except Exception:
+        return None
+
+
+def _detect_auth_mode(filepath):
+    """Read an auth.json and return the auth_mode value."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f).get("auth_mode", "unknown")
+    except Exception:
+        return None
+
+
+def _find_prefixed_variants(basename):
+    """Find all prefixed variants of a file (e.g., -config.toml, --config.toml)."""
+    variants = []
+    for prefix in ("-", "--"):
+        fpath = CODEX_DIR / f"{prefix}{basename}"
+        if fpath.exists():
+            variants.append(fpath)
+    return variants
+
+
+def swap_configs(target_provider):
+    """Swap config.toml and auth.json with their prefixed backups to match target provider."""
+    swaps_done = []
+
+    for basename, detect_fn in [
+        ("config.toml", _detect_provider_in_config),
+        ("auth.json", _detect_auth_mode),
+    ]:
+        active = CODEX_DIR / basename
+        if not active.exists():
+            continue
+
+        active_value = detect_fn(str(active))
+
+        # Check if active already matches target
+        if basename == "config.toml" and active_value == target_provider:
+            continue
+        if basename == "auth.json":
+            target_mode = "chatgpt" if target_provider == "openai" else "apikey"
+            if active_value == target_mode:
+                continue
+
+        # Find prefixed variants
+        variants = _find_prefixed_variants(basename)
+        if not variants:
+            continue
+
+        # Pick variant matching target
+        target_variant = None
+        for v in variants:
+            v_value = detect_fn(str(v))
+            if basename == "config.toml" and v_value == target_provider:
+                target_variant = v
+                break
+            elif basename == "auth.json":
+                target_mode = "chatgpt" if target_provider == "openai" else "apikey"
+                if v_value == target_mode:
+                    target_variant = v
+                    break
+
+        if not target_variant:
+            target_variant = variants[0]
+
+        # Swap: active -> tmp, variant -> active, tmp -> variant position
+        tmp_path = CODEX_DIR / f"{basename}.swapping"
+        os.rename(str(active), str(tmp_path))
+        os.rename(str(target_variant), str(active))
+        os.rename(str(tmp_path), str(target_variant))
+        swaps_done.append(basename)
+
+    if swaps_done:
+        print(f"Config files swapped: {', '.join(swaps_done)}")
+
+
+def restore_backup(backup_dir):
+    """Restore state_5.sqlite from a backup directory."""
+    backup_dir = Path(backup_dir)
+    db_backup = backup_dir / "state_5.sqlite"
+    if not db_backup.exists():
+        print(f"ERROR: No state_5.sqlite found in {backup_dir}")
+        sys.exit(1)
+
+    # Copy back
+    shutil.copy2(str(db_backup), str(STATE_DB))
+    for ext in ("-shm", "-wal"):
+        src = str(db_backup) + ext
+        dst = str(STATE_DB) + ext
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+        elif os.path.exists(dst):
+            os.remove(dst)
+
+    print(f"Restored state_5.sqlite from {backup_dir}")
+    print("NOTE: JSONL files were NOT restored (they may have been modified in-place).")
+    print("      If you need full rollback, restore the entire .codex/sessions/ directory manually.")
+
+
+def load_global_state():
+    """Load .codex-global-state.json."""
+    if not GLOBAL_STATE.exists():
+        print(f"ERROR: Global state not found: {GLOBAL_STATE}")
+        sys.exit(1)
+    with open(str(GLOBAL_STATE), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_global_state(state):
+    """Save .codex-global-state.json."""
+    with open(str(GLOBAL_STATE), "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def pin_top_threads(conn, n, project=None):
+    """Pin top N most recent active threads (optionally filtered by project cwd)."""
+    cur = conn.cursor()
+    query = """
+        SELECT id, title, model_provider, updated_at_ms
+        FROM threads
+        WHERE archived = 0 AND source IN ('cli', 'vscode', 'exec')
+    """
+    params = []
+    if project:
+        query += " AND cwd LIKE ?"
+        params.append(f"%{project}%")
+    query += " ORDER BY updated_at_ms DESC LIMIT ?"
+    params.append(n)
+
+    cur.execute(query, params)
+    threads = cur.fetchall()
+
+    if not threads:
+        print("No matching threads found.")
+        return
+
+    state = load_global_state()
+    pinned = set(state.get("pinned-thread-ids", []))
+    added = []
+
+    print(f"\nPinning top {len(threads)} most recent threads:\n")
+    for t in threads:
+        ts = datetime.datetime.fromtimestamp(t["updated_at_ms"] / 1000).strftime("%Y-%m-%d %H:%M") if t["updated_at_ms"] else "N/A"
+        marker = "  (already pinned)" if t["id"] in pinned else ""
+        print(f"  {ts}  [{t['model_provider']}]  {(t['title'] or '')[:55]}{marker}")
+        if t["id"] not in pinned:
+            pinned.add(t["id"])
+            added.append(t["id"])
+
+    if added:
+        state["pinned-thread-ids"] = list(pinned)
+        save_global_state(state)
+        print(f"\nPinned {len(added)} new threads (total pinned: {len(pinned)})")
+    else:
+        print("\nAll already pinned.")
+
+
+def unpin_all():
+    """Clear all pinned threads."""
+    state = load_global_state()
+    old_count = len(state.get("pinned-thread-ids", []))
+    state["pinned-thread-ids"] = []
+    save_global_state(state)
+    print(f"Cleared {old_count} pinned threads.")
+
+
+def list_pinned(conn):
+    """Show currently pinned threads with details."""
+    state = load_global_state()
+    pinned_ids = state.get("pinned-thread-ids", [])
+    if not pinned_ids:
+        print("No pinned threads.")
+        return
+
+    cur = conn.cursor()
+    print(f"\n=== Pinned threads ({len(pinned_ids)}) ===\n")
+    for tid in pinned_ids:
+        cur.execute("SELECT title, model_provider, updated_at_ms, cwd FROM threads WHERE id = ?", (tid,))
+        row = cur.fetchone()
+        if row:
+            ts = datetime.datetime.fromtimestamp(row["updated_at_ms"] / 1000).strftime("%Y-%m-%d %H:%M") if row["updated_at_ms"] else "N/A"
+            print(f"  {ts}  [{row['model_provider']}]  {(row['title'] or '')[:55]}")
+        else:
+            print(f"  {tid[:20]}...  (not found in DB)")
+
+
+def full_backup():
+    """Create a full ZIP backup of critical .codex files."""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_path = CODEX_DIR / f"codex_backup_{timestamp}.zip"
+
+    # Essential files to back up (relative to CODEX_DIR)
+    essential_files = [
+        "state_5.sqlite",
+        "state_5.sqlite-shm",
+        "state_5.sqlite-wal",
+        ".codex-global-state.json",
+        ".codex-global-state.json.bak",
+        "config.toml",
+        "--config.toml",
+        "-config.toml",
+        "auth.json",
+        "--auth.json",
+        "-auth.json",
+        "session_index.jsonl",
+        "models_cache.json",
+        "installation_id",
+        "version.json",
+        "AGENTS.md",
+        "providers.json",
+    ]
+
+    # Directories to include
+    dirs_to_include = [
+        "sessions",
+        "archived_sessions",
+        "sqlite",
+    ]
+
+    file_count = 0
+    total_bytes = 0
+
+    print(f"Creating full backup: {zip_path}")
+    print()
+
+    with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        # Add essential files
+        for fname in essential_files:
+            fpath = CODEX_DIR / fname
+            if fpath.exists():
+                arcname = f"codex/{fname}"
+                zf.write(str(fpath), arcname)
+                size = fpath.stat().st_size
+                total_bytes += size
+                file_count += 1
+                print(f"  + {fname} ({_fmt_size(size)})")
+
+        # Add directories
+        for dirname in dirs_to_include:
+            dirpath = CODEX_DIR / dirname
+            if not dirpath.exists():
+                continue
+            for fpath in dirpath.rglob("*"):
+                if fpath.is_file():
+                    arcname = f"codex/{fpath.relative_to(CODEX_DIR)}"
+                    zf.write(str(fpath), arcname)
+                    size = fpath.stat().st_size
+                    total_bytes += size
+                    file_count += 1
+            dir_size = sum(f.stat().st_size for f in dirpath.rglob("*") if f.is_file())
+            dir_files = sum(1 for f in dirpath.rglob("*") if f.is_file())
+            print(f"  + {dirname}/ ({dir_files} files, {_fmt_size(dir_size)})")
+
+    zip_size = zip_path.stat().st_size
+    print(f"\nDone: {file_count} files, {_fmt_size(total_bytes)} -> {_fmt_size(zip_size)} compressed")
+    print(f"Saved to: {zip_path}")
+    return zip_path
+
+
+def restore_from_zip(zip_path):
+    """Restore .codex from a ZIP backup."""
+    zip_path = Path(zip_path)
+    if not zip_path.exists():
+        print(f"ERROR: ZIP not found: {zip_path}")
+        sys.exit(1)
+
+    with zipfile.ZipFile(str(zip_path), "r") as zf:
+        names = zf.namelist()
+        # Find the codex/ prefix
+        prefix = ""
+        for n in names:
+            if n.endswith("state_5.sqlite"):
+                prefix = n.rsplit("state_5.sqlite", 1)[0]
+                break
+
+        print(f"Restoring from: {zip_path}")
+        print(f"Files in archive: {len(names)}")
+        print()
+
+        restored = 0
+        for name in names:
+            if name.endswith("/"):
+                continue
+            # Strip prefix to get relative path
+            rel = name[len(prefix):] if prefix else name
+            dest = CODEX_DIR / rel
+
+            # Create parent dirs
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            zf.extract(name, str(CODEX_DIR.parent))
+            restored += 1
+
+        print(f"Restored {restored} files.")
+        print("WARNING: Codex must be restarted to pick up changes.")
+
+
+def _fmt_size(n):
+    """Format bytes as human-readable size."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def fix_dates():
+    """Set file mtime to last event timestamp for all rollout files."""
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT rollout_path FROM threads WHERE rollout_path IS NOT NULL")
+
+    fixed = 0
+    failed = 0
+
+    for (rp,) in cur.fetchall():
+        rp = rp or ""
+        if rp.startswith("\\\\?"):
+            rp = rp[4:]
+        if not rp or not os.path.exists(rp):
+            continue
+        ts = _get_last_event_ts(rp)
+        if ts:
+            os.utime(rp, (ts, ts))
+            fixed += 1
+        else:
+            failed += 1
+
+    # Also fix archived sessions
+    if os.path.isdir(str(ARCHIVED_DIR)):
+        for fname in os.listdir(str(ARCHIVED_DIR)):
+            fpath = os.path.join(str(ARCHIVED_DIR), fname)
+            if os.path.isfile(fpath) and fname.endswith(".jsonl"):
+                ts = _get_last_event_ts(fpath)
+                if ts:
+                    os.utime(fpath, (ts, ts))
+                    fixed += 1
+                else:
+                    failed += 1
+
+    conn.close()
+    print(f"Fixed: {fixed} files (mtime = last message timestamp)")
+    print(f"Failed: {failed}")
+
+
+# ── Provider profiles management ──────────────────────────────────────────
+
+def _detect_provider_from_text(text):
+    """Get model_provider from TOML text."""
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("model_provider"):
+            return stripped.split("=", 1)[1].strip().strip('"').strip("'")
+    return "openai"
+
+
+def _extract_provider_config(config_text):
+    """Extract provider-specific parts from config.toml.
+    Returns (provider_name, provider_section_text, model_value)."""
+    provider_name = None
+    provider_section = []
+    model_value = None
+    in_section = False
+
+    for line in config_text.split("\n"):
+        stripped = line.strip()
+
+        if stripped.startswith("model_provider"):
+            provider_name = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+
+        if stripped.startswith("model") and "=" in stripped and not stripped.startswith("model_"):
+            model_value = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+
+        if stripped.startswith("[model_providers."):
+            in_section = True
+            provider_section.append(line)
+            continue
+
+        if in_section:
+            if stripped.startswith("[") and not stripped.startswith("[model_providers."):
+                in_section = False
+            else:
+                provider_section.append(line)
+
+    return provider_name, "\n".join(provider_section), model_value
+
+
+def _extract_named_section(config_text, provider_name):
+    """Extract a specific [model_providers.XXX] section by name.
+    Returns section text or empty string."""
+    sections = {}
+    current_name = None
+    current_lines = []
+    in_section = False
+
+    for line in config_text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("[model_providers."):
+            # Save previous section
+            if current_name is not None:
+                sections[current_name] = "\n".join(current_lines)
+            current_name = stripped[len("[model_providers."):-1].strip('"').strip("'")
+            current_lines = [line]
+            in_section = True
+            continue
+        if in_section:
+            if stripped.startswith("[") and not stripped.startswith("[model_providers."):
+                in_section = False
+                if current_name is not None:
+                    sections[current_name] = "\n".join(current_lines)
+                current_name = None
+            else:
+                current_lines.append(line)
+
+    if current_name is not None:
+        sections[current_name] = "\n".join(current_lines)
+
+    return sections.get(provider_name, "")
+
+
+def _merge_config(current_text, target_provider_name, target_provider_section, target_model=None, target_reasoning=None):
+    """Merge provider settings into current config, preserving all preferences.
+    Changes only: model_provider, model, model_reasoning_effort fields.
+    Updates [model_providers.<target>] section if provided.
+    Preserves ALL other [model_providers.*] sections."""
+    lines = current_text.split("\n")
+    out = []
+    target_section_written = False
+    in_provider_section = None
+    model_provider_written = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Replace model_provider line
+        if stripped.startswith("model_provider") and "=" in stripped:
+            out.append(f'model_provider = "{target_provider_name}"')
+            model_provider_written = True
+            continue
+
+        # Replace model line (top-level only)
+        if stripped.startswith("model") and "=" in stripped and not stripped.startswith("model_"):
+            if target_model:
+                out.append(f'model = "{target_model}"')
+            else:
+                out.append(line)
+            continue
+
+        # Replace or remove model_reasoning_effort line
+        if stripped.startswith("model_reasoning_effort") and "=" in stripped:
+            if target_reasoning:
+                out.append(f'model_reasoning_effort = "{target_reasoning}"')
+            # else: drop the line (no reasoning for target)
+            continue
+
+        # Detect [model_providers.XXX] section headers
+        if stripped.startswith("[model_providers."):
+            section_name = stripped[len("[model_providers."):-1].strip('"').strip("'")
+            if section_name == target_provider_name:
+                if target_provider_section:
+                    # Replace target provider section with new one
+                    in_provider_section = "target"
+                    if not target_section_written:
+                        out.append("")
+                        out.append(target_provider_section)
+                        out.append("")
+                        target_section_written = True
+                    continue
+                else:
+                    # No section provided — keep existing as-is
+                    in_provider_section = None
+                    out.append(line)
+                    continue
+            else:
+                # Keep other provider sections as-is
+                in_provider_section = "other"
+                out.append(line)
+                continue
+
+        if in_provider_section == "target":
+            # Skip old target section lines (we replaced it)
+            if stripped.startswith("[") and not stripped.startswith("[model_providers."):
+                in_provider_section = None
+                out.append(line)
+            continue
+
+        if in_provider_section == "other":
+            # Keep other provider section lines
+            if stripped.startswith("[") and not stripped.startswith("[model_providers."):
+                in_provider_section = None
+            out.append(line)
+            continue
+
+        out.append(line)
+
+    # If model_provider wasn't in file, add it
+    if not model_provider_written:
+        out.insert(0, f'model_provider = "{target_provider_name}"')
+
+    # If target section wasn't in file, append it
+    if not target_section_written and target_provider_section:
+        out.append("")
+        out.append(target_provider_section)
+
+    return "\n".join(out)
+
+def _load_providers():
+    """Load providers.json. Migrate old format profiles to new format."""
+    if not PROVIDERS_FILE.exists():
+        return {"profiles": {}, "active": None}
+    with open(str(PROVIDERS_FILE), "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Auto-migrate old format profiles
+    profiles = data.get("profiles", {})
+    changed = False
+    for name, prof in profiles.items():
+        if "config.toml" in prof and "provider_section" not in prof:
+            old_cfg = prof["config.toml"]
+            if old_cfg:
+                _, section, model_val = _extract_provider_config(old_cfg)
+                prof["provider_section"] = section or ""
+                prof["model"] = model_val or ""
+                changed = True
+            # Remove old field
+            del prof["config.toml"]
+
+    if changed:
+        _save_providers(data)
+
+    return data
+
+
+def _encode_secret(text):
+    if not text:
+        return text
+    return "b64:" + base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _decode_secret(text):
+    if not text or not text.startswith("b64:"):
+        return text
+    try:
+        return base64.b64decode(text[4:]).decode("utf-8")
+    except Exception:
+        return text
+
+
+def _save_providers(data):
+    """Save providers.json with b64 obfuscation for auth.json fields."""
+    out = json.loads(json.dumps(data))
+    for prof in out.get("profiles", {}).values():
+        auth = prof.get("auth.json")
+        if auth and not auth.startswith("b64:"):
+            prof["auth.json"] = _encode_secret(auth)
+    with open(str(PROVIDERS_FILE), "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+
+
+def _get_active_provider():
+    """Detect current active provider from config.toml."""
+    cfg_path = CODEX_DIR / "config.toml"
+    return _detect_provider_in_config(str(cfg_path)) or "openai"
+
+
+def _read_file_safe(filepath):
+    """Read file content, return None if not found."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def providers_list():
+    """Show all saved provider profiles."""
+    data = _load_providers()
+    active = _get_active_provider()
+    profiles = data.get("profiles", {})
+
+    if not profiles:
+        print("No provider profiles saved yet.")
+        print("Use --save-provider NAME to save current settings as a profile.")
+        return
+
+    print(f"\n=== Provider profiles ({len(profiles)}) ===\n")
+    print(f"  {'Active':<8}  {'Name':<20}  {'Auth mode':<12}  {'Saved':<20}")
+    print(f"  {'-'*8}  {'-'*20}  {'-'*12}  {'-'*20}")
+    for name, prof in profiles.items():
+        is_active = ">>>" if name == active else ""
+        auth_mode = prof.get("auth_mode", "?")
+        saved = prof.get("saved_at", "?")[:16]
+        print(f"  {is_active:<8}  {name:<20}  {auth_mode:<12}  {saved}")
+
+    print(f"\n  Current active: {active}")
+    if active not in profiles:
+        print(f"  [!] Active provider '{active}' is not saved. Use --save-provider {active}")
+
+
+def save_provider(name):
+    """Save current provider section + auth as a profile."""
+    data = _load_providers()
+    profiles = data.get("profiles", {})
+
+    cfg_content = _read_file_safe(CODEX_DIR / "config.toml")
+    auth_content = _read_file_safe(CODEX_DIR / "auth.json")
+
+    if not cfg_content:
+        print("ERROR: config.toml not found.")
+        sys.exit(1)
+
+    provider_name, provider_section, model_value = _extract_provider_config(cfg_content)
+    if not provider_name:
+        provider_name = "openai"
+    auth_mode = "unknown"
+    if auth_content:
+        try:
+            auth_mode = json.loads(auth_content).get("auth_mode", "unknown")
+        except Exception:
+            pass
+
+    profiles[name] = {
+        "model_provider": provider_name,
+        "model": model_value,
+        "auth_mode": auth_mode,
+        "provider_section": provider_section,
+        "auth.json": auth_content,
+        "saved_at": datetime.datetime.now().isoformat(),
+    }
+    data["profiles"] = profiles
+    data["active"] = provider_name
+    _save_providers(data)
+
+    print(f"Saved profile '{name}' (provider: {provider_name}, model: {model_value}, auth: {auth_mode})")
+
+
+def use_provider(name, skip_convert=False):
+    """Switch to a provider profile: swap config/auth + convert threads."""
+    if is_codex_running():
+        print("WARNING: Codex Desktop is running. Restart Codex after switching.")
+    data = _load_providers()
+    profiles = data.get("profiles", {})
+    active = _get_active_provider()
+
+    if name not in profiles:
+        print(f"ERROR: Profile '{name}' not found.")
+        print(f"Available: {', '.join(profiles.keys()) or 'none'}")
+        sys.exit(1)
+
+    prof = profiles[name]
+    target_provider = prof["model_provider"]
+
+    if target_provider == active:
+        print(f"Already using '{target_provider}'. No changes needed.")
+        return
+
+    # 1. Save current active provider back to its profile
+    if active not in profiles:
+        print(f"Auto-saving current provider '{active}' before switching...")
+        current_cfg = _read_file_safe(CODEX_DIR / "config.toml")
+        current_auth = _read_file_safe(CODEX_DIR / "auth.json")
+        if current_cfg:
+            _, section, model_val = _extract_provider_config(current_cfg)
+            profiles[active] = {
+                "model_provider": active,
+                "model": model_val,
+                "auth_mode": _detect_auth_mode(str(CODEX_DIR / "auth.json")) or "unknown",
+                "provider_section": section,
+                "auth.json": current_auth,
+                "saved_at": datetime.datetime.now().isoformat(),
+            }
+    else:
+        # Update existing profile with current files
+        current_cfg = _read_file_safe(CODEX_DIR / "config.toml")
+        current_auth = _read_file_safe(CODEX_DIR / "auth.json")
+        if current_cfg:
+            _, section, model_val = _extract_provider_config(current_cfg)
+            profiles[active]["provider_section"] = section
+            profiles[active]["model"] = model_val
+        if current_auth:
+            profiles[active]["auth.json"] = current_auth
+
+    # 2. Write target profile — merge into config.toml
+    print(f"\nSwitching: {active} -> {target_provider}")
+
+    target_section = prof.get("provider_section")
+    target_model = prof.get("model")
+    target_auth_content = prof.get("auth.json")
+
+    # Backward compat: if profile has old config.toml format, extract section from it
+    if not target_section:
+        old_cfg = prof.get("config.toml")
+        if old_cfg:
+            _, target_section, target_model = _extract_provider_config(old_cfg)
+
+    current_cfg = _read_file_safe(CODEX_DIR / "config.toml")
+    if current_cfg and target_section:
+        merged = _merge_config(current_cfg, target_provider, target_section, target_model)
+        with open(str(CODEX_DIR / "config.toml"), "w", encoding="utf-8") as f:
+            f.write(merged)
+        print(f"  config.toml: merged (provider: {target_provider}, all sections preserved)")
+    elif current_cfg:
+        # No section, just update fields
+        merged = _merge_config(current_cfg, target_provider, None, target_model)
+        with open(str(CODEX_DIR / "config.toml"), "w", encoding="utf-8") as f:
+            f.write(merged)
+        print(f"  config.toml: updated (provider: {target_provider})")
+
+    if target_auth_content:
+        with open(str(CODEX_DIR / "auth.json"), "w", encoding="utf-8") as f:
+            f.write(_decode_secret(target_auth_content))
+        auth_mode = prof.get("auth_mode", "?")
+        print(f"  auth.json: written (auth_mode: {auth_mode})")
+
+    data["active"] = target_provider
+    _save_providers(data)
+
+    # 3. Convert threads
+    if not skip_convert:
+        conn = get_db_conn()
+        try:
+            print()
+            transform(conn, active, target_provider, thread_id=None, skip_pinned=False)
+        finally:
+            conn.close()
+
+
+def detect_provider():
+    """Scan for unsaved provider configs in prefixed files."""
+    data = _load_providers()
+    profiles = data.get("profiles", {})
+    active = _get_active_provider()
+    found = []
+
+    for prefix in ("-", "--"):
+        for basename in ["config.toml", "auth.json"]:
+            fpath = CODEX_DIR / f"{prefix}{basename}"
+            if fpath.exists():
+                if prefix == "-" and basename == "config.toml":
+                    provider = _detect_provider_in_config(str(fpath))
+                    if provider and provider != active and provider not in profiles:
+                        found.append({"provider": provider, "file": f"{prefix}{basename}"})
+                elif prefix == "-" and basename == "auth.json":
+                    auth_mode = _detect_auth_mode(str(fpath))
+                    if auth_mode and auth_mode == "apikey" and active == "openai":
+                        pass  # expected
+
+    # Also check if current active is not saved
+    if active not in profiles:
+        found.append({"provider": active, "file": "config.toml (active, unsaved)"})
+
+    if not found:
+        print("No new providers detected.")
+        if profiles:
+            print(f"\nSaved profiles: {', '.join(profiles.keys())}")
+        print(f"Active: {active}")
+        return
+
+    print(f"\n=== Detected providers ===\n")
+    for item in found:
+        print(f"  Provider: {item['provider']}")
+        print(f"  Source:   {item['file']}")
+        print()
+
+    if active not in profiles:
+        print(f"Current provider '{active}' is not saved.")
+        print(f"Run: python codex_chat_transformer.py --save-provider {active}")
+
+
+def add_provider(json_path, api_key=None):
+    """Add a provider from a simple JSON file + optional API key."""
+    if json_path == "-":
+        raw = json.load(sys.stdin)
+    else:
+        p = Path(json_path)
+        if not p.exists():
+            print(f"ERROR: File not found: {json_path}")
+            sys.exit(1)
+        with open(str(p), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+    if not isinstance(raw, dict) or "name" not in raw or "base_url" not in raw:
+        print("ERROR: JSON must have 'name' and 'base_url' fields.")
+        print('Example: {"name": "MyProvider", "model": "gpt-5.5", "base_url": "https://...", "wire_api": "responses"}')
+        sys.exit(1)
+
+    name = raw["name"]
+    model = raw.get("model", "gpt-5.5")
+    base_url = raw["base_url"]
+    wire_api = raw.get("wire_api", "responses")
+    reasoning = raw.get("model_reasoning_effort", "")
+    personality = raw.get("personality", "")
+
+    key = api_key or raw.get("api_key", "")
+    if not key:
+        key = input(f"Enter API key for '{name}': ").strip()
+        if not key:
+            print("No API key provided. Profile saved without key.")
+
+    lines = [
+        f'model = "{model}"',
+        f'model_provider = "{name}"',
+    ]
+    if reasoning:
+        lines.append(f'model_reasoning_effort = "{reasoning}"')
+    if personality:
+        lines.append(f'personality = "{personality}"')
+    lines.append(f'\n[model_providers.{name}]')
+    lines.append(f'name = "{name}"')
+    lines.append(f'base_url = "{base_url}"')
+    lines.append(f'wire_api = "{wire_api}"')
+    config_text = "\n".join(lines) + "\n"
+
+    auth_text = ""
+    auth_mode = "unknown"
+    if key:
+        auth_text = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": key}, indent=2)
+        auth_mode = "apikey"
+
+    provider_section = f'[model_providers.{name}]\nname = "{name}"\nbase_url = "{base_url}"\nwire_api = "{wire_api}"'
+
+    data = _load_providers()
+    data.setdefault("profiles", {})[name] = {
+        "model_provider": name,
+        "model": model,
+        "auth_mode": auth_mode,
+        "provider_section": provider_section,
+        "auth.json": auth_text,
+        "saved_at": datetime.datetime.now().isoformat(),
+    }
+    _save_providers(data)
+    print(f"Added provider '{name}' (model: {model}, url: {base_url}, auth: {auth_mode})")
+
+
+def remove_provider(name):
+    """Remove a saved provider profile."""
+    data = _load_providers()
+    profiles = data.get("profiles", {})
+    if name not in profiles:
+        print(f"Profile '{name}' not found.")
+        return
+    del profiles[name]
+    data["profiles"] = profiles
+    _save_providers(data)
+    print(f"Removed profile '{name}'.")
+
+
+def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, reasoning=None):
+    """Edit a saved provider profile. Only updates fields that are provided."""
+    data = _load_providers()
+    profiles = data.get("profiles", {})
+    if name not in profiles:
+        print(f"Profile '{name}' not found.")
+        return
+
+    prof = profiles[name]
+
+    # Parse current provider_section
+    section_text = prof.get("provider_section", "")
+    if not section_text:
+        old_cfg = prof.get("config.toml", "")
+        if old_cfg:
+            _, section_text, _ = _extract_provider_config(old_cfg)
+
+    # Update individual fields in section
+    section_lines = section_text.split("\n") if section_text else []
+    new_section_lines = []
+    for sl in section_lines:
+        s = sl.strip()
+        if s.startswith("base_url") and "=" in s:
+            new_section_lines.append(f'base_url = "{base_url}"' if base_url else sl)
+        elif s.startswith("wire_api") and "=" in s:
+            new_section_lines.append(f'wire_api = "{wire_api}"' if wire_api else sl)
+        else:
+            new_section_lines.append(sl)
+
+    # If base_url/wire_api weren't in section, add them
+    if base_url and not any(l.strip().startswith("base_url") for l in new_section_lines):
+        new_section_lines.append(f'base_url = "{base_url}"')
+    if wire_api and not any(l.strip().startswith("wire_api") for l in new_section_lines):
+        new_section_lines.append(f'wire_api = "{wire_api}"')
+
+    new_section = "\n".join(new_section_lines)
+    prof["provider_section"] = new_section
+
+    if model:
+        prof["model"] = model
+    if reasoning is not None:
+        prof["model_reasoning_effort"] = reasoning
+        # Remove reasoning from section — it goes top-level via _merge_config
+        prof["provider_section"] = "\n".join(
+            l for l in new_section_lines if not l.strip().startswith("model_reasoning_effort")
+        )
+
+    if api_key:
+        auth_text = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": api_key}, indent=2)
+        prof["auth.json"] = auth_text
+        prof["auth_mode"] = "apikey"
+
+    profiles[name] = prof
+    data["profiles"] = profiles
+    _save_providers(data)
+
+    changes = []
+    if model: changes.append(f"model={model}")
+    if base_url: changes.append(f"url={base_url}")
+    if api_key: changes.append("key=***")
+    if wire_api: changes.append(f"wire_api={wire_api}")
+    if reasoning is not None: changes.append(f"reasoning={reasoning or 'default'}")
+    print(f"Updated provider '{name}': {', '.join(changes)}")
+
+    # If this is the active provider, also update config.toml
+    active = _get_active_provider()
+    if active == prof.get("model_provider", name):
+        cfg_path = CODEX_DIR / "config.toml"
+        cfg_text = _read_file_safe(str(cfg_path))
+        if cfg_text:
+            merged = _merge_config(cfg_text, prof.get("model_provider", name),
+                                   prof["provider_section"], prof.get("model"),
+                                   prof.get("model_reasoning_effort"))
+            with open(str(cfg_path), "w", encoding="utf-8") as f:
+                f.write(merged)
+            print(f"  config.toml updated (active provider)")
+
+
+def set_model(model_name):
+    """Change only the model in config.toml. No provider switch."""
+    cfg_path = CODEX_DIR / "config.toml"
+    cfg_text = _read_file_safe(str(cfg_path))
+    if not cfg_text:
+        print("ERROR: config.toml not found.")
+        return
+    lines = cfg_text.split("\n")
+    out = []
+    for line in lines:
+        s = line.strip()
+        if s.startswith("model") and "=" in s and not s.startswith("model_"):
+            out.append(f'model = "{model_name}"')
+        else:
+            out.append(line)
+    with open(str(cfg_path), "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+    print(f"Model changed to: {model_name}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Transform Codex chats between model_provider types"
+    )
+    parser.add_argument("--list", action="store_true", help="List thread breakdown by provider")
+    parser.add_argument("--from", dest="from_provider", help="Source model_provider (e.g., openai, MyProvider)")
+    parser.add_argument("--to", dest="to_provider", help="Target model_provider")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would change without modifying anything")
+    parser.add_argument("--skip-pinned", action="store_true", help="Skip pinned threads during transformation")
+    parser.add_argument("--thread", help="Transform only a specific thread ID")
+    parser.add_argument("--restore", metavar="BACKUP_DIR", help="Restore DB from a backup directory")
+    parser.add_argument("--pin-top", type=int, metavar="N", help="Pin top N most recent threads")
+    parser.add_argument("--project", help="Filter by project directory (used with --pin-top and --from/--to)")
+    parser.add_argument("--unpin-all", action="store_true", help="Clear all pinned threads")
+    parser.add_argument("--pin-list", action="store_true", help="Show currently pinned threads")
+    parser.add_argument("--backup", action="store_true", help="Create full ZIP backup of .codex")
+    parser.add_argument("--restore-zip", metavar="ZIP_FILE", help="Restore from ZIP backup")
+    parser.add_argument("--fix-dates", action="store_true", help="Set file mtimes to last message timestamp")
+    parser.add_argument("--providers", action="store_true", help="List saved provider profiles")
+    parser.add_argument("--save-provider", metavar="NAME", help="Save current config/auth as a provider profile")
+    parser.add_argument("--use-provider", metavar="NAME", help="Switch to a saved provider profile")
+    parser.add_argument("--detect-provider", action="store_true", help="Scan for unsaved provider configs")
+    parser.add_argument("--remove-provider", metavar="NAME", help="Remove a saved provider profile")
+    parser.add_argument("--add-provider", metavar="FILE", help="Add provider from JSON file (use - for stdin)")
+    parser.add_argument("--api-key", metavar="KEY", help="API key for --add-provider (prompts if omitted)")
+    parser.add_argument("--doctor", action="store_true", help="Read-only health check of Codex state")
+    parser.add_argument("--from-model", metavar="MODEL", help="Source model name for model mapping")
+    parser.add_argument("--to-model", metavar="MODEL", help="Target model name for model mapping")
+    parser.add_argument("--edit-provider", metavar="NAME", help="Edit a saved provider profile")
+    parser.add_argument("--set-model", metavar="MODEL", help="Set model (with --edit-provider or standalone)")
+    parser.add_argument("--set-url", metavar="URL", help="Set base_url for --edit-provider")
+    parser.add_argument("--set-key", metavar="KEY", help="Set API key for --edit-provider")
+    parser.add_argument("--set-wire-api", metavar="API", help="Set wire_api for --edit-provider")
+    parser.add_argument("--set-reasoning", metavar="LEVEL", help="Set reasoning effort (low/medium/high/xhigh) for --edit-provider")
+
+    args = parser.parse_args()
+
+    if args.restore:
+        restore_backup(args.restore)
+        return
+
+    if args.restore_zip:
+        restore_from_zip(args.restore_zip)
+        return
+
+    if args.backup:
+        full_backup()
+        return
+
+    if args.fix_dates:
+        fix_dates()
+        return
+
+    if args.providers:
+        providers_list()
+        return
+
+    if args.save_provider:
+        save_provider(args.save_provider)
+        return
+
+    if args.use_provider:
+        use_provider(args.use_provider)
+        return
+
+    if args.detect_provider:
+        detect_provider()
+        return
+
+    if args.remove_provider:
+        remove_provider(args.remove_provider)
+        return
+
+    if args.add_provider:
+        add_provider(args.add_provider, args.api_key)
+        return
+
+    if args.edit_provider:
+        edit_provider(args.edit_provider, args.set_model, args.set_url,
+                      args.set_key, args.set_wire_api, args.set_reasoning)
+        return
+
+    if args.set_model and not args.edit_provider:
+        set_model(args.set_model)
+        return
+
+    if args.doctor:
+        doctor()
+        return
+
+    conn = get_db_conn()
+
+    try:
+        if args.list:
+            list_threads(conn)
+            return
+
+        if args.pin_list:
+            list_pinned(conn)
+            return
+
+        if args.unpin_all:
+            unpin_all()
+            return
+
+        if args.pin_top:
+            pin_top_threads(conn, args.pin_top, args.project)
+            return
+
+        if not args.from_provider or not args.to_provider:
+            print("ERROR: --from and --to are required for transformation.")
+            print("Use --list to see available providers.")
+            print("\nExample:")
+            print("  python codex_chat_transformer.py --list")
+            print("  python codex_chat_transformer.py --from openai --to MyProvider --dry-run")
+            print("  python codex_chat_transformer.py --from openai --to MyProvider")
+            print("  python codex_chat_transformer.py --restore backup_YYYYMMDD_HHMMSS")
+            sys.exit(1)
+
+        if args.from_provider == args.to_provider:
+            print("ERROR: --from and --to must be different.")
+            sys.exit(1)
+
+        print(f"Transforming: {args.from_provider} -> {args.to_provider}"
+              + (f" (project: {args.project})" if args.project else ""))
+        transform(conn, args.from_provider, args.to_provider, args.dry_run, args.thread, args.skip_pinned,
+                  args.from_model, args.to_model, args.project)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

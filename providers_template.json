@@ -1,0 +1,8 @@
+{
+  "name": "MyProvider",
+  "model": "gpt-5.5",
+  "base_url": "https://api.example.com/v1",
+  "wire_api": "responses",
+  "model_reasoning_effort": "medium",
+  "personality": "pragmatic"
+}
