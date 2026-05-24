@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.3.0] — 2026-05-25
+
+### Multiplatform Sync & Git Safety / Мультиплатформенная синхронизация и безопасность Git
+- Case-insensitive path validation via `os.path.normcase` — mixed slashes, drive letter case on Windows / Регистронезависимая валидация путей — смешанные слеши, регистр диска на Windows
+- `check_git_dirty` uses `git rev-parse --is-inside-work-tree` instead of `.git` folder check — works in worktrees, submodules, monorepos / Проверка через git rev-parse вместо поиска .git — работает в worktrees, сабмодулях, монорепо
+- `get_git_metadata()` helper — extracts branch, SHA, origin URL via git CLI / Хелпер извлечения ветки, SHA, origin URL
+- SQLite sync fix: `INSERT OR IGNORE` + `UPDATE` in session upload handlers — prevents infinite auto-sync polling loop / Исправление SQLite: INSERT OR IGNORE + UPDATE — предотвращает бесконечный polling
+- `sandbox_policy` column now synced with sessions / Колонка sandbox_policy теперь синхронизируется
+- `conn.close()` wrapped in `finally` blocks in all DB operations / Закрытие conn обёрнуто в finally во всех DB-операциях
+
+### Worktree Recreation & Project Path Mapping / Воссоздание Worktree и маппинг путей проектов
+- `POST /api/recreate-worktree` — native `git worktree add` or `git checkout -f` on receiving machine / Нативное создание/выравнивание worktree на принимающей машине
+- Scenario A: worktree doesn't exist → `git worktree add <path> <sha>` from base repo / Сценарий А: worktree нет → создание из базового репо
+- Scenario B: worktree exists but stale → `git checkout -f <sha>` + file overlay / Сценарий Б: worktree устарел → переключение + накат файлов
+- `POST /api/project-mappings` / `GET /api/project-mappings` — save and recall local↔remote directory pairs / Сохранение связок локальных и удалённых директорий
+- Dashboard Files tab: separate Local and Remote project dir inputs with auto-fill from mappings / Раздельные поля локальной и удалённой директории с автозаполнением
+- Git mismatch warning banner when branches or commits differ between local and remote / Предупреждение при несовпадении веток/коммитов
+
+### Provider Edit Bugfixes / Исправления редактирования провайдеров
+- Provider rename now removes old `[model_providers.OldName]` section from TOML (was leaving duplicate) / Переименование теперь удаляет старую секцию из TOML (раньше оставался дубликат)
+- `edit_provider` CLI supports `--set-name` for renaming / CLI поддерживает переименование через --set-name
+- GUI updates config.toml correctly when active provider is renamed (checks both old and new name) / GUI корректно обновляет config.toml при переименовании активного провайдера
+- Reasoning effort is added to config.toml even when not previously present (was silently dropped) / Reasoning добавляется в config.toml даже если его там не было
+- `_remove_provider_section()` helper for clean TOML section removal / Хелпер для удаления секции из TOML
+
+### Tests / Тесты
+- 38 smoke tests (was 32) / 38 smoke-тестов (было 32)
+- New: case-insensitive paths, git metadata, project mappings + worktree, SQLite sync update, reasoning add-when-absent, provider rename / Новые: пути, git, маппинги, SQLite update, reasoning, rename
+
 ## [1.2.0] — 2026-05-24
 
 ### UDP Beacon + Trusted Devices (Pairing) / UDP Beacon + Доверенные устройства (Pairing)

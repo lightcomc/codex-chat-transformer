@@ -908,6 +908,31 @@ def _extract_named_section(config_text, provider_name):
     return sections.get(provider_name, "")
 
 
+def _remove_provider_section(text, provider_name):
+    """Remove a [model_providers.X] section from TOML text."""
+    lines = text.split("\n")
+    out = []
+    skip = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[model_providers."):
+            sec_name = stripped[len("[model_providers."):-1].strip('"').strip("'")
+            if sec_name == provider_name:
+                skip = True
+                continue
+            else:
+                skip = False
+                out.append(line)
+                continue
+        if skip:
+            if stripped.startswith("["):
+                skip = False
+                out.append(line)
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _merge_config(current_text, target_provider_name, target_provider_section, target_model=None, target_reasoning=None):
     """Merge provider settings into current config, preserving all preferences.
     Changes only: model_provider, model, model_reasoning_effort fields.
@@ -991,6 +1016,15 @@ def _merge_config(current_text, target_provider_name, target_provider_section, t
     if not target_section_written and target_provider_section:
         out.append("")
         out.append(target_provider_section)
+
+    # If reasoning was requested but line wasn't in file, add it after model
+    if target_reasoning and not any(
+        l.strip().startswith("model_reasoning_effort") for l in out
+    ):
+        for i, l in enumerate(out):
+            if l.strip().startswith("model ") and "=" in l.strip() and not l.strip().startswith("model_"):
+                out.insert(i + 1, f'model_reasoning_effort = "{target_reasoning}"')
+                break
 
     return "\n".join(out)
 
@@ -1336,7 +1370,7 @@ def remove_provider(name):
     print(f"Removed profile '{name}'.")
 
 
-def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, reasoning=None):
+def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, reasoning=None, new_name=None):
     """Edit a saved provider profile. Only updates fields that are provided."""
     data = _load_providers()
     profiles = data.get("profiles", {})
@@ -1345,6 +1379,8 @@ def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, 
         return
 
     prof = profiles[name]
+    old_provider_name = prof.get("model_provider", name)
+    final_name = new_name or name
 
     # Parse current provider_section
     section_text = prof.get("provider_section", "")
@@ -1353,12 +1389,16 @@ def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, 
         if old_cfg:
             _, section_text, _ = _extract_provider_config(old_cfg)
 
-    # Update individual fields in section
+    # Rebuild section with new name and values
     section_lines = section_text.split("\n") if section_text else []
     new_section_lines = []
     for sl in section_lines:
         s = sl.strip()
-        if s.startswith("base_url") and "=" in s:
+        if s.startswith("[model_providers."):
+            new_section_lines.append(f"[model_providers.{final_name}]")
+        elif s.startswith("name") and "=" in s:
+            new_section_lines.append(f'name = "{final_name}"')
+        elif s.startswith("base_url") and "=" in s:
             new_section_lines.append(f'base_url = "{base_url}"' if base_url else sl)
         elif s.startswith("wire_api") and "=" in s:
             new_section_lines.append(f'wire_api = "{wire_api}"' if wire_api else sl)
@@ -1373,45 +1413,58 @@ def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, 
 
     new_section = "\n".join(new_section_lines)
     prof["provider_section"] = new_section
+    prof["model_provider"] = final_name
 
     if model:
         prof["model"] = model
     if reasoning is not None:
         prof["model_reasoning_effort"] = reasoning
-        # Remove reasoning from section — it goes top-level via _merge_config
-        prof["provider_section"] = "\n".join(
-            l for l in new_section_lines if not l.strip().startswith("model_reasoning_effort")
-        )
 
     if api_key:
         auth_text = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": api_key}, indent=2)
         prof["auth.json"] = auth_text
         prof["auth_mode"] = "apikey"
 
-    profiles[name] = prof
+    # Handle rename: remove old key, add new
+    if new_name and new_name != name:
+        del profiles[name]
+    profiles[final_name] = prof
     data["profiles"] = profiles
     _save_providers(data)
 
     changes = []
+    if new_name and new_name != name: changes.append(f"name={new_name}")
     if model: changes.append(f"model={model}")
     if base_url: changes.append(f"url={base_url}")
     if api_key: changes.append("key=***")
     if wire_api: changes.append(f"wire_api={wire_api}")
     if reasoning is not None: changes.append(f"reasoning={reasoning or 'default'}")
-    print(f"Updated provider '{name}': {', '.join(changes)}")
+    print(f"Updated provider '{final_name}': {', '.join(changes)}")
 
-    # If this is the active provider, also update config.toml
+    # If this is the active provider (by old or new name), update config.toml
     active = _get_active_provider()
-    if active == prof.get("model_provider", name):
+    if active in (old_provider_name, final_name):
         cfg_path = CODEX_DIR / "config.toml"
         cfg_text = _read_file_safe(str(cfg_path))
         if cfg_text:
-            merged = _merge_config(cfg_text, prof.get("model_provider", name),
-                                   prof["provider_section"], prof.get("model"),
-                                   prof.get("model_reasoning_effort"))
+            # Remove old section if renamed
+            if new_name and new_name != name and old_provider_name != final_name:
+                cfg_text = _remove_provider_section(cfg_text, old_provider_name)
+            merged = _merge_config(cfg_text, final_name, prof["provider_section"],
+                                   prof.get("model"), prof.get("model_reasoning_effort"))
             with open(str(cfg_path), "w", encoding="utf-8") as f:
                 f.write(merged)
             print(f"  config.toml updated (active provider)")
+
+        # Convert chats when renaming active provider
+        if new_name and new_name != name and old_provider_name != final_name:
+            conn = get_db_conn()
+            if conn is not None:
+                try:
+                    print()
+                    transform(conn, old_provider_name, final_name)
+                finally:
+                    conn.close()
 
 
 def set_model(model_name):
@@ -1468,6 +1521,7 @@ def main():
     parser.add_argument("--set-key", metavar="KEY", help="Set API key for --edit-provider")
     parser.add_argument("--set-wire-api", metavar="API", help="Set wire_api for --edit-provider")
     parser.add_argument("--set-reasoning", metavar="LEVEL", help="Set reasoning effort (low/medium/high/xhigh) for --edit-provider")
+    parser.add_argument("--set-name", metavar="NAME", help="Rename provider (with --edit-provider)")
 
     # Sync arguments
     parser.add_argument("--sync-host", action="store_true", help="Start P2P sync server + Dashboard")
@@ -1520,7 +1574,8 @@ def main():
 
     if args.edit_provider:
         edit_provider(args.edit_provider, args.set_model, args.set_url,
-                      args.set_key, args.set_wire_api, args.set_reasoning)
+                      args.set_key, args.set_wire_api, args.set_reasoning,
+                      args.set_name)
         return
 
     if args.set_model and not args.edit_provider:

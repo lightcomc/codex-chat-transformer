@@ -110,6 +110,9 @@ python codex_chat_transformer.py --edit-provider MyProvider --set-key sk-new
 ```bash
 python codex_chat_transformer.py --edit-provider MyProvider --set-reasoning high
 ```
+```bash
+python codex_chat_transformer.py --edit-provider MyProvider --set-name NewName
+```
 
 Сменить модель (без переключения провайдера):
 ```bash
@@ -199,6 +202,10 @@ python codex_chat_transformer.py --sync-pull 192.168.1.60:8080 --sync-pin A7B3C2
 - Автоподбор порта (пробует 8080-8099)
 - UDP broadcast для автообнаружения в LAN
 - Проверка незакоммиченных изменений Git перед синхронизацией
+- **Воссоздание worktree**: нативный `git worktree add` на принимающей машине сохраняет изоляцию
+- **Маппинг путей проектов**: запоминает связки локальных и удалённых директорий
+- **Предупреждение Git mismatch**: алерт при несовпадении веток/коммитов между машинами
+- **Переименование провайдера**: `--edit-provider NAME --set-name NEW` обновляет TOML + providers.json
 - Автобекап перед каждой операцией записи
 
 ---
@@ -344,7 +351,7 @@ codex_chat_transformer.py    — CLI: конвертация, провайдер
 codex_manager_gui.py         — GUI: переключение, редактирование, смена модели, синхронизация (обёртка над CLI)
 codex_sync.py                — Движок P2P синхронизации: сервер, клиент, Dashboard, файлы, авторсинхронизация
 sync_tray.py                 — Виджет в системном трее (опционально, требует pystray + Pillow)
-test_smoke.py                — Smoke-тесты (32 тестов)
+test_smoke.py                — Smoke-тесты (38 тестов)
 codex_manager.cmd / .ps1     — Windows запускаторы
 codex_manager.sh             — Unix запускатор
 providers_template.json      — Шаблон провайдера

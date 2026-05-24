@@ -110,6 +110,9 @@ python codex_chat_transformer.py --edit-provider MyProvider --set-key sk-new
 ```bash
 python codex_chat_transformer.py --edit-provider MyProvider --set-reasoning high
 ```
+```bash
+python codex_chat_transformer.py --edit-provider MyProvider --set-name NewName
+```
 
 Change model (no provider switch):
 ```bash
@@ -199,6 +202,10 @@ Features:
 - Auto port selection (tries 8080-8099)
 - UDP broadcast for LAN discovery
 - Git dirty state check before file sync
+- **Worktree recreation**: native `git worktree add` on receiving machine preserves isolation
+- **Project path mapping**: remembers local↔remote directory pairs for auto-fill
+- **Git mismatch warning**: alerts when branches or commits differ between machines
+- **Provider rename**: `--edit-provider NAME --set-name NEW` updates TOML + providers.json
 - Auto-backup before every write operation
 
 ---
@@ -344,7 +351,7 @@ codex_chat_transformer.py    — CLI: conversion, providers, pin, backup, doctor
 codex_manager_gui.py         — GUI: switching, editing, model change, sync (CLI wrapper)
 codex_sync.py                — P2P sync engine: server, client, Dashboard, file sync, auto-sync
 sync_tray.py                 — System tray widget (optional, requires pystray + Pillow)
-test_smoke.py                — Smoke tests (32 tests)
+test_smoke.py                — Smoke tests (38 tests)
 codex_manager.cmd / .ps1     — Windows launchers
 codex_manager.sh             — Unix launcher
 providers_template.json      — Provider template

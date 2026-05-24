@@ -191,6 +191,20 @@ def test_merge_reasoning():
     assert "low" not in result, "old reasoning not removed"
 
 
+def test_merge_add_reasoning_when_absent():
+    """Reasoning line is added even when not present in original config."""
+    cfg = (
+        'model_provider = "A"\n'
+        'model = "gpt-5"\n'
+        "\n"
+        "[model_providers.A]\n"
+        'name = "A"\n'
+        'base_url = "https://a.com"\n'
+    )
+    result = ct._merge_config(cfg, "A", None, None, "high")
+    assert 'model_reasoning_effort = "high"' in result, "reasoning not added when absent"
+
+
 def test_merge_remove_reasoning():
     cfg = (
         'model_provider = "A"\n'
@@ -227,6 +241,38 @@ def test_edit_provider():
         assert "new.com" in p["provider_section"], "base_url not updated"
         assert "model_reasoning_effort" not in p["provider_section"], "reasoning should NOT be in section"
         assert p["model_reasoning_effort"] == "high", "reasoning not saved"
+        os.unlink(jf.name)
+    finally:
+        restore_providers(orig, tmp)
+
+
+def test_rename_provider():
+    orig, tmp = setup_temp_providers()
+    try:
+        jf = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+        json.dump(
+            {
+                "name": "OldName",
+                "model": "gpt-5",
+                "base_url": "https://old.com/v1",
+                "wire_api": "responses",
+            },
+            jf,
+        )
+        jf.close()
+        ct.add_provider(jf.name, "sk-test")
+
+        # Rename + change url
+        ct.edit_provider("OldName", base_url="https://new.com/v1",
+                         reasoning="medium", new_name="NewName")
+        data = ct._load_providers()
+        assert "OldName" not in data["profiles"], "old key should be removed"
+        assert "NewName" in data["profiles"], "new key should exist"
+        p = data["profiles"]["NewName"]
+        assert p["model_provider"] == "NewName", "model_provider not updated"
+        assert "new.com" in p["provider_section"], "base_url not updated"
+        assert "[model_providers.NewName]" in p["provider_section"], "section header not renamed"
+        assert p["model_reasoning_effort"] == "medium", "reasoning not preserved"
         os.unlink(jf.name)
     finally:
         restore_providers(orig, tmp)
@@ -626,6 +672,183 @@ def test_server_unpair_endpoint():
         codex_sync.stop_server(server)
 
 
+def test_case_insensitive_path_validation():
+    import codex_sync
+    assert codex_sync._validate_path("file.txt", "C:\\Project")
+    assert codex_sync._validate_path("Sub/file.txt", "C:\\Project")
+    assert codex_sync._validate_path("file.txt", "c:\\project")
+    assert not codex_sync._validate_path("../passwd", "C:\\Project")
+
+
+def test_get_git_metadata():
+    import codex_sync, subprocess, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        subprocess.run(["git", "init"], cwd=tmp, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp)
+        subprocess.run(["git", "config", "remote.origin.url", "https://github.com/test/repo.git"], cwd=tmp)
+        with open(os.path.join(tmp, "a.txt"), "w") as f:
+            f.write("test")
+        subprocess.run(["git", "add", "a.txt"], cwd=tmp)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp)
+        
+        branch, sha, origin_url = codex_sync.get_git_metadata(tmp)
+        assert branch in ("master", "main"), f"expected main/master branch, got {branch}"
+        assert len(sha) == 40, f"expected 40-char SHA, got {sha}"
+        assert origin_url == "https://github.com/test/repo.git", f"expected origin URL, got {origin_url}"
+        
+        is_git, is_dirty, dirty_files = codex_sync.check_git_dirty(tmp)
+        assert is_git, "should be git repo"
+        assert not is_dirty, "should be clean repo"
+        
+        with open(os.path.join(tmp, "a.txt"), "a") as f:
+            f.write("dirty")
+        is_git, is_dirty, dirty_files = codex_sync.check_git_dirty(tmp)
+        assert is_dirty, "should be dirty repo"
+        assert "a.txt" in dirty_files[0], "a.txt should be listed in dirty files"
+    finally:
+        def on_rm_error(func, path, exc_info):
+            import stat
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            except Exception:
+                pass
+        shutil.rmtree(tmp, onerror=on_rm_error)
+
+
+def test_project_path_mappings_and_worktree():
+    import codex_sync, threading, json, shutil
+    orig_db = codex_sync.STATE_DB
+    orig_trusted = codex_sync.TRUSTED_FILE
+    
+    tmp_dir = tempfile.mkdtemp()
+    codex_sync.STATE_DB = Path(tmp_dir) / "state_5.sqlite"
+    codex_sync.TRUSTED_FILE = Path(tmp_dir) / "trusted_devices.json"
+    
+    try:
+        server, pin, port = codex_sync.start_server(port=0)
+        actual_port = server.server_address[1]
+        codex_sync.SyncHandler.pin = pin
+        codex_sync.SyncHandler.server_port = actual_port
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+            body = json.dumps({"local_path": "C:\\Local", "remote_path": "D:\\Remote"})
+            conn.request("POST", "/api/project-mappings", body=body,
+                         headers={"Content-Type": "application/json", "Authorization": "Bearer " + pin})
+            resp = conn.getresponse()
+            data = json.loads(resp.read().decode("utf-8"))
+            conn.close()
+            assert resp.status == 200
+            assert data["status"] == "ok"
+            
+            conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+            conn.request("GET", "/api/project-mappings",
+                         headers={"Authorization": "Bearer " + pin})
+            resp = conn.getresponse()
+            data = json.loads(resp.read().decode("utf-8"))
+            conn.close()
+            assert resp.status == 200
+            assert "C:\\Local" in data["project_mappings"]
+            assert data["project_mappings"]["C:\\Local"] == "D:\\Remote"
+        finally:
+            codex_sync.stop_server(server)
+    finally:
+        codex_sync.STATE_DB = orig_db
+        codex_sync.TRUSTED_FILE = orig_trusted
+        shutil.rmtree(tmp_dir)
+
+
+def test_sqlite_sync_updates_existing():
+    import codex_sync, shutil, sqlite3
+    orig_db = codex_sync.STATE_DB
+    tmp_dir = tempfile.mkdtemp()
+    codex_sync.STATE_DB = Path(tmp_dir) / "state_5.sqlite"
+    
+    try:
+        conn = sqlite3.connect(str(codex_sync.STATE_DB))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT,
+                model_provider TEXT,
+                title TEXT,
+                created_at_ms INTEGER,
+                updated_at_ms INTEGER,
+                archived INTEGER,
+                source TEXT,
+                cwd TEXT,
+                git_branch TEXT,
+                git_sha TEXT,
+                git_origin_url TEXT,
+                sandbox_policy TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+        
+        meta = {
+            "id": "thread-123",
+            "model_provider": "openai",
+            "title": "Initial Title",
+            "created_at_ms": 1000,
+            "updated_at_ms": 1000,
+            "archived": False,
+            "source": "api",
+            "cwd": "C:\\Project",
+            "git_branch": "main",
+            "git_sha": "a" * 40,
+            "git_origin_url": "https://github.com/test",
+            "sandbox_policy": "{}"
+        }
+        
+        orig_sessions_dir = codex_sync.SESSIONS_DIR
+        codex_sync.SESSIONS_DIR = Path(tmp_dir) / "sessions"
+        
+        try:
+            codex_sync.SyncHandler._do_upload_session(None, meta, "")
+            
+            conn = sqlite3.connect(str(codex_sync.STATE_DB))
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM threads WHERE id = ?", ("thread-123",))
+            row = cur.fetchone()
+            assert row is not None
+            assert row["title"] == "Initial Title"
+            assert row["updated_at_ms"] == 1000
+            assert row["sandbox_policy"] == "{}"
+            conn.close()
+            
+            meta_updated = meta.copy()
+            meta_updated["title"] = "Updated Title"
+            meta_updated["updated_at_ms"] = 2000
+            meta_updated["sandbox_policy"] = '{"allowed": true}'
+            
+            codex_sync.SyncHandler._do_upload_session(None, meta_updated, "")
+            
+            conn = sqlite3.connect(str(codex_sync.STATE_DB))
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM threads WHERE id = ?", ("thread-123",))
+            row = cur.fetchone()
+            assert row is not None
+            assert row["title"] == "Updated Title"
+            assert row["updated_at_ms"] == 2000
+            assert row["sandbox_policy"] == '{"allowed": true}'
+            conn.close()
+            
+        finally:
+            codex_sync.SESSIONS_DIR = orig_sessions_dir
+            
+    finally:
+        codex_sync.STATE_DB = orig_db
+        shutil.rmtree(tmp_dir)
+
+
 # --- Run ---
 
 if __name__ == "__main__":
@@ -643,7 +866,9 @@ if __name__ == "__main__":
     test("transform() has project/from_model/to_model params", test_transform_signature)
     test("is_codex_running returns bool", test_is_codex_running)
     test("_merge_config handles reasoning effort", test_merge_reasoning)
+    test("_merge_config adds reasoning when absent", test_merge_add_reasoning_when_absent)
     test("edit_provider updates profile", test_edit_provider)
+    test("edit_provider rename + update", test_rename_provider)
     test("set_model changes config", test_set_model)
 
     # Sync tests
@@ -665,6 +890,10 @@ if __name__ == "__main__":
     test("server pairing endpoint (PIN exchange)", test_server_pairing_endpoint)
     test("server local-info (no auth)", test_server_local_info)
     test("server unpair endpoint (revoke token)", test_server_unpair_endpoint)
+    test("case-insensitive path validation", test_case_insensitive_path_validation)
+    test("get Git metadata and check dirty", test_get_git_metadata)
+    test("project path mappings and worktrees", test_project_path_mappings_and_worktree)
+    test("SQLite sync updates existing session", test_sqlite_sync_updates_existing)
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     sys.exit(1 if FAILED else 0)

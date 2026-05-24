@@ -110,6 +110,9 @@ python codex_chat_transformer.py --edit-provider MyProvider --set-key sk-new
 ```bash
 python codex_chat_transformer.py --edit-provider MyProvider --set-reasoning high
 ```
+```bash
+python codex_chat_transformer.py --edit-provider MyProvider --set-name NewName
+```
 
 更改模型（不切换提供商）：
 ```bash
@@ -199,6 +202,10 @@ python codex_chat_transformer.py --sync-pull 192.168.1.60:8080 --sync-pin A7B3C2
 - 自动端口选择（尝试 8080-8099）
 - UDP 广播用于局域网自动发现
 - 文件同步前检查 Git 未提交更改
+- **Worktree 重建**: 在接收机器上原生 `git worktree add` 保持隔离
+- **项目路径映射**: 记住本地↔远程目录对自动填充
+- **Git 不匹配警告**: 分支或提交不同时提醒
+- **提供商重命名**: `--edit-provider NAME --set-name NEW` 更新 TOML + providers.json
 - 每次写入操作前自动备份
 
 ---
@@ -344,7 +351,7 @@ codex_chat_transformer.py    — CLI：转换、提供商、固定、备份、�
 codex_manager_gui.py         — GUI：切换、编辑、更改模型、同步（CLI 封装）
 codex_sync.py                — P2P 同步引擎：服务器、客户端、Dashboard、文件同步、自动同步
 sync_tray.py                 — 系统托盘小组件（可选，需 pystray + Pillow）
-test_smoke.py                — 冒烟测试（32 个测试）
+test_smoke.py                — 冒烟测试（38 个测试）
 codex_manager.cmd / .ps1     — Windows 启动器
 codex_manager.sh             — Unix 启动器
 providers_template.json      — 提供商模板

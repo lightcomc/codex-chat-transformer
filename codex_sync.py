@@ -91,9 +91,10 @@ def find_free_port(start=8080, max_tries=20):
 
 
 def _validate_path(rel_path, base_dir):
-    base = os.path.realpath(base_dir)
-    resolved = os.path.realpath(os.path.join(base, rel_path))
-    return (resolved.startswith(base + os.sep) or resolved == base) and ".." not in Path(rel_path).parts
+    base = os.path.normcase(os.path.realpath(base_dir))
+    resolved = os.path.normcase(os.path.realpath(os.path.join(base_dir, rel_path)))
+    base_sep = os.path.normcase(base + os.sep)
+    return (resolved.startswith(base_sep) or resolved == base) and ".." not in Path(rel_path).parts
 
 
 def _check_rate_limit():
@@ -121,7 +122,7 @@ def _reset_rate_limit():
 
 def _load_trusted():
     if not TRUSTED_FILE.exists():
-        return {"server_id": secrets.token_hex(16), "server_name": socket.gethostname()[:30], "devices": {}}
+        return {"server_id": secrets.token_hex(16), "server_name": socket.gethostname()[:30], "devices": {}, "project_mappings": {}}
     try:
         with open(str(TRUSTED_FILE), "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -131,9 +132,11 @@ def _load_trusted():
             data["server_name"] = socket.gethostname()[:30]
         if "devices" not in data:
             data["devices"] = {}
+        if "project_mappings" not in data:
+            data["project_mappings"] = {}
         return data
     except Exception:
-        return {"server_id": secrets.token_hex(16), "server_name": socket.gethostname()[:30], "devices": {}}
+        return {"server_id": secrets.token_hex(16), "server_name": socket.gethostname()[:30], "devices": {}, "project_mappings": {}}
 
 
 def _save_trusted(data):
@@ -189,11 +192,17 @@ def _remove_trusted_token(token_hash):
 
 def check_git_dirty(project_dir):
     """Check if git working tree has uncommitted changes. Returns (is_git, is_dirty, files)."""
-    git_dir = os.path.join(os.path.realpath(project_dir), ".git")
-    if not os.path.exists(git_dir):
-        return False, False, []
     try:
         import subprocess
+        res = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=os.path.realpath(project_dir),
+            capture_output=True, text=True, timeout=5
+        )
+        is_git = (res.returncode == 0 and "true" in res.stdout.strip().lower())
+        if not is_git:
+            return False, False, []
+        
         result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=os.path.realpath(project_dir),
@@ -202,7 +211,51 @@ def check_git_dirty(project_dir):
         files = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
         return True, len(files) > 0, files
     except Exception:
-        return True, False, []
+        return False, False, []
+
+
+def get_git_metadata(project_dir):
+    """Get the current Git branch, SHA, and remote origin URL. Returns (branch, sha, origin_url)."""
+    try:
+        import subprocess
+        p_real = os.path.realpath(project_dir)
+        res = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=p_real, capture_output=True, text=True, timeout=5
+        )
+        if res.returncode != 0 or "true" not in res.stdout.strip().lower():
+            return "", "", ""
+        
+        # Branch
+        res_branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=p_real, capture_output=True, text=True, timeout=5
+        )
+        branch = res_branch.stdout.strip() if res_branch.returncode == 0 else ""
+        if branch == "HEAD":
+            res_symbolic = subprocess.run(
+                ["git", "symbolic-ref", "--short", "-q", "HEAD"],
+                cwd=p_real, capture_output=True, text=True, timeout=5
+            )
+            branch = res_symbolic.stdout.strip() if res_symbolic.returncode == 0 else "detached HEAD"
+            
+        # SHA
+        res_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=p_real, capture_output=True, text=True, timeout=5
+        )
+        sha = res_sha.stdout.strip() if res_sha.returncode == 0 else ""
+        
+        # Origin URL
+        res_origin = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=p_real, capture_output=True, text=True, timeout=5
+        )
+        origin_url = res_origin.stdout.strip() if res_origin.returncode == 0 else ""
+        
+        return branch, sha, origin_url
+    except Exception:
+        return "", "", ""
 
 
 def is_port_free(port):
@@ -297,12 +350,29 @@ def _get_sessions_list():
         cur.execute("""
             SELECT id, rollout_path, model_provider, title,
                    created_at_ms, updated_at_ms, archived, source, cwd,
-                   git_branch, git_sha, git_origin_url
+                   git_branch, git_sha, git_origin_url, sandbox_policy
             FROM threads
             ORDER BY updated_at_ms DESC
         """)
         rows = cur.fetchall()
         conn.close()
+        
+        # Build folder to cwds mapping for folder-fallback lookup
+        folder_to_cwds = {}
+        for r in rows:
+            cwd_val = (r["cwd"] or "").replace("\\\\?\\", "")
+            if not cwd_val:
+                continue
+            parts = cwd_val.replace("\\", "/").split("/")
+            is_wt = any(p == "worktrees" and i > 0 and parts[i - 1] == ".codex" for i, p in enumerate(parts))
+            if not is_wt and parts:
+                folder_name = parts[-1]
+                if folder_name:
+                    if folder_name not in folder_to_cwds:
+                        folder_to_cwds[folder_name] = []
+                    if cwd_val not in folder_to_cwds[folder_name]:
+                        folder_to_cwds[folder_name].append(cwd_val)
+
         result = []
         for r in rows:
             has_rollout = bool(r["rollout_path"]) and os.path.exists(
@@ -314,10 +384,49 @@ def _get_sessions_list():
                 p == "worktrees" and i > 0 and parts[i - 1] == ".codex"
                 for i, p in enumerate(parts)
             ) if cwd_val else False
+            
+            real_cwd = cwd_val
+            local_worktree_path = ""
+            if is_worktree and cwd_val:
+                # Resolve worktree components: id and project name
+                wt_id = ""
+                project_name = ""
+                for i, p in enumerate(parts):
+                    if p == "worktrees" and i > 0 and parts[i - 1] == ".codex" and i + 2 < len(parts):
+                        wt_id = parts[i + 1]
+                        project_name = parts[i + 2]
+                        break
+                if wt_id and project_name:
+                    local_worktree_path = str(CODEX_DIR / "worktrees" / wt_id / project_name)
+                
+                resolved_base = False
+                # 1. Parse sandbox policy
+                policy_str = r.get("sandbox_policy")
+                if policy_str:
+                    try:
+                        policy_data = json.loads(policy_str)
+                        roots = policy_data.get("writable_roots", [])
+                        for root in roots:
+                            root_clean = root.replace("\\\\?\\", "")
+                            # Look for root that does not contain .codex and doesn't end with .git
+                            if ".codex" not in root_clean.replace("\\", "/") and not root_clean.endswith(".git") and not root_clean.endswith(".git/"):
+                                real_cwd = root_clean
+                                resolved_base = True
+                                break
+                    except Exception:
+                        pass
+                
+                # 2. Fallback to folder name matching other threads
+                if not resolved_base and project_name:
+                    if project_name in folder_to_cwds and folder_to_cwds[project_name]:
+                        real_cwd = folder_to_cwds[project_name][0]
+
             result.append({
                 "id": r["id"],
                 "title": (r["title"] or "")[:80],
                 "cwd": cwd_val,
+                "real_cwd": real_cwd,
+                "local_worktree_path": local_worktree_path,
                 "model_provider": r["model_provider"] or "",
                 "created_at_ms": r["created_at_ms"],
                 "updated_at_ms": r["updated_at_ms"],
@@ -328,6 +437,7 @@ def _get_sessions_list():
                 "git_sha": r["git_sha"] or "",
                 "git_origin_url": r["git_origin_url"] or "",
                 "is_worktree": is_worktree,
+                "sandbox_policy": r["sandbox_policy"] or "",
             })
         return result
     except Exception:
@@ -636,6 +746,8 @@ class SyncHandler(BaseHTTPRequestHandler):
             self._handle_repo_hashes(params)
         elif path == "/api/trusted":
             self._handle_list_trusted()
+        elif path == "/api/project-mappings":
+            self._handle_get_project_mappings()
         elif path == "/api/scan-beacons":
             self._handle_scan_beacons()
         else:
@@ -683,6 +795,10 @@ class SyncHandler(BaseHTTPRequestHandler):
             self._handle_unpair()
         elif path == "/api/server-name":
             self._handle_set_server_name()
+        elif path == "/api/project-mappings":
+            self._handle_save_project_mapping()
+        elif path == "/api/recreate-worktree":
+            self._handle_recreate_worktree()
         else:
             self._send_json({"error": "not_found"}, status=404)
 
@@ -745,6 +861,10 @@ class SyncHandler(BaseHTTPRequestHandler):
             result["git"] = True
             result["git_dirty"] = is_dirty
             result["git_dirty_count"] = len(dirty_files)
+            branch, sha, origin_url = get_git_metadata(dir_path)
+            result["git_branch"] = branch
+            result["git_sha"] = sha
+            result["git_origin_url"] = origin_url
         self._send_json(result)
 
     # ── Pairing handlers ────────────────────────────────────────────────
@@ -826,6 +946,113 @@ class SyncHandler(BaseHTTPRequestHandler):
             return
         _set_server_name(name)
         self._send_json({"status": "ok", "server_name": name})
+
+    def _handle_get_project_mappings(self):
+        trusted = _load_trusted()
+        self._send_json({"project_mappings": trusted.get("project_mappings", {})})
+
+    def _handle_save_project_mapping(self):
+        raw = self._read_body()
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._send_json({"error": "invalid json"}, status=400)
+            return
+        local_path = req.get("local_path", "").strip()
+        remote_path = req.get("remote_path", "").strip()
+        if not local_path:
+            self._send_json({"error": "local_path required"}, status=400)
+            return
+        trusted = _load_trusted()
+        if "project_mappings" not in trusted:
+            trusted["project_mappings"] = {}
+        trusted["project_mappings"][local_path] = remote_path
+        _save_trusted(trusted)
+        self._send_json({"status": "ok"})
+
+    def _handle_recreate_worktree(self):
+        raw = self._read_body()
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._send_json({"error": "invalid json"}, status=400)
+            return
+        
+        session_id = req.get("session_id", "").strip()
+        real_cwd = req.get("real_cwd", "").strip()
+        local_worktree_path = req.get("local_worktree_path", "").strip()
+        git_sha = req.get("git_sha", "").strip()
+        
+        if not session_id or not real_cwd or not local_worktree_path:
+            self._send_json({"error": "session_id, real_cwd, and local_worktree_path are required"}, status=400)
+            return
+        
+        real_cwd = real_cwd.replace("\\\\?\\", "")
+        local_worktree_path = local_worktree_path.replace("\\\\?\\", "")
+        
+        if not os.path.isdir(real_cwd):
+            self._send_json({"error": f"Base repository directory not found: {real_cwd}"}, status=400)
+            return
+        
+        import subprocess
+        
+        def run_git(args, cwd):
+            return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=30)
+        
+        # Scenario A: Worktree does not exist
+        if not os.path.exists(local_worktree_path):
+            if git_sha:
+                res_check = run_git(["git", "cat-file", "-t", git_sha], real_cwd)
+                if res_check.returncode != 0:
+                    run_git(["git", "fetch", "--all"], real_cwd)
+            
+            args = ["git", "worktree", "add", local_worktree_path]
+            if git_sha:
+                args.append(git_sha)
+            else:
+                args.append("HEAD")
+                
+            res_add = run_git(args, real_cwd)
+            if res_add.returncode != 0:
+                self._send_json({"error": f"Failed to recreate worktree: {res_add.stderr.strip()}"}, status=500)
+                return
+            
+            try:
+                conn = sqlite3.connect(str(STATE_DB), timeout=30.0)
+                conn.execute("UPDATE threads SET cwd = ? WHERE id = ?", (local_worktree_path, session_id))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+                
+            self._send_json({"status": "ok", "action": "created", "path": local_worktree_path})
+            return
+            
+        # Scenario B: Worktree already exists, align its commit
+        else:
+            if git_sha:
+                res_check = run_git(["git", "cat-file", "-t", git_sha], real_cwd)
+                if res_check.returncode != 0:
+                    run_git(["git", "fetch", "--all"], real_cwd)
+                
+                res_co = run_git(["git", "checkout", "-f", git_sha], local_worktree_path)
+                if res_co.returncode != 0:
+                    res_co = run_git(["git", "reset", "--hard", git_sha], local_worktree_path)
+                    
+                if res_co.returncode != 0:
+                    self._send_json({"error": f"Failed to align worktree to commit {git_sha}: {res_co.stderr.strip()}"}, status=500)
+                    return
+            
+            try:
+                conn = sqlite3.connect(str(STATE_DB), timeout=30.0)
+                conn.execute("UPDATE threads SET cwd = ? WHERE id = ?", (local_worktree_path, session_id))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+                
+            self._send_json({"status": "ok", "action": "aligned", "path": local_worktree_path})
+            return
 
     def _handle_scan_beacons(self):
         servers = listen_for_beacons(timeout=3)
@@ -929,29 +1156,62 @@ class SyncHandler(BaseHTTPRequestHandler):
 
         try:
             conn = sqlite3.connect(str(STATE_DB), timeout=30.0)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("""
-                INSERT OR IGNORE INTO threads
-                (id, rollout_path, model_provider, title,
-                 created_at_ms, updated_at_ms, archived, source, cwd,
-                 git_branch, git_sha, git_origin_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                meta["id"],
-                rollout_path,
-                meta.get("model_provider", ""),
-                meta.get("title", ""),
-                meta.get("created_at_ms", 0),
-                meta.get("updated_at_ms", 0),
-                int(meta.get("archived", False)),
-                meta.get("source", ""),
-                meta.get("cwd", ""),
-                meta.get("git_branch", ""),
-                meta.get("git_sha", ""),
-                meta.get("git_origin_url", ""),
-            ))
-            conn.commit()
-            conn.close()
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("""
+                    INSERT OR IGNORE INTO threads
+                    (id, rollout_path, model_provider, title,
+                     created_at_ms, updated_at_ms, archived, source, cwd,
+                     git_branch, git_sha, git_origin_url, sandbox_policy)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    meta["id"],
+                    rollout_path,
+                    meta.get("model_provider", ""),
+                    meta.get("title", ""),
+                    meta.get("created_at_ms", 0),
+                    meta.get("updated_at_ms", 0),
+                    int(meta.get("archived", False)),
+                    meta.get("source", ""),
+                    meta.get("cwd", ""),
+                    meta.get("git_branch", ""),
+                    meta.get("git_sha", ""),
+                    meta.get("git_origin_url", ""),
+                    meta.get("sandbox_policy", ""),
+                ))
+                conn.execute("""
+                    UPDATE threads SET
+                        rollout_path = ?,
+                        model_provider = ?,
+                        title = ?,
+                        created_at_ms = ?,
+                        updated_at_ms = ?,
+                        archived = ?,
+                        source = ?,
+                        cwd = ?,
+                        git_branch = ?,
+                        git_sha = ?,
+                        git_origin_url = ?,
+                        sandbox_policy = ?
+                    WHERE id = ?
+                """, (
+                    rollout_path,
+                    meta.get("model_provider", ""),
+                    meta.get("title", ""),
+                    meta.get("created_at_ms", 0),
+                    meta.get("updated_at_ms", 0),
+                    int(meta.get("archived", False)),
+                    meta.get("source", ""),
+                    meta.get("cwd", ""),
+                    meta.get("git_branch", ""),
+                    meta.get("git_sha", ""),
+                    meta.get("git_origin_url", ""),
+                    meta.get("sandbox_policy", ""),
+                    meta["id"],
+                ))
+                conn.commit()
+            finally:
+                conn.close()
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
             return
@@ -1070,11 +1330,12 @@ class SyncHandler(BaseHTTPRequestHandler):
         rpin = req.get("remote_pin", "")
         files = req.get("files", [])
         base_dir = req.get("base_dir", ".")
+        remote_dir = req.get("remote_dir", base_dir)
 
         try:
             zip_path = _client_post_zip(
                 f"http://{remote}:{port}/api/download-pack",
-                rpin, {"files": files, "base_dir": base_dir})
+                rpin, {"files": files, "base_dir": remote_dir})
             try:
                 result = extract_pack(zip_path, base_dir, backup=True)
             finally:
@@ -1164,12 +1425,13 @@ class SyncHandler(BaseHTTPRequestHandler):
         rpin = req.get("remote_pin", "")
         files = req.get("files", [])
         base_dir = req.get("base_dir", ".")
+        remote_dir = req.get("remote_dir", base_dir)
 
         try:
             zip_path = _create_pack(files, base_dir)
             try:
                 _client_post_zip_raw(
-                    f"http://{remote}:{port}/api/upload/pack", rpin, zip_path, base_dir)
+                    f"http://{remote}:{port}/api/upload/pack", rpin, zip_path, remote_dir)
             finally:
                 try:
                     os.unlink(zip_path)
@@ -1193,23 +1455,49 @@ class SyncHandler(BaseHTTPRequestHandler):
                 f.write(jsonl_data)
 
         conn = sqlite3.connect(str(STATE_DB), timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""
-            INSERT OR IGNORE INTO threads
-            (id, rollout_path, model_provider, title,
-             created_at_ms, updated_at_ms, archived, source, cwd,
-             git_branch, git_sha, git_origin_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            meta["id"], rollout_path, meta.get("model_provider", ""),
-            meta.get("title", ""), meta.get("created_at_ms", 0),
-            meta.get("updated_at_ms", 0), int(meta.get("archived", False)),
-            meta.get("source", ""), meta.get("cwd", ""),
-            meta.get("git_branch", ""), meta.get("git_sha", ""),
-            meta.get("git_origin_url", ""),
-        ))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                INSERT OR IGNORE INTO threads
+                (id, rollout_path, model_provider, title,
+                 created_at_ms, updated_at_ms, archived, source, cwd,
+                 git_branch, git_sha, git_origin_url, sandbox_policy)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                meta["id"], rollout_path, meta.get("model_provider", ""),
+                meta.get("title", ""), meta.get("created_at_ms", 0),
+                meta.get("updated_at_ms", 0), int(meta.get("archived", False)),
+                meta.get("source", ""), meta.get("cwd", ""),
+                meta.get("git_branch", ""), meta.get("git_sha", ""),
+                meta.get("git_origin_url", ""), meta.get("sandbox_policy", ""),
+            ))
+            conn.execute("""
+                UPDATE threads SET
+                    rollout_path = ?,
+                    model_provider = ?,
+                    title = ?,
+                    created_at_ms = ?,
+                    updated_at_ms = ?,
+                    archived = ?,
+                    source = ?,
+                    cwd = ?,
+                    git_branch = ?,
+                    git_sha = ?,
+                    git_origin_url = ?,
+                    sandbox_policy = ?
+                WHERE id = ?
+            """, (
+                rollout_path, meta.get("model_provider", ""),
+                meta.get("title", ""), meta.get("created_at_ms", 0),
+                meta.get("updated_at_ms", 0), int(meta.get("archived", False)),
+                meta.get("source", ""), meta.get("cwd", ""),
+                meta.get("git_branch", ""), meta.get("git_sha", ""),
+                meta.get("git_origin_url", ""), meta.get("sandbox_policy", ""),
+                meta["id"],
+            ))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 # ── Client-side HTTP helpers ─────────────────────────────────────────────
@@ -1618,12 +1906,17 @@ select{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4
     <div id="filesNotConnected" style="color:#a6adc8">Connect to a remote server first.</div>
     <div id="filesContent" style="display:none">
       <div class="info-box">
+        <div class="info-row" style="margin-bottom:8px">
+          <label style="min-width:140px">Local Project Dir:</label>
+          <input id="projectDir" placeholder="/path/to/project" onchange="onLocalDirChange()">
+        </div>
         <div class="info-row">
-          <label>Project Dir:</label>
-          <input id="projectDir" placeholder="/path/to/project">
+          <label style="min-width:140px">Remote Project Dir:</label>
+          <input id="remoteProjectDir" placeholder="Optional (same as local if empty)">
           <button class="btn primary" onclick="scanFiles()">Scan</button>
         </div>
       </div>
+      <div id="gitWarningBanner" style="display:none;background:#f38ba8;color:#11111b;border-radius:6px;padding:12px 16px;margin-bottom:12px;font-size:13px;font-weight:600"></div>
       <h2>File Diff <span id="fileCounts" style="font-size:12px;color:#a6adc8"></span></h2>
       <div style="margin-bottom:8px">
         <button class="btn small" onclick="selectChanged()">Select Changed</button>
@@ -1770,6 +2063,7 @@ async function init(){
     localPin=d.pin;
     document.getElementById('settingServerName').value=d.server_name||'';
     renderTrustedDevices(d.trusted||[]);
+    await loadProjectMappings();
   }catch(e){
     document.getElementById('serverInfo').textContent='Server error';
   }
@@ -2025,18 +2319,68 @@ async function pushSelectedSessions(){
   }catch(e){showToast(e.message,'error')}
 }
 
+let projectMappings = {};
+
+async function loadProjectMappings() {
+  try {
+    const res = await fetch('/api/project-mappings').then(r => r.json());
+    projectMappings = res.project_mappings || {};
+  } catch (e) {
+    console.error("Failed to load project mappings", e);
+  }
+}
+
+function onLocalDirChange() {
+  const localDir = document.getElementById('projectDir').value.trim();
+  const remoteInput = document.getElementById('remoteProjectDir');
+  if (localDir && projectMappings[localDir]) {
+    remoteInput.value = projectMappings[localDir];
+  } else {
+    remoteInput.value = '';
+  }
+}
+
 async function scanFiles(){
   const dir=document.getElementById('projectDir').value.trim();
   if(!dir){showToast('Enter project directory','error');return}
+  const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
+
+  if (rdir && rdir !== dir) {
+    projectMappings[dir] = rdir;
+    await fetch('/api/project-mappings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({local_path: dir, remote_path: rdir})
+    });
+  }
+
+  const banner = document.getElementById('gitWarningBanner');
+  banner.style.display = 'none';
+
   try{
     const [lr,rr]=await Promise.all([
       fetch('/api/repo-hashes?dir='+encodeURIComponent(dir)).then(r=>r.json()),
-      fetch('http://'+remoteHost+':'+remotePort+'/api/repo-hashes?dir='+encodeURIComponent(dir),
+      fetch('http://'+remoteHost+':'+remotePort+'/api/repo-hashes?dir='+encodeURIComponent(rdir),
         {headers:{'Authorization':'Bearer '+remotePinVal}}).then(r=>r.json())
     ]);
     const local=lr.files||{};const remote=rr.files||{};
     fileDiff=computeFileDiff(local,remote);
     renderFileDiff();
+
+    if (lr.git && rr.git) {
+      if (lr.git_branch !== rr.git_branch || lr.git_sha !== rr.git_sha) {
+        let warningHtml = '<strong>Git Mismatch Warning!</strong><br>';
+        if (lr.git_branch !== rr.git_branch) {
+          warningHtml += `Local branch is <code>${lr.git_branch || 'None'}</code> but Remote branch is <code>${rr.git_branch || 'None'}</code>.<br>`;
+        }
+        if (lr.git_sha !== rr.git_sha) {
+          warningHtml += `Local commit is <code>${(lr.git_sha || 'None').substring(0,8)}</code> but Remote commit is <code>${(rr.git_sha || 'None').substring(0,8)}</code>.<br>`;
+        }
+        warningHtml += 'Syncing files between different branches or commits may cause unmergeable conflicts or overwrite working progress.';
+        banner.innerHTML = warningHtml;
+        banner.style.display = 'block';
+      }
+    }
   }catch(e){showToast(e.message,'error')}
 }
 
@@ -2074,31 +2418,35 @@ function renderFileDiff(){
 
 async function pullFile(path){
   const dir=document.getElementById('projectDir').value.trim();
+  const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
   try{const r=await fetch('/api/pull/files',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:[path],base_dir:dir})});
+    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:[path],base_dir:dir,remote_dir:rdir})});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
 async function pushFile(path){
   const dir=document.getElementById('projectDir').value.trim();
+  const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
   try{const r=await fetch('/api/push/files',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:[path],base_dir:dir})});
+    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:[path],base_dir:dir,remote_dir:rdir})});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
 async function pullSelectedFiles(){
   const paths=getSelected('file');if(!paths.length){showToast('Nothing selected','error');return}
   const dir=document.getElementById('projectDir').value.trim();
+  const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
   try{const r=await fetch('/api/pull/files',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:paths,base_dir:dir})});
+    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:paths,base_dir:dir,remote_dir:rdir})});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
 async function pushSelectedFiles(){
   const paths=getSelected('file');if(!paths.length){showToast('Nothing selected','error');return}
   const dir=document.getElementById('projectDir').value.trim();
+  const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
   try{const r=await fetch('/api/push/files',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:paths,base_dir:dir})});
+    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:paths,base_dir:dir,remote_dir:rdir})});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
@@ -2127,18 +2475,47 @@ async function offerProjectFileSync(sessionId,direction){
   if(!session) session=remoteSessions.find(function(s){return s.id===sessionId});
   if(!session||!session.cwd) return;
   var projectPath=session.cwd;
+  var realCwd=session.real_cwd || projectPath;
+  var localWtPath=session.local_worktree_path || '';
+
   if(session.is_worktree){
     var yes=await showModal('This session uses an isolated worktree:\n'+projectPath+
-      '\n\nWorktree is stored inside .codex — syncing these files may conflict with Codex internals.\n\nContinue?');
+      '\n\nWe can natively recreate or update this worktree locally (at ' + localWtPath + ') inside your main repository (at ' + realCwd + ') to sync its files 1-to-1.\n\nProceed?');
     if(!yes) return;
+    
+    showToast('Recreating/aligning worktree...', 'info');
+    try {
+      const res = await fetch('/api/recreate-worktree', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          session_id: session.id,
+          real_cwd: realCwd,
+          local_worktree_path: localWtPath,
+          git_sha: session.git_sha
+        })
+      });
+      const data = await res.json();
+      if (data.error) {
+        showToast('Worktree error: ' + data.error, 'error');
+        return;
+      }
+      showToast('Worktree ' + data.action + ' successfully!', 'success');
+      projectPath = localWtPath;
+    } catch(e) {
+      showToast('Failed to prepare worktree: ' + e.message, 'error');
+      return;
+    }
   }else{
-    var yes=await showModal('This session is linked to project:\n'+projectPath+
+    var yes=await showModal('This session is linked to project:\n'+realCwd+
       (session.git_branch?'\nBranch: '+session.git_branch:'')+
       '\n\nSync project files?');
     if(!yes) return;
+    projectPath = realCwd;
   }
   switchTab('files');
   document.getElementById('projectDir').value=projectPath;
+  onLocalDirChange();
   await scanFiles();
 }
 

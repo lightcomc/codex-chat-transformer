@@ -1075,14 +1075,26 @@ class CodexManagerApp:
             data["profiles"] = profiles
             _save_providers(data)
 
-            # Update config.toml if this is the active provider
+            # Update config.toml if this is the active provider (by old or new name)
             active = _get_active_provider()
-            if active == new_name:
+            if active in (orig_name, new_name):
                 current_cfg = _read_file_safe(CODEX_DIR / "config.toml")
                 if current_cfg:
-                    merged = ct._merge_config(current_cfg, new_name, section, model, reasoning or None)
+                    # Remove old section if renamed
+                    if new_name != orig_name:
+                        current_cfg = ct._remove_provider_section(current_cfg, orig_name)
+                    merged = ct._merge_config(current_cfg, new_name, section, model, reasoning if reasoning else None)
                     with open(str(CODEX_DIR / "config.toml"), "w", encoding="utf-8") as f:
                         f.write(merged)
+
+            # Convert chats when renaming active provider
+            if new_name != orig_name and active in (orig_name, new_name):
+                conn = ct.get_db_conn()
+                if conn is not None:
+                    try:
+                        ct.transform(conn, orig_name, new_name)
+                    finally:
+                        conn.close()
 
             dialog.destroy()
             self._refresh()
