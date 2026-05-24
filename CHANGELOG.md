@@ -4,8 +4,11 @@
 
 ### Session-Project Auto-Link / Связывание сессий с файлами проекта
 - After session Pull/Push, Dashboard detects linked project directory and offers file sync / После Pull/Push сессии Dashboard определяет привязанный проект и предлагает синхронизацию файлов
-- Confirmation modal in Dashboard: "This session is linked to project X. Sync project files?" / Модальное окно подтверждения в Dashboard
-- Bulk: aggregates unique project paths across multiple selected sessions / Массовая операция: объединяет уникальные пути проектов
+- Uses session `cwd` (real working dir) instead of `project` field / Использует `cwd` (реальную рабочую директорию) вместо поля `project`
+- Git branch and SHA from DB shown in Sessions table / Ветка и SHA из БД отображаются в таблице сессий
+- Worktree detection: sessions in `~/.codex/worktrees/` flagged with yellow badge / Обнаружение worktrees: сессии в worktrees помечены жёлтым бейджем
+- Warning when syncing worktree files (Codex internals) / Предупреждение при синхронизации файлов worktree
+- Bulk: aggregates unique directories across multiple selected sessions / Массовая операция: объединяет уникальные директории
 
 ### Background Auto-Sync / Фоновая авторсинхронизация
 - Dashboard Settings tab: auto-sync polling (30s / 60s / 2 min / 5 min) / Вкладка Settings: авторсинхронизация с интервалом
@@ -24,8 +27,8 @@
 - Requires: `pip install pystray Pillow` (optional) / Требует: pystray + Pillow (опционально)
 
 ### Tests / Тесты
-- 26 smoke tests (was 23) / 26 smoke-тестов (было 23)
-- New: manifest hash, sync_tray syntax, sync_tray import checks / Новые: хэш манифеста, синтаксис трея, проверки импорта
+- 27 smoke tests (was 23) / 27 smoke-тестов (было 23)
+- New: manifest hash, sessions cwd/git fields, sync_tray syntax, sync_tray import checks / Новые: хэш манифеста, поля cwd/git, синтаксис трея, проверки импорта
 
 ## [1.0.0] — 2026-05-23
 

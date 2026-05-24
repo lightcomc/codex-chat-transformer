@@ -221,7 +221,8 @@ def _get_sessions_list():
         cur = conn.cursor()
         cur.execute("""
             SELECT id, rollout_path, model_provider, title,
-                   created_at_ms, updated_at_ms, archived, source, cwd, project
+                   created_at_ms, updated_at_ms, archived, source, cwd,
+                   git_branch, git_sha, git_origin_url
             FROM threads
             ORDER BY updated_at_ms DESC
         """)
@@ -232,16 +233,22 @@ def _get_sessions_list():
             has_rollout = bool(r["rollout_path"]) and os.path.exists(
                 r["rollout_path"].replace("\\\\?\\", "")
             )
+            cwd_val = (r["cwd"] or "").replace("\\\\?\\", "")
+            is_worktree = "worktrees" in cwd_val and ".codex" in cwd_val
             result.append({
                 "id": r["id"],
                 "title": (r["title"] or "")[:80],
-                "project": r["project"] or "",
+                "cwd": cwd_val,
                 "model_provider": r["model_provider"] or "",
                 "created_at_ms": r["created_at_ms"],
                 "updated_at_ms": r["updated_at_ms"],
                 "archived": bool(r["archived"]),
                 "source": r["source"] or "",
                 "has_rollout": has_rollout,
+                "git_branch": r["git_branch"] or "",
+                "git_sha": r["git_sha"] or "",
+                "git_origin_url": r["git_origin_url"] or "",
+                "is_worktree": is_worktree,
             })
         return result
     except Exception:
@@ -1511,9 +1518,12 @@ async function loadSessions(){
       status=newer?'<span class="badge yellow">Remote newer</span>':'<span class="badge blue">Local newer</span>';
     }
     const updated=new Date(s.updated_at_ms).toLocaleString();
+    const cwdShort=s.cwd?s.cwd.split(/[\\/]/).slice(-2).join('/'):'—';
+    const wtBadge=s.is_worktree?'<br><span class="badge yellow">worktree</span>':'';
+    const branchBadge=s.git_branch?'<br><span class="badge blue">'+s.git_branch+'</span>':'';
     const tr=document.createElement('tr');
     tr.innerHTML='<td><input type="checkbox" class="checkbox" data-name="'+s.id+'" data-scope="sess"></td>'+
-      '<td>'+(s.title||'Untitled')+'</td><td>'+(s.project||'—')+'</td>'+
+      '<td>'+(s.title||'Untitled')+'</td><td>'+cwdShort+wtBadge+branchBadge+'</td>'+
       '<td>'+s.model_provider+'</td><td>'+updated+'</td>'+
       '<td class="actions"><button class="btn small primary" onclick="pullSession(\''+s.id+'\')">Pull</button>'+
       (loc?'<button class="btn small success" onclick="pushSession(\''+s.id+'\')">Push</button>':'')+'</td>';
@@ -1656,34 +1666,46 @@ async function showResult(response){
 async function offerProjectFileSync(sessionId,direction){
   var session=localSessions.find(function(s){return s.id===sessionId});
   if(!session) session=remoteSessions.find(function(s){return s.id===sessionId});
-  if(!session||!session.project) return;
-  var projectPath=session.project;
-  var yes=await showModal('This session is linked to project:\n'+projectPath+'\n\nSync project files?');
-  if(yes){
-    switchTab('files');
-    document.getElementById('projectDir').value=projectPath;
-    await scanFiles();
+  if(!session||!session.cwd) return;
+  var projectPath=session.cwd;
+  if(session.is_worktree){
+    var yes=await showModal('This session uses an isolated worktree:\n'+projectPath+
+      '\n\nWorktree is stored inside .codex — syncing these files may conflict with Codex internals.\n\nContinue?');
+    if(!yes) return;
+  }else{
+    var yes=await showModal('This session is linked to project:\n'+projectPath+
+      (session.git_branch?'\nBranch: '+session.git_branch:'')+
+      '\n\nSync project files?');
+    if(!yes) return;
   }
+  switchTab('files');
+  document.getElementById('projectDir').value=projectPath;
+  await scanFiles();
 }
 
 async function offerBulkProjectFileSync(ids,direction){
-  var projects={};
+  var paths={};
   for(var i=0;i<ids.length;i++){
     var sid=ids[i];
     var session=localSessions.find(function(s){return s.id===sid});
     if(!session) session=remoteSessions.find(function(s){return s.id===sid});
-    if(session&&session.project) projects[session.project]=true;
+    if(session&&session.cwd) paths[session.cwd]=session;
   }
-  var paths=Object.keys(projects);
-  if(!paths.length) return;
-  var msg='These sessions are linked to '+(paths.length>1?paths.length+' projects':'project')+':\n\n';
-  for(var j=0;j<paths.length&&j<5;j++) msg+=paths[j]+'\n';
-  if(paths.length>5) msg+='...and '+( paths.length-5)+' more\n';
-  msg+='\nSync project files?';
+  var pathList=Object.keys(paths);
+  if(!pathList.length) return;
+  var hasWorktree=pathList.some(function(p){return paths[p].is_worktree});
+  var msg='These sessions are linked to '+(pathList.length>1?pathList.length+' directories':'directory')+':\n\n';
+  for(var j=0;j<pathList.length&&j<5;j++){
+    var s=paths[pathList[j]];
+    msg+=pathList[j]+(s.git_branch?' ['+s.git_branch+']':'')+(s.is_worktree?' (worktree)':'')+'\n';
+  }
+  if(pathList.length>5) msg+='...and '+(pathList.length-5)+' more\n';
+  if(hasWorktree) msg+='\nWarning: some sessions use isolated worktrees inside .codex.';
+  msg+='\n\nSync project files?';
   var yes=await showModal(msg);
   if(yes){
     switchTab('files');
-    document.getElementById('projectDir').value=paths[0];
+    document.getElementById('projectDir').value=pathList[0];
     await scanFiles();
   }
 }

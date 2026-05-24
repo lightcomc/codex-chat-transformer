@@ -342,7 +342,7 @@ codex_chat_transformer.py    — CLI: конвертация, провайдер
 codex_manager_gui.py         — GUI: переключение, редактирование, смена модели, синхронизация (обёртка над CLI)
 codex_sync.py                — Движок P2P синхронизации: сервер, клиент, Dashboard, файлы, авторсинхронизация
 sync_tray.py                 — Виджет в системном трее (опционально, требует pystray + Pillow)
-test_smoke.py                — Smoke-тесты (26 тестов)
+test_smoke.py                — Smoke-тесты (27 тестов)
 codex_manager.cmd / .ps1     — Windows запускаторы
 codex_manager.sh             — Unix запускатор
 providers_template.json      — Шаблон провайдера

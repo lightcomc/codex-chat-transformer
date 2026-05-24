@@ -416,6 +416,27 @@ def test_manifest_includes_hash():
         codex_sync.stop_server(server)
 
 
+def test_sessions_include_cwd_and_git():
+    """Sessions API returns cwd, git_branch, git_sha, is_worktree fields."""
+    import codex_sync, threading, json
+    server, pin, port = codex_sync.start_server(port=0)
+    actual_port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request("GET", "/api/sessions", headers={"Authorization": "Bearer " + pin})
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        assert "sessions" in data, "should return sessions key"
+        for s in data["sessions"]:
+            assert "cwd" in s, "session should include cwd field"
+            assert "git_branch" in s, "session should include git_branch"
+            assert "git_sha" in s, "session should include git_sha"
+            assert "is_worktree" in s, "session should include is_worktree"
+    finally:
+        codex_sync.stop_server(server)
 def test_sync_tray_syntax():
     """sync_tray.py compiles without syntax errors."""
     path = os.path.join(os.path.dirname(__file__), "sync_tray.py")
@@ -468,6 +489,7 @@ if __name__ == "__main__":
     test("server auth required (401 without PIN, 200 with PIN)", test_server_auth_required)
     test("server CORS headers", test_server_cors)
     test("manifest includes hash", test_manifest_includes_hash)
+    test("sessions include cwd and git fields", test_sessions_include_cwd_and_git)
     test("sync_tray.py syntax valid", test_sync_tray_syntax)
     test("sync_tray imports optional (graceful)", test_sync_tray_imports_optional)
 
