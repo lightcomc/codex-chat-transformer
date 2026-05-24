@@ -18,6 +18,7 @@ import secrets
 import shutil
 import socket
 import sqlite3
+import tempfile
 import threading
 import time
 import zipfile
@@ -36,6 +37,7 @@ SESSIONS_DIR = CODEX_DIR / "sessions"
 SYNC_VERSION = "1.0"
 
 MAX_ZIP_SIZE = 500 * 1024 * 1024  # 500 MB
+CHUNK_SIZE = 4 * 1024 * 1024      # 4 MB chunks for streaming
 
 EXCLUDE_DIRS = {
     ".git", "__pycache__", ".venv", "venv", "node_modules",
@@ -325,56 +327,90 @@ def compute_file_diff(local_hashes, remote_hashes):
 
 
 def _create_pack(file_list, base_dir):
-    buf = io.BytesIO()
     base = os.path.realpath(base_dir)
     total_size = 0
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for rel in file_list:
-            if not _validate_path(rel, base):
-                continue
-            full = os.path.join(base, rel)
-            if os.path.exists(full):
-                total_size += os.path.getsize(full)
-                if total_size > MAX_ZIP_SIZE:
-                    raise RuntimeError(f"ZIP size exceeds {MAX_ZIP_SIZE // 1024 // 1024} MB limit")
-                zf.write(full, rel)
-    return buf.getvalue()
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False, prefix="codex_sync_")
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            for rel in file_list:
+                if not _validate_path(rel, base):
+                    continue
+                full = os.path.join(base, rel)
+                if os.path.exists(full):
+                    total_size += os.path.getsize(full)
+                    if total_size > MAX_ZIP_SIZE:
+                        tmp.close()
+                        os.unlink(tmp.name)
+                        raise RuntimeError(f"ZIP size exceeds {MAX_ZIP_SIZE // 1024 // 1024} MB limit")
+                    zf.write(full, rel)
+        tmp.close()
+        return tmp.name
+    except Exception:
+        try:
+            tmp.close()
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+        raise
 
 
-def extract_pack(zip_bytes, target_dir, backup=True):
+def extract_pack(zip_source, target_dir, backup=True):
+    """Extract ZIP from file path or bytes. Returns result dict."""
     global data_changed
     target = os.path.realpath(target_dir)
     os.makedirs(target, exist_ok=True)
+
+    is_file = isinstance(zip_source, str)
+    tmp_cleanup = None
+
+    if is_file:
+        zip_path = zip_source
+    else:
+        tmpf = tempfile.NamedTemporaryFile(suffix=".zip", delete=False, prefix="codex_extract_")
+        tmpf.write(zip_source)
+        tmpf.close()
+        zip_path = tmpf.name
+        tmp_cleanup = tmpf.name
 
     if backup:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         bak_dir = os.path.join(target, f".sync_backup_{ts}")
         os.makedirs(bak_dir, exist_ok=True)
 
-    buf = io.BytesIO(zip_bytes)
     replaced = []
     errors = []
-    with zipfile.ZipFile(buf, "r") as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            rel = info.filename
-            if not _validate_path(rel, target):
-                errors.append(f"Blocked (path traversal): {rel}")
-                continue
-            dest = os.path.join(target, rel)
-            if os.path.exists(dest) and backup:
-                bak_path = os.path.join(bak_dir, rel)
-                os.makedirs(os.path.dirname(bak_path), exist_ok=True)
-                shutil.copy2(dest, bak_path)
-                replaced.append(rel)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with zf.open(info) as src, open(dest, "wb") as dst:
-                dst.write(src.read())
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                rel = info.filename
+                if not _validate_path(rel, target):
+                    errors.append(f"Blocked (path traversal): {rel}")
+                    continue
+                dest = os.path.join(target, rel)
+                if os.path.exists(dest) and backup:
+                    bak_path = os.path.join(bak_dir, rel)
+                    os.makedirs(os.path.dirname(bak_path), exist_ok=True)
+                    shutil.copy2(dest, bak_path)
+                    replaced.append(rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with zf.open(info) as src, open(dest, "wb") as dst:
+                    while True:
+                        chunk = src.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+        file_count = len(replaced) + len(errors)
+    finally:
+        if tmp_cleanup:
+            try:
+                os.unlink(tmp_cleanup)
+            except Exception:
+                pass
 
     data_changed = True
-    return {"extracted": len(replaced) + len(errors) == 0 and len(zf.infolist()) or 0,
-            "replaced": len(replaced), "errors": errors}
+    return {"extracted": file_count, "replaced": len(replaced), "errors": errors}
 
 
 # ── Backup helper ────────────────────────────────────────────────────────
@@ -608,11 +644,27 @@ class SyncHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "base_dir not found"}, status=404)
             return
         try:
-            zip_data = _create_pack(files, base_dir)
+            zip_path = _create_pack(files, base_dir)
         except RuntimeError as e:
             self._send_json({"error": str(e)}, status=413)
             return
-        self._send_binary(zip_data, "application/zip")
+        try:
+            size = os.path.getsize(zip_path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with open(zip_path, "rb") as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        finally:
+            try:
+                os.unlink(zip_path)
+            except Exception:
+                pass
 
     def _handle_upload_provider(self):
         global data_changed
@@ -706,9 +758,25 @@ class SyncHandler(BaseHTTPRequestHandler):
         self._send_json({"status": "ok", "id": meta["id"], "backup": bak})
 
     def _handle_upload_pack(self):
-        raw = self._read_body()
         target_dir = self.headers.get("X-Target-Dir", ".")
-        result = extract_pack(raw, target_dir, backup=True)
+        length = int(self.headers.get("Content-Length", 0))
+        tmpf = tempfile.NamedTemporaryFile(suffix=".zip", delete=False, prefix="codex_upload_")
+        try:
+            remaining = length
+            while remaining > 0:
+                chunk_size = min(CHUNK_SIZE, remaining)
+                chunk = self.rfile.read(chunk_size)
+                if not chunk:
+                    break
+                tmpf.write(chunk)
+                remaining -= len(chunk)
+            tmpf.close()
+            result = extract_pack(tmpf.name, target_dir, backup=True)
+        finally:
+            try:
+                os.unlink(tmpf.name)
+            except Exception:
+                pass
         self._send_json(result)
 
     # ── Proxy (server-to-server) handlers ─────────────────────────────
@@ -802,10 +870,16 @@ class SyncHandler(BaseHTTPRequestHandler):
         base_dir = req.get("base_dir", ".")
 
         try:
-            zip_data = _client_post_zip(
+            zip_path = _client_post_zip(
                 f"http://{remote}:{port}/api/download-pack",
                 rpin, {"files": files, "base_dir": base_dir})
-            result = extract_pack(zip_data, base_dir, backup=True)
+            try:
+                result = extract_pack(zip_path, base_dir, backup=True)
+            finally:
+                try:
+                    os.unlink(zip_path)
+                except Exception:
+                    pass
             self._send_json(result)
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
@@ -890,9 +964,15 @@ class SyncHandler(BaseHTTPRequestHandler):
         base_dir = req.get("base_dir", ".")
 
         try:
-            zip_data = _create_pack(files, base_dir)
-            _client_post_zip_raw(
-                f"http://{remote}:{port}/api/upload/pack", rpin, zip_data, base_dir)
+            zip_path = _create_pack(files, base_dir)
+            try:
+                _client_post_zip_raw(
+                    f"http://{remote}:{port}/api/upload/pack", rpin, zip_path, base_dir)
+            finally:
+                try:
+                    os.unlink(zip_path)
+                except Exception:
+                    pass
             self._send_json({"status": "ok", "pushed": len(files)})
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
@@ -972,6 +1052,44 @@ def _client_get_bytes(url, pin):
     return data
 
 
+def _client_download_to_file(url, pin):
+    """Download large binary to temp file. Returns file path."""
+    parsed = urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or 80
+    path = parsed.path
+    if parsed.query:
+        path += "?" + parsed.query
+    conn = http.client.HTTPConnection(host, port, timeout=120)
+    headers = {}
+    if pin:
+        headers["Authorization"] = f"Bearer {pin}"
+    conn.request("GET", path, headers=headers)
+    resp = conn.getresponse()
+    if resp.status != 200:
+        data = resp.read()
+        conn.close()
+        raise Exception(f"HTTP {resp.status}: {data.decode('utf-8', errors='replace')}")
+    tmpf = tempfile.NamedTemporaryFile(suffix=".zip", delete=False, prefix="codex_dl_")
+    try:
+        while True:
+            chunk = resp.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            tmpf.write(chunk)
+        tmpf.close()
+        conn.close()
+        return tmpf.name
+    except Exception:
+        try:
+            tmpf.close()
+            os.unlink(tmpf.name)
+        except Exception:
+            pass
+        conn.close()
+        raise
+
+
 def _client_get_provider_full(host, port, pin, name):
     return _client_get_json(f"http://{host}:{port}/api/providers/full?name={name}", pin)
 
@@ -999,6 +1117,7 @@ def _client_post_json(url, pin, payload):
 
 
 def _client_post_zip(url, pin, payload):
+    """POST JSON request, download ZIP response to temp file. Returns file path."""
     parsed = urlparse(url)
     host = parsed.hostname
     port = parsed.port or 80
@@ -1010,24 +1129,49 @@ def _client_post_zip(url, pin, payload):
     }
     conn.request("POST", parsed.path, body=body, headers=headers)
     resp = conn.getresponse()
-    data = resp.read()
-    conn.close()
     if resp.status != 200:
-        raise Exception(f"HTTP {resp.status}")
-    return data
+        data = resp.read()
+        conn.close()
+        raise Exception(f"HTTP {resp.status}: {data.decode('utf-8', errors='replace')}")
+    tmpf = tempfile.NamedTemporaryFile(suffix=".zip", delete=False, prefix="codex_pull_")
+    try:
+        while True:
+            chunk = resp.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            tmpf.write(chunk)
+        tmpf.close()
+        conn.close()
+        return tmpf.name
+    except Exception:
+        try:
+            tmpf.close()
+            os.unlink(tmpf.name)
+        except Exception:
+            pass
+        conn.close()
+        raise
 
 
-def _client_post_zip_raw(url, pin, zip_data, base_dir):
+def _client_post_zip_raw(url, pin, zip_path, base_dir):
     parsed = urlparse(url)
     host = parsed.hostname
     port = parsed.port or 80
+    size = os.path.getsize(zip_path)
     conn = http.client.HTTPConnection(host, port, timeout=120)
     headers = {
         "Authorization": f"Bearer {pin}",
         "Content-Type": "application/zip",
+        "Content-Length": str(size),
         "X-Target-Dir": base_dir,
     }
-    conn.request("POST", parsed.path, body=zip_data, headers=headers)
+    conn.request("POST", parsed.path, body=None, headers=headers)
+    with open(zip_path, "rb") as f:
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            conn.send(chunk)
     resp = conn.getresponse()
     data = resp.read()
     conn.close()

@@ -325,6 +325,25 @@ def test_path_traversal():
     assert not codex_sync._validate_path("/absolute/path", "/project")
 
 
+def test_chunked_pack_extract():
+    """_create_pack writes to temp file, extract_pack reads from file path."""
+    import codex_sync, tempfile, os
+    with tempfile.TemporaryDirectory() as src_dir:
+        with open(os.path.join(src_dir, "test.txt"), "w") as f:
+            f.write("hello chunked world")
+        zip_path = codex_sync._create_pack(["test.txt"], src_dir)
+        assert os.path.exists(zip_path), "zip temp file should exist"
+        assert os.path.getsize(zip_path) > 0, "zip should not be empty"
+        with tempfile.TemporaryDirectory() as dst_dir:
+            result = codex_sync.extract_pack(zip_path, dst_dir, backup=False)
+            assert result["errors"] == [], "no errors: {}".format(result["errors"])
+            extracted = os.path.join(dst_dir, "test.txt")
+            assert os.path.exists(extracted), "extracted file should exist"
+            with open(extracted, "r") as f:
+                assert f.read() == "hello chunked world"
+        os.unlink(zip_path)
+
+
 def test_server_ping():
     import codex_sync, threading, json
     server, pin, port = codex_sync.start_server(port=0)
@@ -485,6 +504,7 @@ if __name__ == "__main__":
     test("compute_local_hashes", test_compute_hashes)
     test("compute_file_diff", test_file_diff)
     test("path traversal protection", test_path_traversal)
+    test("chunked pack + extract (temp file based)", test_chunked_pack_extract)
     test("server ping", test_server_ping)
     test("server auth required (401 without PIN, 200 with PIN)", test_server_auth_required)
     test("server CORS headers", test_server_cors)
