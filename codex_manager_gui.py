@@ -52,6 +52,8 @@ T = {
     "use_provider": {"ru": "Использовать", "en": "Use Provider"},
     "save_current": {"ru": "Сохранить текущий", "en": "Save Current"},
     "remove": {"ru": "Удалить", "en": "Remove"},
+    "auto_backup": {"ru": "Автобекап БД перед конвертацией", "en": "Auto-backup DB before conversion"},
+    "backup_created": {"ru": "Автобекап: {}", "en": "Auto-backup: {}"},
     "convert_chats": {"ru": "Конвертировать чаты при переключении", "en": "Convert chats when switching"},
     "pin_top": {"ru": "Закрепить 10 свежих чатов", "en": "Pin top 10 recent chats"},
     "add_json": {"ru": "Добавить из JSON...", "en": "Add from JSON..."},
@@ -123,6 +125,12 @@ T = {
     "files_fixed": {"ru": "Исправлено: {} файлов", "en": "Fixed: {} files"},
     "pinned_count": {"ru": "Закреплено: {}", "en": "Pinned: {}"},
     "default_val": {"ru": "по умолчанию", "en": "default"},
+    "sync_start": {"ru": "Запустить сервер", "en": "Start Server"},
+    "sync_stop": {"ru": "Остановить", "en": "Stop"},
+    "sync_running": {"ru": "Сервер: {ip}:{port} PIN: {pin}", "en": "Server: {ip}:{port} PIN: {pin}"},
+    "sync_stopped": {"ru": "Сервер остановлен", "en": "Server stopped"},
+    "sync_open": {"ru": "Открыть Dashboard", "en": "Open Dashboard"},
+    "sync_copy": {"ru": "Копировать IP:PIN", "en": "Copy IP:PIN"},
     "consent_title": {"ru": "Codex Chat Transformer — Условия использования", "en": "Codex Chat Transformer — Terms of Use"},
     "consent_accept": {"ru": "Принимаю условия", "en": "I accept the terms"},
     "consent_decline": {"ru": "Отклонить и выйти", "en": "Decline and exit"},
@@ -236,7 +244,9 @@ def _merge_config(current_text, target_provider, target_section, target_model=No
     return ct._merge_config(current_text, target_provider, target_section, target_model, target_reasoning)
 
 
-def _run_convert(from_p, to_p):
+def _run_convert(from_p, to_p, auto_backup=True):
+    if auto_backup:
+        ct.create_backup(from_p)
     conn = _db_conn()
     if not conn:
         return 0, 0
@@ -433,12 +443,15 @@ class CodexManagerApp:
 
         # Options
         self.convert_var = tk.BooleanVar(value=True)
+        self.autobackup_var = tk.BooleanVar(value=True)
         self.pin_var = tk.BooleanVar(value=False)
         opt = tk.Frame(self.root, bg=BG)
         opt.pack(fill="x", padx=16, pady=(6, 2))
 
         self.chk_convert = ttk.Checkbutton(opt, text=t("convert_chats"), variable=self.convert_var)
         self.chk_convert.pack(anchor="w")
+        self.chk_autobackup = ttk.Checkbutton(opt, text=t("auto_backup"), variable=self.autobackup_var)
+        self.chk_autobackup.pack(anchor="w")
         self.chk_pin = ttk.Checkbutton(opt, text=t("pin_top"), variable=self.pin_var)
         self.chk_pin.pack(anchor="w")
 
@@ -462,6 +475,23 @@ class CodexManagerApp:
         self.btn_fixdates = ttk.Button(btn3, text=t("fix_dates"), command=self._fix_dates)
         self.btn_fixdates.pack(side="left", expand=True, fill="x")
 
+        # Sync section
+        sync_frame = tk.Frame(self.root, bg=BG2, padx=12, pady=6)
+        sync_frame.pack(fill="x", padx=16, pady=(6, 2))
+
+        self._sync_server = None
+        self._sync_pin = ""
+        self._sync_port = 0
+
+        self.btn_sync = ttk.Button(sync_frame, text=t("sync_start"), command=self._toggle_sync)
+        self.btn_sync.pack(side="left")
+        self.sync_status = ttk.Label(sync_frame, text=t("sync_stopped"), style="Stats.TLabel")
+        self.sync_status.pack(side="left", padx=(8, 0))
+        self.btn_dash = ttk.Button(sync_frame, text=t("sync_open"), command=self._open_dashboard, style="Small.TButton")
+        self.btn_dash.pack(side="right")
+        self.btn_copy_sync = ttk.Button(sync_frame, text=t("sync_copy"), command=self._copy_sync_info, style="Small.TButton")
+        self.btn_copy_sync.pack(side="right", padx=(0, 4))
+
         # Status bar
         tk.Frame(self.root, bg=BG2, height=1).pack(fill="x", padx=16, pady=(8, 2))
         self.status_var = tk.StringVar(value=t("ready"))
@@ -484,16 +514,69 @@ class CodexManagerApp:
         self.btn_save.config(text=t("save_current"))
         self.btn_remove.config(text=t("remove"))
         self.chk_convert.config(text=t("convert_chats"))
+        self.chk_autobackup.config(text=t("auto_backup"))
         self.chk_pin.config(text=t("pin_top"))
         self.btn_json.config(text=t("add_json"))
         self.btn_create.config(text=t("create_new"))
         self.btn_backup.config(text=t("full_backup"))
         self.btn_restore.config(text=t("restore_zip"))
+        self.btn_sync.config(text=t("sync_stop") if self._sync_server else t("sync_start"))
+        self.btn_dash.config(text=t("sync_open"))
+        self.btn_copy_sync.config(text=t("sync_copy"))
+        if not self._sync_server:
+            self.sync_status.config(text=t("sync_stopped"))
         self.btn_fixdates.config(text=t("fix_dates"))
         self.btn_edit.config(text=t("edit_provider"))
         self.ctx_menu.entryconfig(0, label=t("ctx_switch"))
         self.ctx_menu.entryconfig(1, label=t("ctx_edit"))
         self.ctx_menu.entryconfig(3, label=t("ctx_remove"))
+
+    # ── Sync server control ─────────────────────────────────────────────────
+
+    def _toggle_sync(self):
+        if self._sync_server:
+            from codex_sync import stop_server
+            stop_server(self._sync_server)
+            self._sync_server = None
+            self.sync_status.config(text=t("sync_stopped"))
+            self.btn_sync.config(text=t("sync_start"))
+        else:
+            from codex_sync import start_server, get_local_ip
+            server, pin, port = start_server(port=None)
+            self._sync_server = server
+            self._sync_pin = pin
+            self._sync_port = port
+            ip = get_local_ip()
+            self.sync_status.config(text=t("sync_running").format(ip=ip, port=port, pin=pin))
+            self.btn_sync.config(text=t("sync_stop"))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self._sync_poll()
+
+    def _sync_poll(self):
+        if not self._sync_server:
+            return
+        import codex_sync
+        if codex_sync.data_changed:
+            codex_sync.data_changed = False
+            self._refresh()
+        self.root.after(2000, self._sync_poll)
+
+    def _open_dashboard(self):
+        if not self._sync_port:
+            messagebox.showinfo(t("info"), t("sync_start"))
+            return
+        import webbrowser
+        webbrowser.open(f"http://127.0.0.1:{self._sync_port}/dashboard")
+
+    def _copy_sync_info(self):
+        if not self._sync_port:
+            return
+        from codex_sync import get_local_ip
+        ip = get_local_ip()
+        text = f"{ip}:{self._sync_port} PIN:{self._sync_pin}"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set(f"Copied: {text}")
 
     # ── Refresh data ───────────────────────────────────────────────────────
 
@@ -725,7 +808,7 @@ class CodexManagerApp:
 
     def _convert_thread(self, from_p, to_p):
         try:
-            total, conv = _run_convert(from_p, to_p)
+            total, conv = _run_convert(from_p, to_p, auto_backup=self.autobackup_var.get())
             self.root.after(0, lambda: self._convert_done(total, conv, from_p, to_p))
         except Exception as e:
             self.root.after(0, lambda: self._convert_failed(str(e)))

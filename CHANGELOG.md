@@ -57,3 +57,41 @@
 ### Tests / Тесты
 - 14 smoke tests: syntax, merge config, b64, add/remove/edit provider, set model / 14 smoke-тестов
 - `python test_smoke.py` — no external dependencies / без внешних зависимостей
+
+## [1.1.0] — 2026-05-24
+
+### P2P Sync / P2P Синхронизация
+- Local P2P bidirectional sync between machines via HTTP API / Локальная P2P двунаправленная синхронизация между машинами
+- Web Dashboard (embedded HTML, dark theme) — accessible from any browser on the network / Веб-панель (встроенный HTML, тёмная тема)
+- PIN-based authentication (6-char hex) with rate limiting / PIN-авторизация (6-значный hex) с rate limiting
+- CORS support for cross-origin browser requests / Поддержка CORS для кросс-доменных запросов
+- Auto port selection (8080-8099) — tries next port if busy / Автоподбор порта — пробует следующий если занят
+- UDP broadcast beacon for LAN auto-discovery / UDP broadcast beacon для автообнаружения в LAN
+- Bidirectional: Push + Pull providers, sessions, files / Двунаправленная: Push + Pull провайдеров, сессий, файлов
+- Provider import modes: with key / without key / skip / keep both / Режимы импорта: с ключом / без ключа / пропустить / оба
+- Session sync: downloads JSONL + inserts into local DB / Синхронизация сессий: скачивает JSONL + вставляет в локальную БД
+- File sync: SHA-256 hash diff + ZIP packaging / Синхронизация файлов: SHA-256 diff + ZIP упаковка
+- Git dirty state check before file sync / Проверка незакоммиченных изменений Git перед синхронизацией
+- ZIP size limit (500 MB) / Лимит размера ZIP (500 МБ)
+- Auto-backup before every sync write operation / Автобекап перед каждой операцией записи
+- Settings tab: language, auto-backup, conflict resolution / Вкладка настроек: язык, автобекап, разрешение конфликтов
+
+### CLI / CLI
+- `--sync-host` — start sync server + Dashboard / запуск сервера синхронизации + Dashboard
+- `--sync-pull HOST[:PORT]` — connect and pull data / подключение и загрузка данных
+- `--sync-push HOST[:PORT]` — connect and push data / подключение и отправка данных
+- `--sync-pin PIN` — authentication PIN / PIN для авторизации
+- `--sync-port PORT` — specify port (default: auto) / указать порт (по умолчанию: авто)
+
+### GUI
+- Sync panel: Start/Stop server, IP:PORT + PIN display / Панель синхронизации: запуск/остановка, IP:PORT + PIN
+- "Open Dashboard" button — opens browser / Кнопка "Открыть Dashboard" — открывает браузер
+- "Copy IP:PIN" button / Кнопка "Копировать IP:PIN"
+- Auto-refresh GUI when data changes via Dashboard / Автообновление GUI при изменениях через Dashboard
+
+### New File / Новый файл
+- `codex_sync.py` — P2P sync engine (server, client, Dashboard, all 4 layers) / Движок P2P синхронизации
+
+### Tests / Тесты
+- 23 smoke tests (was 14) — added sync tests / 23 smoke-тестов (было 14) — добавлены тесты синхронизации
+- Tests: PIN format, hashes, file diff, path traversal, server ping, CORS, auth / Тесты: формат PIN, хэши, file diff, path traversal, ping, CORS, авторизация

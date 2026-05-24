@@ -7,6 +7,7 @@
 !README.md
 !codex_manager_gui.py
 !codex_chat_transformer.py
+!codex_sync.py
 !codex_manager.cmd
 !codex_manager.ps1
 !codex_manager.sh
@@ -16,3 +17,5 @@
 !providers_example.json
 !test_smoke.py
 !CHANGELOG.md
+!README.ru.md
+!README.zh.md

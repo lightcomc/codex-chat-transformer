@@ -1,0 +1,338 @@
+# Codex Chat Transformer
+
+[English](README.md) | [中文](README.zh.md)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.7+](https://img.shields.io/badge/Python-3.7%2B-blue.svg)](https://www.python.org/)
+[![Zero external deps](https://img.shields.io/badge/deps-zero-green.svg)]()
+
+Инструмент для управления сессиями [Codex Desktop](https://github.com/openai/codex) — конвертация чатов между провайдерами, закрепление в сайдбаре и полное резервное копирование.
+
+---
+
+## Быстрый старт
+
+Установка:
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/lightcomc/codex-chat-transformer/main/install.sh | bash
+```
+```powershell
+# PowerShell
+irm https://raw.githubusercontent.com/lightcomc/codex-chat-transformer/main/install.ps1 | iex
+```
+
+Основные команды:
+```bash
+# Запуск GUI
+codex_manager.cmd
+```
+```bash
+# Сохранить текущего провайдера
+python codex_chat_transformer.py --save-provider MyProvider
+```
+```bash
+# Переключить провайдер + конвертировать чаты
+python codex_chat_transformer.py --use-provider MyProvider
+```
+```bash
+# Полный бекап
+python codex_chat_transformer.py --backup
+```
+
+---
+
+## Проблема
+
+Codex Desktop создаёт отдельные «виртуальные пространства» для каждого способа подключения. При переключении между подпиской и API-ключом чаты «пропадают» — они на месте, но сайдбар фильтрует по текущему `model_provider`. Если попытаться продолжить чужой чат — получаешь 401, потому что он стучится не на тот endpoint.
+
+---
+
+## Возможности
+
+### Конвертация чатов
+
+Конвертирует чаты с одного провайдера на другой. Меняет `model_provider` в базе и JSONL-файлах. Поддерживает фильтрацию по проекту и маппинг моделей. Автоматически создаёт бекап. Отчёт о верификации после конвертации.
+
+```bash
+python codex_chat_transformer.py --from openai --to MyProvider
+```
+```bash
+python codex_chat_transformer.py --from openai --to MyProvider --dry-run
+```
+```bash
+python codex_chat_transformer.py --from openai --to MyProvider --project my_project
+```
+```bash
+python codex_chat_transformer.py --from openai --to MyProvider --from-model gpt-4 --to-model gpt-5.5
+```
+```bash
+python codex_chat_transformer.py --from openai --to MyProvider --thread <ID>
+```
+```bash
+python codex_chat_transformer.py --from openai --to MyProvider --skip-pinned
+```
+
+### Управление провайдерами
+
+Все провайдеры хранятся в одном `config.toml` — каждый как отдельная секция `[model_providers.*]`. Переключение меняет только `model_provider`, `model` и `model_reasoning_effort`, не трогая остальные настройки. Профили сохраняются в `providers.json` с автоматической миграцией старого формата.
+
+> **Примечание:** Провайдер `openai` защищён — URL и API-ключ доступны только для чтения. Для смены учётных данных OpenAI авторизуйтесь напрямую через Codex Desktop.
+
+Сохранить текущего провайдера как профиль:
+```bash
+python codex_chat_transformer.py --save-provider MyProvider
+```
+
+Переключиться:
+```bash
+python codex_chat_transformer.py --use-provider MyProvider
+```
+
+Добавить из JSON-файла:
+```bash
+python codex_chat_transformer.py --add-provider provider.json
+```
+```bash
+python codex_chat_transformer.py --add-provider provider.json --api-key sk-xxx
+```
+
+Редактировать:
+```bash
+python codex_chat_transformer.py --edit-provider MyProvider --set-model gpt-5.5
+```
+```bash
+python codex_chat_transformer.py --edit-provider MyProvider --set-url https://new.url/v1
+```
+```bash
+python codex_chat_transformer.py --edit-provider MyProvider --set-key sk-new
+```
+```bash
+python codex_chat_transformer.py --edit-provider MyProvider --set-reasoning high
+```
+
+Сменить модель (без переключения провайдера):
+```bash
+python codex_chat_transformer.py --set-model gpt-5.5
+```
+
+Удалить:
+```bash
+python codex_chat_transformer.py --remove-provider MyProvider
+```
+
+Список:
+```bash
+python codex_chat_transformer.py --providers
+```
+
+Автообнаружение:
+```bash
+python codex_chat_transformer.py --detect-provider
+```
+
+### Закрепление чатов
+
+Делает чаты видимыми при **любом** подключении. Pinned-чаты показываются всегда, независимо от провайдера. Используется для реактивации чатов при переходе между провайдерами.
+
+```bash
+python codex_chat_transformer.py --pin-top 10
+```
+```bash
+python codex_chat_transformer.py --pin-top 10 --project my_project
+```
+```bash
+python codex_chat_transformer.py --pin-list
+```
+```bash
+python codex_chat_transformer.py --unpin-all
+```
+
+### Полный бекап
+
+Упаковывает всю папку `.codex` в ZIP: база, конфиги, авторизация, все сессии, `providers.json`.
+
+```bash
+python codex_chat_transformer.py --backup
+```
+```bash
+python codex_chat_transformer.py --restore backup_20260518_120000
+```
+```bash
+python codex_chat_transformer.py --restore-zip codex_backup_20260518.zip
+```
+
+### Диагностика
+
+Read-only проверка состояния: база, конфиг, авторизация, провайдеры, закреплённые чаты.
+
+```bash
+python codex_chat_transformer.py --doctor
+```
+
+### P2P Синхронизация
+
+Локальная двунаправленная синхронизация между машинами через HTTP API + веб-панель. Обе машины запускают один и тот же сервер. Браузер выступает оркестратором — Push и Pull провайдеров, сессий и файлов проекта.
+
+```bash
+# Запуск сервера синхронизации (автоподбор свободного порта)
+python codex_chat_transformer.py --sync-host
+
+# Запуск на конкретном порту
+python codex_chat_transformer.py --sync-host --sync-port 8080
+
+# Подключение к удалённому серверу и загрузка данных
+python codex_chat_transformer.py --sync-pull 192.168.1.60:8080 --sync-pin A7B3C2
+```
+
+Возможности:
+- Веб-панель (тёмная тема, 4 вкладки: Подключение, Провайдеры, Сессии, Файлы)
+- PIN-авторизация с rate limiting
+- Двунаправленная: Push + Pull для каждого элемента
+- Режимы импорта провайдеров: с ключом / без ключа / пропустить / оба
+- Синхронизация сессий: скачивание JSONL + вставка в БД
+- Синхронизация файлов: SHA-256 diff + ZIP упаковка
+- Автоподбор порта (пробует 8080-8099)
+- UDP broadcast для автообнаружения в LAN
+- Проверка незакоммиченных изменений Git перед синхронизацией
+- Автобекап перед каждой операцией записи
+
+---
+
+## GUI
+
+GUI — тонкая обёртка над CLI (`import codex_chat_transformer as ct`), дублирования кода нет.
+
+### Возможности GUI
+
+- Переключение провайдеров одним кликом
+- Конвертация чатов в фоновом потоке — GUI не зависает
+- Редактирование провайдера: кнопка или правый клик
+- Модель и reasoning меняются прямо в info-панели
+- Выпадающий список reasoning: low / medium / high / xhigh / default
+- Автообнаружение JSON-конфигов рядом с приложением
+- Запрос API-ключа при импорте если отсутствует
+- Провайдер `openai` защищён от редактирования
+- Автоматическая миграция старых профилей
+- RU / EN интерфейс
+
+### Запуск
+
+| Платформа | Команда |
+|---|---|
+| Windows | `codex_manager.cmd` (двойной клик) |
+| PowerShell | `.\codex_manager.ps1` |
+| Linux / macOS | `./codex_manager.sh` |
+
+### Добавление провайдера
+
+Положите JSON-файл рядом с приложением — он подхватится автоматически. Если ключа нет — программа спросит.
+
+```json
+{
+  "name": "NeuroGate API",
+  "model": "gpt-5.5",
+  "base_url": "https://api.example.com/v1",
+  "wire_api": "responses",
+  "model_reasoning_effort": "medium"
+}
+```
+
+---
+
+## Требования
+
+- Python 3.7+
+- Tkinter (входит в стандартную поставку Python)
+- Без внешних зависимостей
+
+---
+
+## Безопасность
+
+API-ключи хранятся локально с base64 обфусцированием (и в CLI, и в GUI). Это **не** шифрование. Не передавайте `providers.json` и `auth.json` третьим лицам. Инструмент не отправляет ключи никуда, кроме настроенного API endpoint.
+
+---
+
+## FAQ
+
+**В: Чаты пропали после смены способа подключения.**
+
+О: Конвертируйте в текущий провайдер: `--list` чтобы узнать имя, затем `--from openai --to YourProvider`. Codex должен быть закрыт.
+
+**В: Чат видно, но при отправке — 401.**
+
+О: Провайдер в JSONL не обновился. Перезапустите конвертацию — обновляются и БД, и JSONL.
+
+**В: Как конвертировать чаты только одного проекта?**
+
+О: `--from openai --to MyProvider --project my_project`. Фильтрует по полю `project` в базе.
+
+**В: Как маппить модели при конвертации?**
+
+О: `--from openai --to MyProvider --from-model gpt-4 --to-model gpt-5.5`. Заменяет имя модели в JSONL.
+
+**В: Можно ли откатить?**
+
+О: Три способа:
+1. `--restore backup_YYYYMMDD_HHMMSS` — откатить БД
+2. `--restore-zip file.zip` — полное восстановление
+3. Обратная конвертация: `--from YourProvider --to openai`
+
+**В: Нужно ли закрывать Codex?**
+
+О: **Да.** Codex держит БД открытой и может перезаписать изменения.
+
+**В: Что делает `--doctor`?**
+
+О: Read-only диагностика: проверяет базу, конфиг, авторизацию, провайдеры, pinned-чаты. Ничего не меняет.
+
+**В: Как сменить модель без переключения провайдера?**
+
+О: В GUI — кликните на модель в info-панели и введите новую. В CLI — `--set-model gpt-5.5`.
+
+**В: Как сменить reasoning effort?**
+
+О: В GUI — выпадающий список в info-панели. В CLI — `--edit-provider NAME --set-reasoning high`.
+
+**В: Как синхронизировать провайдеров между двумя компьютерами?**
+
+О: Запустите `--sync-host` на обоих. Откройте Dashboard в браузере, введите удалённый IP + PIN, выберите провайдеров и нажмите Pull или Push.
+
+**В: Можно ли синхронизировать без Dashboard?**
+
+О: Да: `--sync-pull IP:PORT --pin XXXXXX` откроет интерактивное CLI-меню.
+
+---
+
+## Где что хранится
+
+| Файл | Содержимое |
+|---|---|
+| `state_5.sqlite` → `threads` | Метаданные чатов: провайдер, заголовок, проект, токены |
+| `sessions/YYYY/MM/DD/rollout-*.jsonl` | Полная история чата |
+| `.codex-global-state.json` → `pinned-thread-ids` | Закреплённые чаты |
+| `config.toml` | Все провайдеры `[model_providers.*]` + настройки |
+| `auth.json` | Текущая авторизация (API-ключ или OAuth) |
+| `providers.json` | Профили провайдеров (`provider_section` + `model` + авторизация, b64 обфускация) |
+
+---
+
+## Файлы
+
+```
+codex_chat_transformer.py    — CLI: конвертация, провайдеры, закрепление, бекап, doctor, редактирование, синхронизация
+codex_manager_gui.py         — GUI: переключение, редактирование, смена модели, синхронизация (обёртка над CLI)
+codex_sync.py                — Движок P2P синхронизации: сервер, клиент, Dashboard, синхронизация файлов
+test_smoke.py                — Smoke-тесты (23 теста)
+codex_manager.cmd / .ps1     — Windows запускаторы
+codex_manager.sh             — Unix запускатор
+providers_template.json      — Шаблон провайдера
+providers_example.json       — Пример провайдера
+CHANGELOG.md                 — История изменений
+install.sh / install.ps1     — Установка одной строкой
+```
+
+## Лицензия
+
+[MIT](LICENSE)

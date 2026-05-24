@@ -1461,6 +1461,13 @@ def main():
     parser.add_argument("--set-wire-api", metavar="API", help="Set wire_api for --edit-provider")
     parser.add_argument("--set-reasoning", metavar="LEVEL", help="Set reasoning effort (low/medium/high/xhigh) for --edit-provider")
 
+    # Sync arguments
+    parser.add_argument("--sync-host", action="store_true", help="Start P2P sync server + Dashboard")
+    parser.add_argument("--sync-port", type=int, default=None, metavar="PORT", help="Port for sync server (default: auto)")
+    parser.add_argument("--sync-pull", metavar="HOST[:PORT]", help="Connect to sync host and pull data")
+    parser.add_argument("--sync-push", metavar="HOST[:PORT]", help="Connect to sync host and push data")
+    parser.add_argument("--sync-pin", metavar="PIN", help="PIN for sync authentication (prompts if omitted)")
+
     args = parser.parse_args()
 
     if args.restore:
@@ -1514,6 +1521,72 @@ def main():
 
     if args.doctor:
         doctor()
+        return
+
+    if args.sync_host:
+        from codex_sync import start_server, get_local_ip, stop_server
+        server, pin, port = start_server(port=args.sync_port)
+        ip = get_local_ip()
+        print(f"\n=== Codex Sync Server ===")
+        print(f"  Address: http://{ip}:{port}")
+        print(f"  Dashboard: http://{ip}:{port}/dashboard")
+        print(f"  PIN: {pin}")
+        print(f"\nPress Ctrl+C to stop.\n")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nStopping sync server...")
+            stop_server(server)
+        return
+
+    if args.sync_pull or args.sync_push:
+        from codex_sync import _client_get_json, _client_post_json
+        target = args.sync_pull or args.sync_push
+        if ":" in target:
+            host, port_str = target.rsplit(":", 1)
+            port = int(port_str)
+        else:
+            host = target
+            port = 8080
+        pin = args.sync_pin or input("Enter PIN: ").strip().upper()
+        mode = "pull" if args.sync_pull else "push"
+        base_url = f"http://{host}:{port}"
+        print(f"\n=== Codex Sync ({mode}) ===")
+        print(f"  Target: {host}:{port}")
+        try:
+            manifest = _client_get_json(f"{base_url}/api/manifest", pin)
+            print(f"  Connected! {manifest['session_count']} sessions, {manifest['provider_count']} providers\n")
+        except Exception as e:
+            print(f"  Connection failed: {e}")
+            return
+        print("  [1] Pull providers")
+        print("  [2] Pull sessions")
+        print("  [3] Push providers")
+        print("  [4] Push sessions")
+        print("  [0] Exit")
+        choice = input("\n  Choose: ").strip()
+        if choice == "1":
+            data = _client_get_json(f"{base_url}/api/providers", pin)
+            for p in data.get("providers", []):
+                print(f"  {p['name']}: {p['model']} ({p['auth_mode']}, key={'yes' if p['has_key'] else 'no'})")
+        elif choice == "2":
+            data = _client_get_json(f"{base_url}/api/sessions", pin)
+            for s in data.get("sessions", [])[:20]:
+                updated = datetime.datetime.fromtimestamp(s["updated_at_ms"] / 1000).strftime("%Y-%m-%d %H:%M") if s.get("updated_at_ms") else "?"
+                print(f"  {s['id'][:12]}... | {s['title'][:40]} | {s['model_provider']} | {updated}")
+        elif choice == "3":
+            data = _client_get_json(f"http://127.0.0.1:8080/api/providers", "")
+            names = [p["name"] for p in data.get("providers", [])]
+            if not names:
+                print("  No local providers to push.")
+            else:
+                for n in names:
+                    print(f"  {n}")
+                sel = input("  Push which (comma-separated)? ").strip()
+                if sel:
+                    result = _client_post_json(f"{base_url}/api/upload/provider", pin,
+                                               {"names": [n.strip() for n in sel.split(",")]})
+                    print(f"  Result: {result}")
         return
 
     conn = get_db_conn()

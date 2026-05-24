@@ -259,6 +259,142 @@ def test_cli_syntax():
     )
 
 
+# --- Sync tests ---
+
+def test_sync_syntax():
+    py_compile.compile(
+        str(Path(__file__).parent / "codex_sync.py"), doraise=True
+    )
+
+
+def test_sync_imports():
+    import codex_sync
+    assert hasattr(codex_sync, "generate_pin")
+    assert hasattr(codex_sync, "get_local_ip")
+    assert hasattr(codex_sync, "find_free_port")
+    assert hasattr(codex_sync, "compute_local_hashes")
+    assert hasattr(codex_sync, "compute_file_diff")
+    assert hasattr(codex_sync, "start_server")
+    assert hasattr(codex_sync, "stop_server")
+
+
+def test_pin_format():
+    import codex_sync
+    for _ in range(10):
+        pin = codex_sync.generate_pin()
+        assert len(pin) == 6, f"PIN should be 6 chars, got {len(pin)}"
+        assert pin == pin.upper(), f"PIN should be uppercase: {pin}"
+        int(pin, 16)  # must be valid hex
+
+
+def test_compute_hashes():
+    import codex_sync, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        (Path(tmp) / "test.txt").write_text("hello", encoding="utf-8")
+        (Path(tmp) / "sub").mkdir()
+        (Path(tmp) / "sub" / "inner.py").write_text("print(1)", encoding="utf-8")
+        (Path(tmp) / ".git").mkdir()
+        (Path(tmp) / ".git" / "config").write_text("git", encoding="utf-8")
+        (Path(tmp) / "__pycache__").mkdir()
+        (Path(tmp) / "__pycache__" / "cache.pyc").write_text("cache", encoding="utf-8")
+        hashes = codex_sync.compute_local_hashes(tmp)
+        assert "test.txt" in hashes, "test.txt should be hashed"
+        assert "sub/inner.py" in hashes, "sub/inner.py should be hashed"
+        assert not any(".git" in h for h in hashes), ".git files should be excluded"
+        assert not any("__pycache__" in h for h in hashes), "__pycache__ should be excluded"
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_file_diff():
+    import codex_sync
+    local = {"a.txt": "aaa", "b.txt": "bbb", "c.txt": "ccc"}
+    remote = {"a.txt": "aaa", "b.txt": "BBB", "d.txt": "ddd"}
+    diff = codex_sync.compute_file_diff(local, remote)
+    assert set(diff["unchanged"]) == {"a.txt"}, f"unchanged: {diff['unchanged']}"
+    assert set(diff["modified"]) == {"b.txt"}, f"modified: {diff['modified']}"
+    assert set(diff["new"]) == {"d.txt"}, f"new: {diff['new']}"
+    assert set(diff["deleted"]) == {"c.txt"}, f"deleted: {diff['deleted']}"
+
+
+def test_path_traversal():
+    import codex_sync
+    assert codex_sync._validate_path("safe/file.txt", "/project")
+    assert not codex_sync._validate_path("../../../etc/passwd", "/project")
+    assert not codex_sync._validate_path("/absolute/path", "/project")
+
+
+def test_server_ping():
+    import codex_sync, threading, json
+    server, pin, port = codex_sync.start_server(port=0)
+    actual_port = server.server_address[1]
+    codex_sync.SyncHandler.pin = pin
+    codex_sync.SyncHandler.server_port = actual_port
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request("GET", "/api/ping")
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        assert resp.status == 200, f"Expected 200, got {resp.status}"
+        assert data["status"] == "ok"
+        assert data["version"] == "1.0"
+    finally:
+        codex_sync.stop_server(server)
+
+
+def test_server_auth_required():
+    import codex_sync, threading, json
+    server, pin, port = codex_sync.start_server(port=0)
+    actual_port = server.server_address[1]
+    codex_sync.SyncHandler.pin = pin
+    codex_sync.SyncHandler.server_port = actual_port
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request("GET", "/api/manifest")
+        resp = conn.getresponse()
+        conn.close()
+        assert resp.status == 401, f"Expected 401, got {resp.status}"
+
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request("GET", "/api/manifest", headers={"Authorization": f"Bearer {pin}"})
+        resp = conn.getresponse()
+        conn.close()
+        assert resp.status == 200, f"Expected 200 with PIN, got {resp.status}"
+    finally:
+        codex_sync.stop_server(server)
+
+
+def test_server_cors():
+    import codex_sync, threading
+    server, pin, port = codex_sync.start_server(port=0)
+    actual_port = server.server_address[1]
+    codex_sync.SyncHandler.pin = pin
+    codex_sync.SyncHandler.server_port = actual_port
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request("OPTIONS", "/api/providers")
+        resp = conn.getresponse()
+        resp.read()
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+        conn.close()
+        assert resp.status == 200, f"OPTIONS should return 200, got {resp.status}"
+        assert "access-control-allow-origin" in headers, "Missing CORS header"
+        assert headers["access-control-allow-origin"] == "*", "CORS should be *"
+    finally:
+        codex_sync.stop_server(server)
+
+
+import http.client
+
+
 # --- Run ---
 
 if __name__ == "__main__":
@@ -278,6 +414,17 @@ if __name__ == "__main__":
     test("_merge_config handles reasoning effort", test_merge_reasoning)
     test("edit_provider updates profile", test_edit_provider)
     test("set_model changes config", test_set_model)
+
+    # Sync tests
+    test("codex_sync.py syntax valid", test_sync_syntax)
+    test("codex_sync imports", test_sync_imports)
+    test("PIN format: 6 uppercase hex chars", test_pin_format)
+    test("compute_local_hashes", test_compute_hashes)
+    test("compute_file_diff", test_file_diff)
+    test("path traversal protection", test_path_traversal)
+    test("server ping", test_server_ping)
+    test("server auth required (401 without PIN, 200 with PIN)", test_server_auth_required)
+    test("server CORS headers", test_server_cors)
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     sys.exit(1 if FAILED else 0)
