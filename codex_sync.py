@@ -13,6 +13,7 @@ import hashlib
 import http.client
 import io
 import json
+import ipaddress
 import os
 import secrets
 import shutil
@@ -444,6 +445,7 @@ def extract_pack(zip_source, target_dir, backup=True):
         zip_path = tmpf.name
         tmp_cleanup = tmpf.name
 
+    bak_dir = None
     if backup:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         bak_dir = os.path.join(target, f".sync_backup_{ts}")
@@ -503,6 +505,26 @@ def _create_sync_backup():
     return str(bak_dir)
 
 
+def is_local_origin(origin):
+    if not origin:
+        return True
+    try:
+        parsed = urlparse(origin)
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
+            return True
+        try:
+            ip = ipaddress.ip_address(hostname)
+            return ip.is_loopback or ip.is_private
+        except ValueError:
+            pass
+        return False
+    except Exception:
+        return False
+
+
 # ── HTTP Request Handler ─────────────────────────────────────────────────
 
 
@@ -515,12 +537,8 @@ class SyncHandler(BaseHTTPRequestHandler):
 
     def end_headers(self):
         origin = self.headers.get("Origin", "")
-        if not origin or origin.startswith("http://127.0.0.1") or \
-           origin.startswith("http://localhost") or \
-           origin.startswith("http://" + get_local_ip()):
+        if is_local_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin or "*")
-        else:
-            self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         super().end_headers()

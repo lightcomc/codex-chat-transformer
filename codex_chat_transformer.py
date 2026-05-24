@@ -413,6 +413,8 @@ def doctor():
     # Thread stats
     if STATE_DB.exists():
         conn = get_db_conn()
+        if conn is None:
+            return
         cur = conn.cursor()
         cur.execute("SELECT model_provider, COUNT(*) as cnt FROM threads GROUP BY model_provider ORDER BY cnt DESC")
         rows = cur.fetchall()
@@ -657,10 +659,13 @@ def list_pinned(conn):
         return
 
     cur = conn.cursor()
+    placeholders = ",".join("?" for _ in pinned_ids)
+    cur.execute(f"SELECT id, title, model_provider, updated_at_ms, cwd FROM threads WHERE id IN ({placeholders})", tuple(pinned_ids))
+    rows = {row["id"]: row for row in cur.fetchall()}
+
     print(f"\n=== Pinned threads ({len(pinned_ids)}) ===\n")
     for tid in pinned_ids:
-        cur.execute("SELECT title, model_provider, updated_at_ms, cwd FROM threads WHERE id = ?", (tid,))
-        row = cur.fetchone()
+        row = rows.get(tid)
         if row:
             ts = datetime.datetime.fromtimestamp(row["updated_at_ms"] / 1000).strftime("%Y-%m-%d %H:%M") if row["updated_at_ms"] else "N/A"
             print(f"  {ts}  [{row['model_provider']}]  {(row['title'] or '')[:55]}")
@@ -790,6 +795,8 @@ def _fmt_size(n):
 def fix_dates():
     """Set file mtime to last event timestamp for all rollout files."""
     conn = get_db_conn()
+    if conn is None:
+        return
     cur = conn.cursor()
     cur.execute("SELECT rollout_path FROM threads WHERE rollout_path IS NOT NULL")
 
@@ -1201,11 +1208,12 @@ def use_provider(name, skip_convert=False):
     # 3. Convert threads
     if not skip_convert:
         conn = get_db_conn()
-        try:
-            print()
-            transform(conn, active, target_provider, thread_id=None, skip_pinned=False)
-        finally:
-            conn.close()
+        if conn is not None:
+            try:
+                print()
+                transform(conn, active, target_provider, thread_id=None, skip_pinned=False)
+            finally:
+                conn.close()
 
 
 def detect_provider():
@@ -1590,44 +1598,44 @@ def main():
         return
 
     conn = get_db_conn()
+    if conn is not None:
+        try:
+            if args.list:
+                list_threads(conn)
+                return
 
-    try:
-        if args.list:
-            list_threads(conn)
-            return
+            if args.pin_list:
+                list_pinned(conn)
+                return
 
-        if args.pin_list:
-            list_pinned(conn)
-            return
+            if args.unpin_all:
+                unpin_all()
+                return
 
-        if args.unpin_all:
-            unpin_all()
-            return
+            if args.pin_top:
+                pin_top_threads(conn, args.pin_top, args.project)
+                return
 
-        if args.pin_top:
-            pin_top_threads(conn, args.pin_top, args.project)
-            return
+            if not args.from_provider or not args.to_provider:
+                print("ERROR: --from and --to are required for transformation.")
+                print("Use --list to see available providers.")
+                print("\nExample:")
+                print("  python codex_chat_transformer.py --list")
+                print("  python codex_chat_transformer.py --from openai --to MyProvider --dry-run")
+                print("  python codex_chat_transformer.py --from openai --to MyProvider")
+                print("  python codex_chat_transformer.py --restore backup_YYYYMMDD_HHMMSS")
+                sys.exit(1)
 
-        if not args.from_provider or not args.to_provider:
-            print("ERROR: --from and --to are required for transformation.")
-            print("Use --list to see available providers.")
-            print("\nExample:")
-            print("  python codex_chat_transformer.py --list")
-            print("  python codex_chat_transformer.py --from openai --to MyProvider --dry-run")
-            print("  python codex_chat_transformer.py --from openai --to MyProvider")
-            print("  python codex_chat_transformer.py --restore backup_YYYYMMDD_HHMMSS")
-            sys.exit(1)
+            if args.from_provider == args.to_provider:
+                print("ERROR: --from and --to must be different.")
+                sys.exit(1)
 
-        if args.from_provider == args.to_provider:
-            print("ERROR: --from and --to must be different.")
-            sys.exit(1)
-
-        print(f"Transforming: {args.from_provider} -> {args.to_provider}"
-              + (f" (project: {args.project})" if args.project else ""))
-        transform(conn, args.from_provider, args.to_provider, args.dry_run, args.thread, args.skip_pinned,
-                  args.from_model, args.to_model, args.project)
-    finally:
-        conn.close()
+            print(f"Transforming: {args.from_provider} -> {args.to_provider}"
+                  + (f" (project: {args.project})" if args.project else ""))
+            transform(conn, args.from_provider, args.to_provider, args.dry_run, args.thread, args.skip_pinned,
+                      args.from_model, args.to_model, args.project)
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

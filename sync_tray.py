@@ -219,7 +219,7 @@ class SyncTrayApp:
                 val, _ = winreg.QueryValueEx(key, "CodexSyncTray")
                 key.Close()
                 return True
-            except (WindowsError, OSError):
+            except OSError:
                 return False
         elif platform.system() == "Darwin":
             plist = Path.home() / "Library/LaunchAgents/com.codex.synctray.plist"
@@ -265,7 +265,7 @@ class SyncTrayApp:
                                      0, winreg.KEY_WRITE)
                 winreg.DeleteValue(key, "CodexSyncTray")
                 key.Close()
-            except (WindowsError, OSError):
+            except OSError:
                 pass
         elif platform.system() == "Darwin":
             plist = Path.home() / "Library/LaunchAgents/com.codex.synctray.plist"
