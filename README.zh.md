@@ -188,6 +188,8 @@ python codex_chat_transformer.py --sync-pull 192.168.1.60:8080 --sync-pin A7B3C2
 功能：
 - 网页面板（深色主题，5 个标签页：连接、提供商、会话、文件、设置）
 - 基于 PIN 的身份验证，带速率限制
+- **信任设备（配对）**：输入 PIN 一次 → 设备被记住 → 自动连接无需 PIN
+- **局域网自动发现**：UDP 广播带服务器名称，从 Dashboard 一键连接
 - 双向：每个项目均可 Push 和 Pull
 - 提供商导入模式：带密钥 / 不带密钥 / 跳过 / 保留两者
 - 会话同步：下载 JSONL + 插入本地数据库
@@ -342,7 +344,7 @@ codex_chat_transformer.py    — CLI：转换、提供商、固定、备份、�
 codex_manager_gui.py         — GUI：切换、编辑、更改模型、同步（CLI 封装）
 codex_sync.py                — P2P 同步引擎：服务器、客户端、Dashboard、文件同步、自动同步
 sync_tray.py                 — 系统托盘小组件（可选，需 pystray + Pillow）
-test_smoke.py                — 冒烟测试（27 个测试）
+test_smoke.py                — 冒烟测试（32 个测试）
 codex_manager.cmd / .ps1     — Windows 启动器
 codex_manager.sh             — Unix 启动器
 providers_template.json      — 提供商模板

@@ -2,6 +2,21 @@
 
 ## [1.2.0] — 2026-05-24
 
+### UDP Beacon + Trusted Devices (Pairing) / UDP Beacon + Доверенные устройства (Pairing)
+- UDP beacon now broadcasts `server_id` (UUID) and `name` for stable device identification / UDP beacon теперь транслирует `server_id` (UUID) и `name` для стабильной идентификации
+- Trusted device storage in `~/.codex/trusted_devices.json` — tokens stored as SHA-256 hashes / Хранилище доверенных устройств — токены хранятся как SHA-256 хэши
+- One-time PIN pairing: `POST /api/pair` exchanges PIN for long-term crypto token / Одноразовый pairing: обмен PIN на долгосрочный токен
+- Auto-connect: trusted devices connect without PIN, keyed by `server_id` (survives DHCP changes) / Авто-подключение: доверенные устройства подключаются без PIN, привязка по server_id
+- `GET /api/local-info` — local-only endpoint returns PIN, server_id, trusted devices / Локальный endpoint возвращает PIN, server_id, доверенные устройства
+- `POST /api/server-name` — change display name from Dashboard / Смена имени сервера из Dashboard
+- `POST /api/unpair` — revoke trusted device / Отзыв доверенного устройства
+- `GET /api/trusted` — list paired devices / Список связанных устройств
+- `GET /api/scan-beacons` — server-side UDP listener for Dashboard auto-discovery / Серверный UDP listener для автообнаружения
+- ThreadingHTTPServer replaces HTTPServer — beacon scanning no longer blocks requests / ThreadingHTTPServer — сканирование beacon больше не блокирует запросы
+- Dashboard Connect tab: auto-scan LAN, discovered server list, click-to-connect with pairing / Вкладка Connect: автосканирование LAN, список серверов, подключение с pairing
+- Dashboard Settings tab: trusted devices list with Unpair, server name editor / Вкладка Settings: список доверенных устройств, редактор имени сервера
+- Deduplication in `listen_for_beacons()` — same IP:port appears once / Дедупликация в listen_for_beacons
+
 ### Session-Project Auto-Link / Связывание сессий с файлами проекта
 - After session Pull/Push, Dashboard detects linked project directory and offers file sync / После Pull/Push сессии Dashboard определяет привязанный проект и предлагает синхронизацию файлов
 - Uses session `cwd` (real working dir) instead of `project` field / Использует `cwd` (реальную рабочую директорию) вместо поля `project`
@@ -27,8 +42,8 @@
 - Requires: `pip install pystray Pillow` (optional) / Требует: pystray + Pillow (опционально)
 
 ### Tests / Тесты
-- 27 smoke tests (was 23) / 27 smoke-тестов (было 23)
-- New: manifest hash, sessions cwd/git fields, sync_tray syntax, sync_tray import checks / Новые: хэш манифеста, поля cwd/git, синтаксис трея, проверки импорта
+- 32 smoke tests (was 23) / 32 smoke-тестов (было 23)
+- New: manifest hash, sessions cwd/git fields, sync_tray syntax, sync_tray import, trusted device storage, pairing endpoint, local-info, unpair / Новые: хэш манифеста, поля cwd/git, трей, pairing, local-info, unpair
 
 ## [1.0.0] — 2026-05-23
 

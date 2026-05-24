@@ -477,6 +477,155 @@ def test_sync_tray_imports_optional():
     assert "SyncTrayApp" in content, "Should have SyncTrayApp class"
 
 
+# --- Pairing tests ---
+
+def test_trusted_device_storage():
+    """Trusted device helpers: add, check, remove."""
+    import codex_sync, tempfile, json, shutil
+    tmp = tempfile.mkdtemp()
+    orig = codex_sync.TRUSTED_FILE
+    codex_sync.TRUSTED_FILE = codex_sync.Path(tmp) / "trusted_devices.json"
+    try:
+        data = codex_sync._load_trusted()
+        assert "server_id" in data, "should auto-create server_id"
+        assert len(data["server_id"]) == 32, "server_id should be 32 hex chars"
+        assert "devices" in data, "should have devices dict"
+        assert len(data["devices"]) == 0, "should start empty"
+
+        token = "a" * 32
+        codex_sync._add_trusted_token(token, "Test Laptop")
+        assert codex_sync._is_trusted_token(token), "should recognize trusted token"
+        assert not codex_sync._is_trusted_token("wrong"), "should reject unknown token"
+
+        data2 = codex_sync._load_trusted()
+        assert len(data2["devices"]) == 1, "should have 1 device"
+
+        codex_sync._remove_trusted_token(codex_sync._hash_token(token))
+        assert not codex_sync._is_trusted_token(token), "should remove trust"
+
+        data3 = codex_sync._load_trusted()
+        assert len(data3["devices"]) == 0, "should be empty after remove"
+    finally:
+        codex_sync.TRUSTED_FILE = orig
+        shutil.rmtree(tmp)
+
+
+def test_server_pairing_endpoint():
+    """POST /api/pair with correct PIN returns paired, wrong PIN returns 401."""
+    import codex_sync, threading, json
+    server, pin, port = codex_sync.start_server(port=0)
+    actual_port = server.server_address[1]
+    codex_sync.SyncHandler.pin = pin
+    codex_sync.SyncHandler.server_port = actual_port
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        # Wrong PIN
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        body = json.dumps({"pin": "WRONG", "client_token": "a" * 32, "device_name": "Bad"})
+        conn.request("POST", "/api/pair", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        assert resp.status == 401, f"Wrong PIN should give 401, got {resp.status}"
+
+        # Correct PIN
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        client_token = "b" * 32
+        body = json.dumps({"pin": pin, "client_token": client_token,
+                           "device_name": "Test Laptop"})
+        conn.request("POST", "/api/pair", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        assert resp.status == 200, f"Correct PIN should give 200, got {resp.status}"
+        assert data["status"] == "paired", f"Expected paired, got {data}"
+        assert "server_name" in data, "should return server_name"
+
+        # Trusted token should now work for auth
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request("GET", "/api/manifest",
+                     headers={"Authorization": "Bearer " + client_token})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        assert resp.status == 200, f"Trusted token should work, got {resp.status}"
+    finally:
+        codex_sync.stop_server(server)
+
+
+def test_server_local_info():
+    """GET /api/local-info returns pin, server_id, server_name without auth."""
+    import codex_sync, threading, json
+    server, pin, port = codex_sync.start_server(port=0)
+    actual_port = server.server_address[1]
+    codex_sync.SyncHandler.pin = pin
+    codex_sync.SyncHandler.server_port = actual_port
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request("GET", "/api/local-info")
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        assert resp.status == 200, f"Expected 200, got {resp.status}"
+        assert data["pin"] == pin, "should return actual PIN"
+        assert len(data["server_id"]) == 32, "server_id should be 32 hex"
+        assert "server_name" in data, "should have server_name"
+        assert isinstance(data["trusted"], list), "should have trusted list"
+    finally:
+        codex_sync.stop_server(server)
+
+
+def test_server_unpair_endpoint():
+    """POST /api/unpair removes trusted device."""
+    import codex_sync, threading, json
+    server, pin, port = codex_sync.start_server(port=0)
+    actual_port = server.server_address[1]
+    codex_sync.SyncHandler.pin = pin
+    codex_sync.SyncHandler.server_port = actual_port
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        # Pair first
+        client_token = "c" * 32
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        body = json.dumps({"pin": pin, "client_token": client_token,
+                           "device_name": "ToUnpair"})
+        conn.request("POST", "/api/pair", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        assert resp.status == 200
+
+        # Unpair
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        body = json.dumps({"device_name": "ToUnpair"})
+        conn.request("POST", "/api/unpair", body=body,
+                     headers={"Content-Type": "application/json",
+                               "Authorization": "Bearer " + pin})
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        assert resp.status == 200
+        assert data["status"] == "unpaired"
+
+        # Token should no longer work
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request("GET", "/api/manifest",
+                     headers={"Authorization": "Bearer " + client_token})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        assert resp.status == 401, "Token should be revoked after unpair"
+    finally:
+        codex_sync.stop_server(server)
+
+
 # --- Run ---
 
 if __name__ == "__main__":
@@ -512,6 +661,10 @@ if __name__ == "__main__":
     test("sessions include cwd and git fields", test_sessions_include_cwd_and_git)
     test("sync_tray.py syntax valid", test_sync_tray_syntax)
     test("sync_tray imports optional (graceful)", test_sync_tray_imports_optional)
+    test("trusted device storage (add/check/remove)", test_trusted_device_storage)
+    test("server pairing endpoint (PIN exchange)", test_server_pairing_endpoint)
+    test("server local-info (no auth)", test_server_local_info)
+    test("server unpair endpoint (revoke token)", test_server_unpair_endpoint)
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     sys.exit(1 if FAILED else 0)

@@ -23,7 +23,7 @@ import threading
 import time
 import zipfile
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -33,6 +33,7 @@ CODEX_DIR = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 STATE_DB = CODEX_DIR / "state_5.sqlite"
 PROVIDERS_FILE = CODEX_DIR / "providers.json"
 SESSIONS_DIR = CODEX_DIR / "sessions"
+TRUSTED_FILE = CODEX_DIR / "trusted_devices.json"
 
 SYNC_VERSION = "1.0"
 
@@ -112,6 +113,77 @@ def _record_failed_auth():
 def _reset_rate_limit():
     with _auth_lock:
         _failed_auth["count"] = 0
+
+
+# ── Trusted devices (pairing) ────────────────────────────────────────────
+
+
+def _load_trusted():
+    if not TRUSTED_FILE.exists():
+        return {"server_id": secrets.token_hex(16), "server_name": socket.gethostname()[:30], "devices": {}}
+    try:
+        with open(str(TRUSTED_FILE), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "server_id" not in data:
+            data["server_id"] = secrets.token_hex(16)
+        if "server_name" not in data:
+            data["server_name"] = socket.gethostname()[:30]
+        if "devices" not in data:
+            data["devices"] = {}
+        return data
+    except Exception:
+        return {"server_id": secrets.token_hex(16), "server_name": socket.gethostname()[:30], "devices": {}}
+
+
+def _save_trusted(data):
+    CODEX_DIR.mkdir(parents=True, exist_ok=True)
+    with open(str(TRUSTED_FILE), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _get_server_id():
+    data = _load_trusted()
+    return data.get("server_id", "")
+
+
+def _get_server_name():
+    data = _load_trusted()
+    return data.get("server_name", socket.gethostname()[:30])
+
+
+def _set_server_name(name):
+    data = _load_trusted()
+    data["server_name"] = name[:30]
+    _save_trusted(data)
+
+
+def _hash_token(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _is_trusted_token(token):
+    data = _load_trusted()
+    token_hash = _hash_token(token)
+    return token_hash in data.get("devices", {})
+
+
+def _add_trusted_token(token, name):
+    data = _load_trusted()
+    token_hash = _hash_token(token)
+    data["devices"][token_hash] = {
+        "name": name[:50],
+        "added_at": int(time.time()),
+    }
+    _save_trusted(data)
+
+
+def _remove_trusted_token(token_hash):
+    data = _load_trusted()
+    if token_hash in data.get("devices", {}):
+        del data["devices"][token_hash]
+        _save_trusted(data)
+        return True
+    return False
 
 
 def check_git_dirty(project_dir):
@@ -485,12 +557,19 @@ class SyncHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "rate_limited"}, status=429)
             return False
         auth = self.headers.get("Authorization", "")
-        if auth != f"Bearer {self.pin}":
+        if not auth.startswith("Bearer "):
             _record_failed_auth()
             self._send_json({"error": "unauthorized"}, status=401)
             return False
-        _reset_rate_limit()
-        return True
+        token = auth[7:]
+        if token == self.pin:
+            _reset_rate_limit()
+            return True
+        if _is_trusted_token(token):
+            return True
+        _record_failed_auth()
+        self._send_json({"error": "unauthorized"}, status=401)
+        return False
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -514,6 +593,14 @@ class SyncHandler(BaseHTTPRequestHandler):
                              "ip": get_local_ip(), "port": self.server_port})
             return
 
+        if path == "/api/local-info":
+            self._send_json({"status": "ok", "pin": self.pin,
+                             "ip": get_local_ip(), "port": self.server_port,
+                             "server_id": _get_server_id(),
+                             "server_name": _get_server_name(),
+                             "trusted": list(_load_trusted().get("devices", {}).values())})
+            return
+
         if not self._check_auth():
             return
 
@@ -529,6 +616,10 @@ class SyncHandler(BaseHTTPRequestHandler):
             self._handle_session(params)
         elif path == "/api/repo-hashes":
             self._handle_repo_hashes(params)
+        elif path == "/api/trusted":
+            self._handle_list_trusted()
+        elif path == "/api/scan-beacons":
+            self._handle_scan_beacons()
         else:
             self._send_json({"error": "not_found"}, status=404)
 
@@ -540,6 +631,11 @@ class SyncHandler(BaseHTTPRequestHandler):
 
         if path in ("/", "/dashboard", "/api/ping"):
             self._send_json({"error": "method_not_allowed"}, status=405)
+            return
+
+        # Pairing endpoint — verifies PIN internally, no Bearer auth required
+        if path == "/api/pair":
+            self._handle_pair()
             return
 
         if not self._check_auth():
@@ -565,6 +661,10 @@ class SyncHandler(BaseHTTPRequestHandler):
             self._handle_push_sessions()
         elif path == "/api/push/files":
             self._handle_push_files()
+        elif path == "/api/unpair":
+            self._handle_unpair()
+        elif path == "/api/server-name":
+            self._handle_set_server_name()
         else:
             self._send_json({"error": "not_found"}, status=404)
 
@@ -628,6 +728,90 @@ class SyncHandler(BaseHTTPRequestHandler):
             result["git_dirty"] = is_dirty
             result["git_dirty_count"] = len(dirty_files)
         self._send_json(result)
+
+    # ── Pairing handlers ────────────────────────────────────────────────
+
+    def _handle_pair(self):
+        raw = self._read_body()
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._send_json({"error": "invalid json"}, status=400)
+            return
+        pin = req.get("pin", "")
+        client_token = req.get("client_token", "")
+        device_name = req.get("device_name", "Unknown device")
+        if not pin or not client_token:
+            self._send_json({"error": "pin and client_token required"}, status=400)
+            return
+        if not _check_rate_limit():
+            self._send_json({"error": "rate_limited"}, status=429)
+            return
+        if pin != self.pin:
+            _record_failed_auth()
+            self._send_json({"error": "wrong pin"}, status=401)
+            return
+        _reset_rate_limit()
+        _add_trusted_token(client_token, device_name)
+        self._send_json({"status": "paired", "server_name": _get_server_name(), "server_id": _get_server_id()})
+
+    def _handle_unpair(self):
+        raw = self._read_body()
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._send_json({"error": "invalid json"}, status=400)
+            return
+        token_hash = req.get("token_hash", "")
+        device_name = req.get("device_name", "")
+        if token_hash:
+            removed = _remove_trusted_token(token_hash)
+        elif device_name:
+            data = _load_trusted()
+            removed = False
+            for h, info in list(data.get("devices", {}).items()):
+                if info.get("name") == device_name:
+                    del data["devices"][h]
+                    _save_trusted(data)
+                    removed = True
+                    break
+        else:
+            self._send_json({"error": "token_hash or device_name required"}, status=400)
+            return
+        self._send_json({"status": "unpaired" if removed else "not_found"})
+
+    def _handle_list_trusted(self):
+        data = _load_trusted()
+        devices = []
+        for token_hash, info in data.get("devices", {}).items():
+            devices.append({
+                "token_hash": token_hash,
+                "name": info.get("name", "Unknown"),
+                "added_at": info.get("added_at", 0),
+            })
+        self._send_json({
+            "server_id": data.get("server_id", ""),
+            "server_name": data.get("server_name", ""),
+            "devices": devices,
+        })
+
+    def _handle_set_server_name(self):
+        raw = self._read_body()
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._send_json({"error": "invalid json"}, status=400)
+            return
+        name = req.get("name", "").strip()[:30]
+        if not name:
+            self._send_json({"error": "name required"}, status=400)
+            return
+        _set_server_name(name)
+        self._send_json({"status": "ok", "server_name": name})
+
+    def _handle_scan_beacons(self):
+        servers = listen_for_beacons(timeout=3)
+        self._send_json({"servers": servers})
 
     # ── Write endpoint handlers ───────────────────────────────────────
 
@@ -1194,7 +1378,7 @@ def start_server(host="0.0.0.0", port=None, pin=None):
         raise RuntimeError("No free port found (tried 8080-8099)")
     SyncHandler.pin = pin
     SyncHandler.server_port = port
-    server = HTTPServer((host, port), SyncHandler)
+    server = ThreadingHTTPServer((host, port), SyncHandler)
     return server, pin, port
 
 
@@ -1207,11 +1391,16 @@ def stop_server(server):
 
 def start_beacon(sync_port, pin, interval=3):
     """Broadcast UDP beacon on port 19876 for LAN auto-discovery."""
+    server_id = _get_server_id()
+    server_name = _get_server_name()
+
     def _beacon():
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         msg = json.dumps({"type": "codex-sync", "port": sync_port,
-                          "pin_hint": pin[:3] + "..."}).encode("utf-8")
+                          "pin_hint": pin[:3] + "...",
+                          "server_id": server_id,
+                          "name": server_name}).encode("utf-8")
         while True:
             try:
                 sock.sendto(msg, ("<broadcast>", 19876))
@@ -1224,8 +1413,9 @@ def start_beacon(sync_port, pin, interval=3):
 
 
 def listen_for_beacons(timeout=5):
-    """Listen for UDP beacons. Returns list of {ip, port, pin_hint}."""
+    """Listen for UDP beacons. Returns list of {ip, port, pin_hint, server_id, name}."""
     results = []
+    seen = set()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.settimeout(timeout)
@@ -1239,8 +1429,13 @@ def listen_for_beacons(timeout=5):
             data, addr = sock.recvfrom(1024)
             info = json.loads(data.decode("utf-8"))
             if info.get("type") == "codex-sync":
-                results.append({"ip": addr[0], "port": info["port"],
-                                "pin_hint": info.get("pin_hint", "")})
+                key = (addr[0], info["port"])
+                if key not in seen:
+                    seen.add(key)
+                    results.append({"ip": addr[0], "port": info["port"],
+                                    "pin_hint": info.get("pin_hint", ""),
+                                    "server_id": info.get("server_id", ""),
+                                    "name": info.get("name", "")})
         except socket.timeout:
             break
         except Exception:
@@ -1338,7 +1533,14 @@ select{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4
       </div>
     </div>
 
-    <h2>Connect to Remote</h2>
+    <h2>Discovered Servers</h2>
+    <div class="info-box">
+      <button class="btn" onclick="scanForServers()" id="scanBtn">Scan LAN</button>
+      <span id="scanStatus" style="margin-left:12px;color:#a6adc8;font-size:13px"></span>
+      <div id="discoveredList" style="margin-top:10px"></div>
+    </div>
+
+    <h2>Manual Connect</h2>
     <div class="info-box">
       <div class="info-row">
         <label>IP:Port:</label>
@@ -1423,6 +1625,11 @@ select{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4
     <h2>Settings</h2>
     <div class="info-box">
       <div class="info-row">
+        <label>Server name:</label>
+        <input id="settingServerName" placeholder="My PC" style="max-width:200px">
+        <button class="btn small" onclick="saveServerName()">Save</button>
+      </div>
+      <div class="info-row">
         <label>Language:</label>
         <select id="settingLang" onchange="setLang(this.value)">
           <option value="en">English</option>
@@ -1445,15 +1652,12 @@ select{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4
         </select>
       </div>
     </div>
-    <h2>UDP Discovery</h2>
+    <h2>Trusted Devices</h2>
     <div class="info-box">
-      <div class="info-row">
-        <button class="btn" onclick="scanBeacons()">Scan for servers</button>
-        <span id="beaconResults" style="margin-left:12px;color:#a6adc8;font-size:13px"></span>
-      </div>
-      <table id="beaconTable" style="display:none">
-        <thead><tr><th>IP</th><th>Port</th><th>PIN hint</th><th>Action</th></tr></thead>
-        <tbody id="beaconBody"></tbody>
+      <div id="trustedEmpty" style="color:#a6adc8;font-size:13px">No trusted devices paired yet.</div>
+      <table id="trustedTable" style="display:none">
+        <thead><tr><th>Device Name</th><th>Added</th><th>Action</th></tr></thead>
+        <tbody id="trustedBody"></tbody>
       </table>
     </div>
     <h2>Auto-Sync</h2>
@@ -1506,17 +1710,48 @@ select{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4
   </div>
 </div>
 
+<div id="pinModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1001;align-items:center;justify-content:center">
+  <div style="background:#2a2a3d;border:1px solid #45475a;border-radius:12px;padding:24px;max-width:400px;width:90%">
+    <h3 id="pinModalTitle" style="color:#89b4fa;margin-bottom:12px">Enter PIN</h3>
+    <input id="pinModalInput" placeholder="XXXXXX" maxlength="6" style="width:100%;padding:8px 12px;border:1px solid #45475a;background:#1e1e2e;color:#cdd6f4;border-radius:6px;font-size:18px;text-align:center;text-transform:uppercase;letter-spacing:4px;margin-bottom:12px">
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="pinModalCancel()">Cancel</button>
+      <button class="btn primary" onclick="pinModalSubmit()">Pair</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let localPin='', remoteHost='', remotePort=8080, remotePinVal='';
 let localProviders=[], remoteProviders=[], localSessions=[], remoteSessions=[];
 let fileDiff=null;
+let _modalResolveFunc=null;
+let _pinModalResolve=null;
+const TRUSTED_TOKENS_KEY='codex_sync_tokens';
+
+function getStoredTokens(){
+  try{return JSON.parse(localStorage.getItem(TRUSTED_TOKENS_KEY)||'{}')}catch(e){return{}}
+}
+function saveStoredToken(serverId,token,name){
+  const t=getStoredTokens();t[serverId]={token:token,name:name};localStorage.setItem(TRUSTED_TOKENS_KEY,JSON.stringify(t))
+}
+function getStoredToken(serverId){
+  return getStoredTokens()[serverId]||null
+}
+function removeStoredToken(serverId){
+  const t=getStoredTokens();delete t[serverId];localStorage.setItem(TRUSTED_TOKENS_KEY,JSON.stringify(t))
+}
 
 async function init(){
   try{
-    const r=await fetch('/api/ping');
+    const r=await fetch('/api/local-info');
     const d=await r.json();
     document.getElementById('serverInfo').textContent='Server: '+d.ip+':'+d.port;
-    localPin=d.ip+':'+d.port; // store for reference
+    document.getElementById('localAddr').textContent=d.ip+':'+d.port;
+    document.getElementById('localPin').textContent=d.pin;
+    localPin=d.pin;
+    document.getElementById('settingServerName').value=d.server_name||'';
+    renderTrustedDevices(d.trusted||[]);
   }catch(e){
     document.getElementById('serverInfo').textContent='Server error';
   }
@@ -1539,7 +1774,6 @@ function showToast(msg,type){
   setTimeout(()=>t.className='toast',3000);
 }
 
-let _modalResolveFunc=null;
 function showModal(msg){
   return new Promise(function(resolve){
     _modalResolveFunc=resolve;
@@ -1555,9 +1789,40 @@ function modalResolve(val){
 async function connectRemote(){
   const addr=document.getElementById('remoteAddr').value.trim();
   remotePinVal=document.getElementById('remotePin').value.trim().toUpperCase();
-  if(!addr||!remotePinVal){showToast('Enter address and PIN','error');return}
+  if(!addr){showToast('Enter address','error');return}
   const parts=addr.split(':');
   remoteHost=parts[0];remotePort=parts[1]?parseInt(parts[1]):8080;
+  await _doConnect();
+}
+
+async function _connectDiscovered(ip,port,serverId,serverName){
+  remoteHost=ip;remotePort=port;
+  // Try trusted token first
+  const stored=getStoredToken(serverId);
+  if(stored&&stored.token){
+    remotePinVal=stored.token;
+    const ok=await _tryConnect();
+    if(ok){showToast('Auto-connected to '+serverName,'success');return}
+    // Token expired/revoked — fall through to PIN
+    removeStoredToken(serverId);
+  }
+  // Show PIN modal for pairing
+  const pin=await showPinModal('Enter PIN for '+serverName);
+  if(!pin){return}
+  remotePinVal=pin.toUpperCase();
+  const ok=await _tryConnect();
+  if(!ok){return}
+  // Pair and save token
+  await _pairDevice(serverId,serverName);
+}
+
+async function _doConnect(){
+  if(!remotePinVal){showToast('Enter PIN','error');return}
+  const ok=await _tryConnect();
+  if(ok) showToast('Connected!','success');
+}
+
+async function _tryConnect(){
   try{
     const status=await fetch('http://'+remoteHost+':'+remotePort+'/api/manifest',{
       headers:{'Authorization':'Bearer '+remotePinVal}});
@@ -1570,12 +1835,28 @@ async function connectRemote(){
     document.getElementById('sessContent').style.display='block';
     document.getElementById('filesNotConnected').style.display='none';
     document.getElementById('filesContent').style.display='block';
-    showToast('Connected!','success');
     startAutoSync();
+    return true;
   }catch(e){
     document.getElementById('connStatus').innerHTML='<span class="badge red">Error</span> '+e.message;
     showToast('Connection failed: '+e.message,'error');
+    return false;
   }
+}
+
+async function _pairDevice(serverId,serverName){
+  const clientToken=crypto.randomUUID?crypto.randomUUID().replace(/-/g,''):(Date.now().toString(16)+Math.random().toString(16).slice(2));
+  try{
+    const r=await fetch('http://'+remoteHost+':'+remotePort+'/api/pair',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pin:remotePinVal,client_token:clientToken,device_name:navigator.userAgent.includes('Win')?'Windows PC':navigator.userAgent.includes('Mac')?'Mac':navigator.userAgent.includes('Linux')?'Linux PC':'Device'})});
+    if(!r.ok) return;
+    const d=await r.json();
+    saveStoredToken(serverId,clientToken,d.server_name||serverName);
+    remotePinVal=clientToken;
+    showToast('Paired with '+(d.server_name||serverName),'success');
+  }catch(e){showToast('Pairing failed: '+e.message,'error')}
 }
 
 function disconnectRemote(){
@@ -1960,13 +2241,93 @@ function setSetting(key,val){const s=loadSettings();s[key]=val;saveSettings(s)}
 
 // ── UDP Beacon scan ──────────────────────────────────────────────────────
 
-async function scanBeacons(){
-  document.getElementById('beaconResults').textContent='Scanning...';
+// ── LAN Discovery & Pairing ────────────────────────────────────────────
+async function scanForServers(){
+  const btn=document.getElementById('scanBtn');
+  btn.disabled=true;btn.textContent='Scanning...';
+  document.getElementById('scanStatus').textContent='Listening for beacons (5s)...';
+  document.getElementById('discoveredList').innerHTML='';
   try{
-    const r=await fetch('/api/ping');
+    const r=await fetch('/api/scan-beacons');
     const d=await r.json();
-    document.getElementById('beaconResults').textContent='UDP scan is server-side. Use manual IP entry for now.';
-  }catch(e){document.getElementById('beaconResults').textContent='Error: '+e.message}
+    const servers=d.servers||[];
+    if(servers.length===0){
+      document.getElementById('discoveredList').innerHTML='<div style="color:#a6adc8;font-size:13px">No servers found. Make sure the remote machine runs --sync-host.</div>';
+    }else{
+      let html='';
+      servers.forEach(function(s){
+        const stored=getStoredToken(s.server_id);
+        const trusted=stored?'<span class="badge green">Trusted</span>':'';
+        html+='<div style="display:flex;align-items:center;gap:10px;padding:8px;border:1px solid #45475a;border-radius:6px;margin-bottom:6px">';
+        html+='<div style="flex:1"><strong style="color:#89b4fa">'+(s.name||s.ip)+'</strong><br><span style="color:#a6adc8;font-size:12px">'+s.ip+':'+s.port+'</span> '+trusted+'</div>';
+        html+='<button class="btn primary small" onclick="_connectDiscovered(\''+s.ip+'\','+s.port+',\''+s.server_id+'\',\''+s.name.replace(/'/g,"")+'\')">Connect</button>';
+        html+='</div>';
+      });
+      document.getElementById('discoveredList').innerHTML=html;
+    }
+    document.getElementById('scanStatus').textContent=servers.length+' server(s) found';
+  }catch(e){
+    document.getElementById('scanStatus').textContent='Error: '+e.message;
+  }
+  btn.disabled=false;btn.textContent='Scan LAN';
+}
+
+function showPinModal(title){
+  return new Promise(function(resolve){
+    _pinModalResolve=resolve;
+    document.getElementById('pinModalTitle').textContent=title||'Enter PIN';
+    document.getElementById('pinModalInput').value='';
+    document.getElementById('pinModal').style.display='flex';
+    setTimeout(function(){document.getElementById('pinModalInput').focus()},100);
+  });
+}
+function pinModalSubmit(){
+  const val=document.getElementById('pinModalInput').value.trim();
+  document.getElementById('pinModal').style.display='none';
+  if(_pinModalResolve){_pinModalResolve(val);_pinModalResolve=null}
+}
+function pinModalCancel(){
+  document.getElementById('pinModal').style.display='none';
+  if(_pinModalResolve){_pinModalResolve(null);_pinModalResolve=null}
+}
+
+// ── Trusted Devices (Settings tab) ───────────────────────────────────────
+function renderTrustedDevices(devices){
+  if(!devices||devices.length===0){
+    document.getElementById('trustedEmpty').style.display='';
+    document.getElementById('trustedTable').style.display='none';
+    return;
+  }
+  document.getElementById('trustedEmpty').style.display='none';
+  document.getElementById('trustedTable').style.display='';
+  let html='';
+  devices.forEach(function(d,i){
+    html+='<tr><td>'+d.name+'</td><td style="color:#a6adc8;font-size:12px">'+new Date(d.added_at*1000).toLocaleString()+'</td>';
+    html+='<td><button class="btn danger small" onclick="unpairDevice('+i+')">Unpair</button></td></tr>';
+  });
+  document.getElementById('trustedBody').innerHTML=html;
+}
+
+async function unpairDevice(idx){
+  const devices=await fetch('/api/trusted').then(r=>r.json());
+  const list=devices.devices||[];
+  if(!list[idx]) return;
+  const name=list[idx].name;
+  if(!await showModal('Unpair device "'+name+'"?')) return;
+  await fetch('/api/unpair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_name:name})});
+  // Refresh
+  const info=await fetch('/api/local-info').then(r=>r.json());
+  renderTrustedDevices(info.trusted||[]);
+  showToast('Device unpinned','success');
+}
+
+async function saveServerName(){
+  const name=document.getElementById('settingServerName').value.trim();
+  if(!name) return;
+  try{
+    await fetch('/api/server-name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})});
+    showToast('Server name updated','success');
+  }catch(e){showToast('Error: '+e.message,'error')}
 }
 
 // ── Init settings UI ────────────────────────────────────────────────────

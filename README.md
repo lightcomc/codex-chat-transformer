@@ -188,6 +188,8 @@ python codex_chat_transformer.py --sync-pull 192.168.1.60:8080 --sync-pin A7B3C2
 Features:
 - Web Dashboard (dark theme, 5 tabs: Connect, Providers, Sessions, Files, Settings)
 - PIN-based auth with rate limiting
+- **Trusted devices (pairing)**: enter PIN once → device remembered → auto-connect without PIN
+- **LAN auto-discovery**: UDP beacon with server name, click to connect from Dashboard
 - Bidirectional: Push + Pull per item
 - Provider import modes: with key / without key / skip / keep both
 - Session sync: JSONL download + DB insertion
@@ -342,7 +344,7 @@ codex_chat_transformer.py    — CLI: conversion, providers, pin, backup, doctor
 codex_manager_gui.py         — GUI: switching, editing, model change, sync (CLI wrapper)
 codex_sync.py                — P2P sync engine: server, client, Dashboard, file sync, auto-sync
 sync_tray.py                 — System tray widget (optional, requires pystray + Pillow)
-test_smoke.py                — Smoke tests (27 tests)
+test_smoke.py                — Smoke tests (32 tests)
 codex_manager.cmd / .ps1     — Windows launchers
 codex_manager.sh             — Unix launcher
 providers_template.json      — Provider template
