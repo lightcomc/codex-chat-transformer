@@ -40,7 +40,7 @@ MAX_ZIP_SIZE = 500 * 1024 * 1024  # 500 MB
 EXCLUDE_DIRS = {
     ".git", "__pycache__", ".venv", "venv", "node_modules",
     ".idea", ".tox", ".mypy_cache", ".pytest_cache", ".eggs",
-    ".claude", "backup_*", "*.egg-info", ".env",
+    ".claude", ".codex", "backup_*", "*.egg-info", ".env",
 }
 
 # Module-level flag: set to True when sync writes local data
@@ -234,7 +234,11 @@ def _get_sessions_list():
                 r["rollout_path"].replace("\\\\?\\", "")
             )
             cwd_val = (r["cwd"] or "").replace("\\\\?\\", "")
-            is_worktree = "worktrees" in cwd_val and ".codex" in cwd_val
+            parts = cwd_val.replace("\\", "/").split("/") if cwd_val else []
+            is_worktree = any(
+                p == "worktrees" and i > 0 and parts[i - 1] == ".codex"
+                for i, p in enumerate(parts)
+            ) if cwd_val else False
             result.append({
                 "id": r["id"],
                 "title": (r["title"] or "")[:80],
@@ -402,7 +406,13 @@ class SyncHandler(BaseHTTPRequestHandler):
         pass
 
     def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = self.headers.get("Origin", "")
+        if not origin or origin.startswith("http://127.0.0.1") or \
+           origin.startswith("http://localhost") or \
+           origin.startswith("http://" + get_local_ip()):
+            self.send_header("Access-Control-Allow-Origin", origin or "*")
+        else:
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         super().end_headers()
@@ -669,8 +679,9 @@ class SyncHandler(BaseHTTPRequestHandler):
             conn.execute("""
                 INSERT OR IGNORE INTO threads
                 (id, rollout_path, model_provider, title,
-                 created_at_ms, updated_at_ms, archived, source, cwd, project)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 created_at_ms, updated_at_ms, archived, source, cwd,
+                 git_branch, git_sha, git_origin_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 meta["id"],
                 rollout_path,
@@ -681,7 +692,9 @@ class SyncHandler(BaseHTTPRequestHandler):
                 int(meta.get("archived", False)),
                 meta.get("source", ""),
                 meta.get("cwd", ""),
-                meta.get("project", ""),
+                meta.get("git_branch", ""),
+                meta.get("git_sha", ""),
+                meta.get("git_origin_url", ""),
             ))
             conn.commit()
             conn.close()
@@ -902,13 +915,16 @@ class SyncHandler(BaseHTTPRequestHandler):
         conn.execute("""
             INSERT OR IGNORE INTO threads
             (id, rollout_path, model_provider, title,
-             created_at_ms, updated_at_ms, archived, source, cwd, project)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             created_at_ms, updated_at_ms, archived, source, cwd,
+             git_branch, git_sha, git_origin_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             meta["id"], rollout_path, meta.get("model_provider", ""),
             meta.get("title", ""), meta.get("created_at_ms", 0),
             meta.get("updated_at_ms", 0), int(meta.get("archived", False)),
-            meta.get("source", ""), meta.get("cwd", ""), meta.get("project", ""),
+            meta.get("source", ""), meta.get("cwd", ""),
+            meta.get("git_branch", ""), meta.get("git_sha", ""),
+            meta.get("git_origin_url", ""),
         ))
         conn.commit()
         conn.close()
@@ -1712,7 +1728,7 @@ async function offerBulkProjectFileSync(ids,direction){
 
 // ── Auto-Sync Polling ───────────────────────────────────────────────────
 
-let _pollTimer=null,_lastRemoteHash=null,_syncBusy=false;
+let _pollTimer=null,_lastRemoteHash=null,_syncBusy=false,_lastSyncTime=0;
 
 function startAutoSync(){
   if(_pollTimer){clearInterval(_pollTimer);_pollTimer=null}
@@ -1729,6 +1745,8 @@ function startAutoSync(){
 
 async function pollRemote(){
   if(_syncBusy||!remoteHost) return;
+  var now=Date.now();
+  if(now-_lastSyncTime<15000) return;
   try{
     document.getElementById('autoSyncStatus').textContent='Polling...';
     document.getElementById('autoSyncStatus').style.color='#f9e2af';
@@ -1746,6 +1764,7 @@ async function pollRemote(){
       _syncBusy=false;
     }
     _lastRemoteHash=remote.hash;
+    _lastSyncTime=Date.now();
     document.getElementById('lastSyncTime').textContent=new Date().toLocaleTimeString();
     document.getElementById('autoSyncStatus').textContent='Idle';
     document.getElementById('autoSyncStatus').style.color='#a6adc8';
