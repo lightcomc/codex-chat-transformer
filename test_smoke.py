@@ -278,6 +278,15 @@ def test_rename_provider():
         restore_providers(orig, tmp)
 
 
+def test_sanitize_name():
+    assert ct._sanitize_name("My Provider") == "My_Provider"
+    assert ct._sanitize_name("Hello World") == "Hello_World"
+    assert ct._sanitize_name("NoSpaces") == "NoSpaces"
+    assert ct._sanitize_name("a/b:c*d?e") == "a_b_c_d_e"
+    assert ct._sanitize_name("  trim  ") == "trim"
+    assert ct._sanitize_name("") == ""
+
+
 def test_set_model():
     # Create a temp dir with config.toml
     tmp_dir = tempfile.mkdtemp()
@@ -869,6 +878,7 @@ if __name__ == "__main__":
     test("_merge_config adds reasoning when absent", test_merge_add_reasoning_when_absent)
     test("edit_provider updates profile", test_edit_provider)
     test("edit_provider rename + update", test_rename_provider)
+    test("provider name sanitization", test_sanitize_name)
     test("set_model changes config", test_set_model)
 
     # Sync tests

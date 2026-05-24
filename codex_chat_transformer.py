@@ -844,6 +844,12 @@ def _detect_provider_from_text(text):
     return "openai"
 
 
+def _sanitize_name(name):
+    """Replace spaces and invalid chars in provider name with underscores."""
+    import re
+    return re.sub(r'[\s/\\:*?"<>|]+', '_', name.strip())
+
+
 def _extract_provider_config(config_text):
     """Extract provider-specific parts from config.toml.
     Returns (provider_name, provider_section_text, model_value)."""
@@ -1123,6 +1129,7 @@ def providers_list():
 
 def save_provider(name):
     """Save current provider section + auth as a profile."""
+    name = _sanitize_name(name)
     data = _load_providers()
     profiles = data.get("profiles", {})
 
@@ -1309,7 +1316,7 @@ def add_provider(json_path, api_key=None):
         print('Example: {"name": "MyProvider", "model": "gpt-5.5", "base_url": "https://...", "wire_api": "responses"}')
         sys.exit(1)
 
-    name = raw["name"]
+    name = _sanitize_name(raw["name"])
     model = raw.get("model", "gpt-5.5")
     base_url = raw["base_url"]
     wire_api = raw.get("wire_api", "responses")
@@ -1380,7 +1387,7 @@ def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, 
 
     prof = profiles[name]
     old_provider_name = prof.get("model_provider", name)
-    final_name = new_name or name
+    final_name = _sanitize_name(new_name) if new_name else name
 
     # Parse current provider_section
     section_text = prof.get("provider_section", "")

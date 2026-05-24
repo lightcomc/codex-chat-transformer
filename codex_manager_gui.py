@@ -624,7 +624,7 @@ class CodexManagerApp:
         profiles = data.get("profiles", {})
 
         for item in found:
-            name = item["name"]
+            name = ct._sanitize_name(item["name"])
             if name in profiles:
                 continue
             if messagebox.askyesno(t("auto_detect_title"), t("auto_detected", name)):
@@ -654,7 +654,7 @@ class CodexManagerApp:
             auth_text = json.dumps(raw, indent=2)
             provider_name = fallback_name or "NewProvider"
         elif "base_url" in raw:
-            name = raw.get("name", fallback_name or "NewProvider")
+            name = ct._sanitize_name(raw.get("name", fallback_name or "NewProvider"))
             model = raw.get("model", "gpt-5.5")
             wire = raw.get("wire_api", "responses")
             reasoning = raw.get("model_reasoning_effort", "")
@@ -690,9 +690,10 @@ class CodexManagerApp:
             return
 
         # Ask name if needed
-        name = self._ask_string(t("save_title"), t("save_prompt"), initialvalue=provider_name)
-        if not name:
+        name_raw = self._ask_string(t("save_title"), t("save_prompt"), initialvalue=provider_name)
+        if not name_raw:
             return
+        name = ct._sanitize_name(name_raw)
 
         pn = ct._detect_provider_from_text(config_text) if config_text else name
         am = _detect_auth_mode_text(auth_text) if auth_text else "unknown"
@@ -1039,10 +1040,11 @@ class CodexManagerApp:
         orig_name = name
 
         def _save():
-            new_name = fields["name"][0].get().strip()
-            if not new_name:
+            new_name_raw = fields["name"][0].get().strip()
+            if not new_name_raw:
                 messagebox.showwarning(t("warning"), t("f_enter_name"), parent=dialog)
                 return
+            new_name = ct._sanitize_name(new_name_raw)
             model = fields["model"][0].get().strip()
             base_url = fields["base_url"][0].get().strip()
             api_key = fields["api_key"][0].get().strip()
