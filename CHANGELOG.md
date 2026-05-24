@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.2.0] — 2026-05-24
+
+### Session-Project Auto-Link / Связывание сессий с файлами проекта
+- After session Pull/Push, Dashboard detects linked project directory and offers file sync / После Pull/Push сессии Dashboard определяет привязанный проект и предлагает синхронизацию файлов
+- Confirmation modal in Dashboard: "This session is linked to project X. Sync project files?" / Модальное окно подтверждения в Dashboard
+- Bulk: aggregates unique project paths across multiple selected sessions / Массовая операция: объединяет уникальные пути проектов
+
+### Background Auto-Sync / Фоновая авторсинхронизация
+- Dashboard Settings tab: auto-sync polling (30s / 60s / 2 min / 5 min) / Вкладка Settings: авторсинхронизация с интервалом
+- Auto-pull modes: notify only / sessions / providers / all / Режимы: только уведомление / сессии / провайдеры / все
+- `/api/manifest` now returns `hash` + `timestamp` fields for change detection / Манифест возвращает хэш и метку времени
+- Status indicators: last sync time, polling status / Индикаторы: время последней синхронизации, статус опроса
+- Sync mutex prevents overlapping auto-pulls / Мьютекс предотвращает пересекающиеся авторсинхронизации
+
+### System Tray Widget / Виджет в системном трее
+- New file: `sync_tray.py` — optional system tray app / Новый файл: опциональное приложение в трее
+- Colored circle status indicator: Red (stopped), Yellow (idle), Green (syncing) / Цветной индикатор: красный/жёлтый/зелёный
+- Menu: Start/Stop Server, Open Dashboard, Autorun on startup, Exit / Меню: старт/стоп, Dashboard, автозапуск, выход
+- Dynamic icon via Pillow (no .ico files) / Динамическая иконка через Pillow
+- Autorun: Windows registry / macOS LaunchAgent / Автозапуск: реестр Windows / LaunchAgent macOS
+- Single instance via PID lockfile / Одна копия через PID lockfile
+- Requires: `pip install pystray Pillow` (optional) / Требует: pystray + Pillow (опционально)
+
+### Tests / Тесты
+- 26 smoke tests (was 23) / 26 smoke-тестов (было 23)
+- New: manifest hash, sync_tray syntax, sync_tray import checks / Новые: хэш манифеста, синтаксис трея, проверки импорта
+
 ## [1.0.0] — 2026-05-23
 
 ### Chat Conversion / Конвертация чатов

@@ -186,12 +186,14 @@ python codex_chat_transformer.py --sync-pull 192.168.1.60:8080 --sync-pin A7B3C2
 ```
 
 功能：
-- 网页面板（深色主题，4 个标签页：连接、提供商、会话、文件）
+- 网页面板（深色主题，5 个标签页：连接、提供商、会话、文件、设置）
 - 基于 PIN 的身份验证，带速率限制
 - 双向：每个项目均可 Push 和 Pull
 - 提供商导入模式：带密钥 / 不带密钥 / 跳过 / 保留两者
 - 会话同步：下载 JSONL + 插入本地数据库
 - 文件同步：SHA-256 哈希差异 + ZIP 打包
+- 自动关联：会话 Push/Pull 时检测关联项目并提示文件同步
+- 后台自动同步轮询（30秒–5分钟，可配置）
 - 自动端口选择（尝试 8080-8099）
 - UDP 广播用于局域网自动发现
 - 文件同步前检查 Git 未提交更改
@@ -245,6 +247,21 @@ GUI 是 CLI 的轻量封装（`import codex_chat_transformer as ct`），无代�
 - Python 3.7+
 - Tkinter（包含在标准 Python 中）
 - 无外部依赖
+
+### 可选：系统托盘
+
+系统托盘小组件，带彩色状态指示器：
+- 红色 — 服务器已停止
+- 黄色 — 服务器运行中，等待连接
+- 绿色 — 正在同步
+
+```bash
+pip install pystray Pillow
+python sync_tray.py
+```
+
+功能：启动/停止服务器、打开 Dashboard、开机自启（Windows/macOS）、单实例保护。
+托盘完全可选 — 主工具和 Dashboard 无需它即可运行。
 
 ---
 
@@ -323,8 +340,9 @@ API 密钥在本地使用 base64 混淆存储（CLI 和 GUI 均如此）。这**
 ```
 codex_chat_transformer.py    — CLI：转换、提供商、固定、备份、诊断、编辑、同步
 codex_manager_gui.py         — GUI：切换、编辑、更改模型、同步（CLI 封装）
-codex_sync.py                — P2P 同步引擎：服务器、客户端、Dashboard、文件同步
-test_smoke.py                — 冒烟测试（23 个测试）
+codex_sync.py                — P2P 同步引擎：服务器、客户端、Dashboard、文件同步、自动同步
+sync_tray.py                 — 系统托盘小组件（可选，需 pystray + Pillow）
+test_smoke.py                — 冒烟测试（26 个测试）
 codex_manager.cmd / .ps1     — Windows 启动器
 codex_manager.sh             — Unix 启动器
 providers_template.json      — 提供商模板

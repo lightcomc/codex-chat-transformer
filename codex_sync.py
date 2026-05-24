@@ -202,6 +202,15 @@ def _provider_full(name):
 # ── Sessions helpers ─────────────────────────────────────────────────────
 
 
+def _get_manifest_hash():
+    """Hash representing current state of sessions + providers. Used for auto-sync change detection."""
+    sessions = _get_sessions_list()
+    providers, _ = _providers_summary()
+    sess_str = "|".join("{}:{}".format(s["id"], s["updated_at_ms"]) for s in sessions)
+    prov_str = "|".join(p["name"] for p in providers)
+    return hashlib.sha256((sess_str + "||" + prov_str).encode()).hexdigest()[:16]
+
+
 def _get_sessions_list():
     if not STATE_DB.exists():
         return []
@@ -518,6 +527,8 @@ class SyncHandler(BaseHTTPRequestHandler):
             "active_provider": active,
             "ip": get_local_ip(),
             "port": self.server_port,
+            "hash": _get_manifest_hash(),
+            "timestamp": int(time.time()),
         })
 
     def _handle_providers(self, params):
@@ -1278,6 +1289,36 @@ select{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4
         <tbody id="beaconBody"></tbody>
       </table>
     </div>
+    <h2>Auto-Sync</h2>
+    <div class="info-box">
+      <div class="info-row">
+        <label>Auto-sync:</label>
+        <select id="settingAutoSync" onchange="startAutoSync()">
+          <option value="0">Off</option>
+          <option value="30">Every 30s</option>
+          <option value="60">Every 60s</option>
+          <option value="120">Every 2 min</option>
+          <option value="300">Every 5 min</option>
+        </select>
+      </div>
+      <div class="info-row">
+        <label>Auto-pull:</label>
+        <select id="settingAutoPull" onchange="setSetting('autoPull',this.value)">
+          <option value="none">Notify only</option>
+          <option value="sessions">Auto-pull sessions</option>
+          <option value="providers">Auto-pull providers</option>
+          <option value="all">Auto-pull everything</option>
+        </select>
+      </div>
+      <div class="info-row">
+        <label>Last sync:</label>
+        <span id="lastSyncTime" style="color:#a6adc8">Never</span>
+      </div>
+      <div class="info-row">
+        <label>Status:</label>
+        <span id="autoSyncStatus" style="color:#a6adc8">Idle</span>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1287,6 +1328,16 @@ select{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4
 </div>
 
 <div class="toast" id="toast"></div>
+
+<div id="confirmModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:#2a2a3d;border:1px solid #45475a;border-radius:12px;padding:24px;max-width:480px;width:90%">
+    <p id="confirmMsg" style="color:#cdd6f4;font-size:14px;margin-bottom:16px;white-space:pre-wrap"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="modalResolve(false)">No</button>
+      <button class="btn primary" onclick="modalResolve(true)">Yes</button>
+    </div>
+  </div>
+</div>
 
 <script>
 let localPin='', remoteHost='', remotePort=8080, remotePinVal='';
@@ -1321,6 +1372,19 @@ function showToast(msg,type){
   setTimeout(()=>t.className='toast',3000);
 }
 
+let _modalResolveFunc=null;
+function showModal(msg){
+  return new Promise(function(resolve){
+    _modalResolveFunc=resolve;
+    document.getElementById('confirmMsg').textContent=msg;
+    document.getElementById('confirmModal').style.display='flex';
+  });
+}
+function modalResolve(val){
+  document.getElementById('confirmModal').style.display='none';
+  if(_modalResolveFunc){_modalResolveFunc(val);_modalResolveFunc=null;}
+}
+
 async function connectRemote(){
   const addr=document.getElementById('remoteAddr').value.trim();
   remotePinVal=document.getElementById('remotePin').value.trim().toUpperCase();
@@ -1340,6 +1404,7 @@ async function connectRemote(){
     document.getElementById('filesNotConnected').style.display='none';
     document.getElementById('filesContent').style.display='block';
     showToast('Connected!','success');
+    startAutoSync();
   }catch(e){
     document.getElementById('connStatus').innerHTML='<span class="badge red">Error</span> '+e.message;
     showToast('Connection failed: '+e.message,'error');
@@ -1348,6 +1413,7 @@ async function connectRemote(){
 
 function disconnectRemote(){
   remoteHost='';remotePort=8080;remotePinVal='';
+  if(_pollTimer){clearInterval(_pollTimer);_pollTimer=null;}
   document.getElementById('connStatus').innerHTML='<span class="badge">Disconnected</span>';
   document.getElementById('provNotConnected').style.display='';
   document.getElementById('provContent').style.display='none';
@@ -1459,27 +1525,35 @@ async function loadSessions(){
 async function pullSession(id){
   try{const r=await fetch('/api/pull/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:[id]})});
-    showResult(r);loadSessions();}catch(e){showToast(e.message,'error')}
+    await showResult(r);loadSessions();
+    await offerProjectFileSync(id,'pull');
+  }catch(e){showToast(e.message,'error')}
 }
 
 async function pushSession(id){
   try{const r=await fetch('/api/push/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:[id]})});
-    showResult(r);loadSessions();}catch(e){showToast(e.message,'error')}
+    await showResult(r);loadSessions();
+    await offerProjectFileSync(id,'push');
+  }catch(e){showToast(e.message,'error')}
 }
 
 async function pullSelectedSessions(){
   const ids=getSelected('sess');if(!ids.length){showToast('Nothing selected','error');return}
   try{const r=await fetch('/api/pull/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:ids})});
-    showResult(r);loadSessions();}catch(e){showToast(e.message,'error')}
+    await showResult(r);loadSessions();
+    await offerBulkProjectFileSync(ids,'pull');
+  }catch(e){showToast(e.message,'error')}
 }
 
 async function pushSelectedSessions(){
   const ids=getSelected('sess');if(!ids.length){showToast('Nothing selected','error');return}
   try{const r=await fetch('/api/push/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:ids})});
-    showResult(r);loadSessions();}catch(e){showToast(e.message,'error')}
+    await showResult(r);loadSessions();
+    await offerBulkProjectFileSync(ids,'push');
+  }catch(e){showToast(e.message,'error')}
 }
 
 async function scanFiles(){
@@ -1577,6 +1651,118 @@ async function showResult(response){
   }catch(e){showToast('Done','success')}
 }
 
+// ── Session-Project Linking ──────────────────────────────────────────────
+
+async function offerProjectFileSync(sessionId,direction){
+  var session=localSessions.find(function(s){return s.id===sessionId});
+  if(!session) session=remoteSessions.find(function(s){return s.id===sessionId});
+  if(!session||!session.project) return;
+  var projectPath=session.project;
+  var yes=await showModal('This session is linked to project:\n'+projectPath+'\n\nSync project files?');
+  if(yes){
+    switchTab('files');
+    document.getElementById('projectDir').value=projectPath;
+    await scanFiles();
+  }
+}
+
+async function offerBulkProjectFileSync(ids,direction){
+  var projects={};
+  for(var i=0;i<ids.length;i++){
+    var sid=ids[i];
+    var session=localSessions.find(function(s){return s.id===sid});
+    if(!session) session=remoteSessions.find(function(s){return s.id===sid});
+    if(session&&session.project) projects[session.project]=true;
+  }
+  var paths=Object.keys(projects);
+  if(!paths.length) return;
+  var msg='These sessions are linked to '+(paths.length>1?paths.length+' projects':'project')+':\n\n';
+  for(var j=0;j<paths.length&&j<5;j++) msg+=paths[j]+'\n';
+  if(paths.length>5) msg+='...and '+( paths.length-5)+' more\n';
+  msg+='\nSync project files?';
+  var yes=await showModal(msg);
+  if(yes){
+    switchTab('files');
+    document.getElementById('projectDir').value=paths[0];
+    await scanFiles();
+  }
+}
+
+// ── Auto-Sync Polling ───────────────────────────────────────────────────
+
+let _pollTimer=null,_lastRemoteHash=null,_syncBusy=false;
+
+function startAutoSync(){
+  if(_pollTimer){clearInterval(_pollTimer);_pollTimer=null}
+  var interval=parseInt(document.getElementById('settingAutoSync').value)||0;
+  if(!interval||!remoteHost){
+    document.getElementById('autoSyncStatus').textContent='Idle';
+    document.getElementById('statusLeft').textContent='Ready';
+    return;
+  }
+  _lastRemoteHash=null;
+  document.getElementById('statusLeft').textContent='Auto-sync: every '+interval+'s';
+  _pollTimer=setInterval(function(){pollRemote()},interval*1000);
+}
+
+async function pollRemote(){
+  if(_syncBusy||!remoteHost) return;
+  try{
+    document.getElementById('autoSyncStatus').textContent='Polling...';
+    document.getElementById('autoSyncStatus').style.color='#f9e2af';
+    var remote=await fetch('http://'+remoteHost+':'+remotePort+'/api/manifest',{
+      headers:{'Authorization':'Bearer '+remotePinVal}}).then(function(r){return r.json()});
+    var local=await fetch('/api/manifest').then(function(r){return r.json()});
+    if(_lastRemoteHash!==null&&remote.hash!==_lastRemoteHash){
+      _syncBusy=true;
+      document.getElementById('autoSyncStatus').textContent='Syncing...';
+      document.getElementById('autoSyncStatus').style.color='#89b4fa';
+      var mode=document.getElementById('settingAutoPull').value;
+      if(mode==='sessions'||mode==='all') await autoPullSessions();
+      if(mode==='providers'||mode==='all') await autoPullProviders();
+      if(mode==='none') showToast('Remote has changes!','info');
+      _syncBusy=false;
+    }
+    _lastRemoteHash=remote.hash;
+    document.getElementById('lastSyncTime').textContent=new Date().toLocaleTimeString();
+    document.getElementById('autoSyncStatus').textContent='Idle';
+    document.getElementById('autoSyncStatus').style.color='#a6adc8';
+  }catch(e){
+    document.getElementById('autoSyncStatus').textContent='Error';
+    document.getElementById('autoSyncStatus').style.color='#f38ba8';
+  }
+}
+
+async function autoPullSessions(){
+  var lr=await fetch('/api/sessions').then(function(r){return r.json()});
+  var rr=await fetch('http://'+remoteHost+':'+remotePort+'/api/sessions',{
+    headers:{'Authorization':'Bearer '+remotePinVal}}).then(function(r){return r.json()});
+  var localIds={};
+  (lr.sessions||[]).forEach(function(s){localIds[s.id]=s.updated_at_ms});
+  var toPull=(rr.sessions||[]).filter(function(s){
+    return !localIds[s.id]||s.updated_at_ms>(localIds[s.id]||0);
+  });
+  if(!toPull.length) return;
+  var ids=toPull.map(function(s){return s.id});
+  await fetch('/api/pull/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:ids})});
+  showToast('Auto-pulled '+ids.length+' session(s)','success');
+  if(document.querySelector('[data-tab="sessions"]').classList.contains('active')) loadSessions();
+}
+
+async function autoPullProviders(){
+  var lr=await fetch('/api/providers').then(function(r){return r.json()});
+  var rr=await fetch('http://'+remoteHost+':'+remotePort+'/api/providers',{
+    headers:{'Authorization':'Bearer '+remotePinVal}}).then(function(r){return r.json()});
+  var localNames=new Set((lr.providers||[]).map(function(p){return p.name}));
+  var toPull=(rr.providers||[]).filter(function(p){return !localNames.has(p.name)});
+  if(!toPull.length) return;
+  var names=toPull.map(function(p){return p.name});
+  await fetch('/api/pull/providers',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:names,mode:'with_key'})});
+  showToast('Auto-pulled '+names.length+' provider(s)','success');
+}
+
 // ── Settings ─────────────────────────────────────────────────────────────
 
 const SETTINGS_KEY='codex_sync_settings';
@@ -1600,10 +1786,12 @@ async function scanBeacons(){
 
 // ── Init settings UI ────────────────────────────────────────────────────
 (function(){
-  const s=loadSettings();
+  var s=loadSettings();
   document.getElementById('settingLang').value=s.lang||'en';
   document.getElementById('settingBackup').value=s.backup||'true';
   document.getElementById('settingConflict').value=s.conflict||'skip';
+  document.getElementById('settingAutoSync').value=s.autoSync||'0';
+  document.getElementById('settingAutoPull').value=s.autoPull||'none';
 })();
 
 init();

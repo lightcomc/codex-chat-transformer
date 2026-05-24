@@ -395,6 +395,48 @@ def test_server_cors():
 import http.client
 
 
+def test_manifest_includes_hash():
+    """Manifest endpoint returns hash field for auto-sync change detection."""
+    import codex_sync, threading, json
+    server, pin, port = codex_sync.start_server(port=0)
+    actual_port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request("GET", "/api/manifest", headers={"Authorization": "Bearer " + pin})
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        assert "hash" in data, "manifest should include hash"
+        assert len(data["hash"]) == 16, "hash should be 16 chars, got {}".format(len(data["hash"]))
+        assert all(c in "0123456789abcdef" for c in data["hash"]), "hash should be hex"
+        assert "timestamp" in data, "manifest should include timestamp"
+    finally:
+        codex_sync.stop_server(server)
+
+
+def test_sync_tray_syntax():
+    """sync_tray.py compiles without syntax errors."""
+    path = os.path.join(os.path.dirname(__file__), "sync_tray.py")
+    if not os.path.exists(path):
+        return
+    py_compile.compile(path, doraise=True)
+
+
+def test_sync_tray_imports_optional():
+    """sync_tray.py has graceful import error for missing pystray."""
+    path = os.path.join(os.path.dirname(__file__), "sync_tray.py")
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "try:" in content and "pystray" in content, "Should have graceful import"
+    assert "pip install pystray Pillow" in content, "Should show install instructions"
+    assert "_create_icon_image" in content, "Should have icon generation function"
+    assert "SyncTrayApp" in content, "Should have SyncTrayApp class"
+
+
 # --- Run ---
 
 if __name__ == "__main__":
@@ -425,6 +467,9 @@ if __name__ == "__main__":
     test("server ping", test_server_ping)
     test("server auth required (401 without PIN, 200 with PIN)", test_server_auth_required)
     test("server CORS headers", test_server_cors)
+    test("manifest includes hash", test_manifest_includes_hash)
+    test("sync_tray.py syntax valid", test_sync_tray_syntax)
+    test("sync_tray imports optional (graceful)", test_sync_tray_imports_optional)
 
     print(f"\n{PASSED} passed, {FAILED} failed")
     sys.exit(1 if FAILED else 0)

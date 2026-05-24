@@ -186,12 +186,14 @@ python codex_chat_transformer.py --sync-pull 192.168.1.60:8080 --sync-pin A7B3C2
 ```
 
 Features:
-- Web Dashboard (dark theme, 4 tabs: Connect, Providers, Sessions, Files)
+- Web Dashboard (dark theme, 5 tabs: Connect, Providers, Sessions, Files, Settings)
 - PIN-based auth with rate limiting
 - Bidirectional: Push + Pull per item
 - Provider import modes: with key / without key / skip / keep both
 - Session sync: JSONL download + DB insertion
 - File sync: SHA-256 hash diff + ZIP packaging
+- Auto-link: session Pull/Push detects linked project and offers file sync
+- Background auto-sync polling (30s–5 min, configurable)
 - Auto port selection (tries 8080-8099)
 - UDP broadcast for LAN discovery
 - Git dirty state check before file sync
@@ -245,6 +247,21 @@ Place a JSON file next to the app — it's auto-detected. If no API key is prese
 - Python 3.7+
 - Tkinter (included with standard Python)
 - No external dependencies
+
+### Optional: System Tray
+
+The tray widget provides server control from the system tray with a colored status indicator:
+- Red — server stopped
+- Yellow — server running, waiting for connections
+- Green — active sync in progress
+
+```bash
+pip install pystray Pillow
+python sync_tray.py
+```
+
+Features: Start/Stop server, Open Dashboard, Autorun on startup (Windows/macOS), single instance lock.
+The tray is fully optional — the main tool and Dashboard work without it.
 
 ---
 
@@ -323,8 +340,9 @@ A: Yes: `--sync-pull IP:PORT --pin XXXXXX` opens an interactive CLI menu.
 ```
 codex_chat_transformer.py    — CLI: conversion, providers, pin, backup, doctor, edit, sync
 codex_manager_gui.py         — GUI: switching, editing, model change, sync (CLI wrapper)
-codex_sync.py                — P2P sync engine: server, client, Dashboard, file sync
-test_smoke.py                — Smoke tests (23 tests)
+codex_sync.py                — P2P sync engine: server, client, Dashboard, file sync, auto-sync
+sync_tray.py                 — System tray widget (optional, requires pystray + Pillow)
+test_smoke.py                — Smoke tests (26 tests)
 codex_manager.cmd / .ps1     — Windows launchers
 codex_manager.sh             — Unix launcher
 providers_template.json      — Provider template
