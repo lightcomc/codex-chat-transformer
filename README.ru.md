@@ -165,6 +165,31 @@ python codex_chat_transformer.py --restore backup_20260518_120000
 python codex_chat_transformer.py --restore-zip codex_backup_20260518.zip
 ```
 
+### Codex Pack / Search / History
+
+Portable subset ZIP for providers and sessions:
+
+```bash
+python codex_chat_transformer.py --export-pack my.codex-pack.zip --scope all
+```
+```bash
+python codex_chat_transformer.py --export-pack providers.zip --scope providers --providers OpenRouter --without-keys
+```
+```bash
+python codex_chat_transformer.py --import-pack my.codex-pack.zip --scope sessions --sessions SESSION_ID
+```
+
+Search and operation history:
+
+```bash
+python codex_chat_transformer.py --search "database migration" --project C:\Research\my_project
+```
+```bash
+python codex_chat_transformer.py --history --history-limit 20
+```
+
+Pack import is upsert-only and does not switch the active provider. History is stored in `.codex/operation_history.jsonl` with API keys, PINs, and auth payloads redacted.
+
 ### Диагностика
 
 Read-only проверка состояния: база, конфиг, авторизация, провайдеры, закреплённые чаты.

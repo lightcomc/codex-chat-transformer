@@ -31,7 +31,8 @@ import shutil
 import sqlite3
 import sys
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
 
 CODEX_DIR = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 STATE_DB = CODEX_DIR / "state_5.sqlite"
@@ -39,6 +40,53 @@ GLOBAL_STATE = CODEX_DIR / ".codex-global-state.json"
 PROVIDERS_FILE = CODEX_DIR / "providers.json"
 SESSIONS_DIR = CODEX_DIR / "sessions"
 ARCHIVED_DIR = CODEX_DIR / "archived_sessions"
+PACK_ROOT = "codex-pack"
+PROVIDERS_LIST_SENTINEL = "__LIST__"
+HISTORY_MAX_BYTES = 2 * 1024 * 1024
+HISTORY_ROTATIONS = 3
+
+
+def parse_sync_peer(raw_target):
+    """Parse CLI sync peer input and validate host/port before any network I/O."""
+    target = (raw_target or "").strip()
+    if not target:
+        raise ValueError("sync target is required")
+
+    scheme = "http"
+    host = ""
+    port = 8080
+
+    if "://" in target:
+        parsed = urlparse(target)
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            raise ValueError("sync target scheme must be http or https")
+        host = parsed.hostname or ""
+        if not host:
+            raise ValueError("sync target host is required")
+        try:
+            port = parsed.port if parsed.port is not None else 8080
+        except ValueError:
+            raise ValueError("sync target port must be numeric")
+    else:
+        if target.startswith(":"):
+            raise ValueError("sync target host is required")
+        if ":" in target:
+            host, port_str = target.rsplit(":", 1)
+            host = host.strip()
+            if not host:
+                raise ValueError("sync target host is required")
+            if not port_str.isdigit():
+                raise ValueError("sync target port must be numeric")
+            port = int(port_str)
+        else:
+            host = target
+
+    if not host:
+        raise ValueError("sync target host is required")
+    if not 1 <= int(port) <= 65535:
+        raise ValueError("sync target port must be between 1 and 65535")
+    return {"scheme": scheme, "host": host, "port": int(port)}
 
 
 def get_db_conn(exit_on_error=True):
@@ -141,6 +189,7 @@ def create_backup(from_provider):
         shutil.copy2(str(PROVIDERS_FILE), str(backup_dir / "providers.json"))
 
     print(f"Backup created: {backup_dir}")
+    record_history("backup_created", provider=from_provider, backup_path=str(backup_dir))
     return backup_dir
 
 
@@ -387,28 +436,226 @@ def _read_auth_info():
         return {"mode": "error", "has_key": False}
 
 
+def _history_path():
+    return CODEX_DIR / "operation_history.jsonl"
+
+
+def _history_logging_enabled():
+    try:
+        return PROVIDERS_FILE.parent.resolve() == CODEX_DIR.resolve()
+    except Exception:
+        return True
+
+
+def _redact_history_value(key, value):
+    key_l = str(key or "").lower()
+    sensitive = (
+        key_l in ("key", "api_key", "openai_api_key", "pin", "remote_pin", "sync_pin", "token", "client_token")
+        or key_l.endswith("_key")
+        or key_l.endswith("_token")
+        or key_l in ("auth.json", "auth")
+    )
+    if sensitive:
+        return "***"
+    if isinstance(value, dict):
+        return {k: _redact_history_value(k, v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_history_value(key, item) for item in value]
+    if isinstance(value, str) and ("OPENAI_API_KEY" in value or "sk-" in value):
+        return "***"
+    return value
+
+
+def _rotate_history_if_needed(path):
+    if not path.exists() or path.stat().st_size <= HISTORY_MAX_BYTES:
+        return
+    for idx in range(HISTORY_ROTATIONS - 1, 0, -1):
+        src = path.with_name(f"{path.name}.{idx}")
+        dst = path.with_name(f"{path.name}.{idx + 1}")
+        if src.exists():
+            if idx + 1 > HISTORY_ROTATIONS:
+                src.unlink()
+            else:
+                src.replace(dst)
+    path.replace(path.with_name(f"{path.name}.1"))
+
+
+def record_history(action, status="ok", source="cli", **fields):
+    """Append a small operation-history record without secrets."""
+    if not _history_logging_enabled():
+        return
+    try:
+        path = _history_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_history_if_needed(path)
+        record = {
+            "ts": datetime.datetime.utcnow().isoformat() + "Z",
+            "source": source,
+            "action": action,
+            "status": status,
+        }
+        for key, value in fields.items():
+            record[key] = _redact_history_value(key, value)
+        with open(str(path), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def load_history(limit=20):
+    """Load operation history newest-first."""
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 20
+    limit = max(1, limit)
+    path = _history_path()
+    if not path.exists():
+        return []
+    records = []
+    try:
+        with open(str(path), "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return list(reversed(records))[:limit]
+
+
+def print_history(limit=20):
+    records = load_history(limit)
+    if not records:
+        print("No operation history.")
+        return
+    print(f"\n=== Operation history ({len(records)}) ===\n")
+    print(f"{'Time':<22} {'Source':<8} {'Action':<24} {'Status':<8} Summary")
+    print("-" * 88)
+    for rec in records:
+        summary_parts = []
+        for key in ("provider", "from_provider", "to_provider", "zip_path", "backup_path"):
+            if rec.get(key):
+                summary_parts.append(f"{key}={rec[key]}")
+        details = rec.get("details")
+        if isinstance(details, dict):
+            for key in ("providers", "sessions", "path"):
+                if key in details:
+                    summary_parts.append(f"{key}={details[key]}")
+        print(f"{rec.get('ts', '')[:22]:<22} {rec.get('source', ''):<8} {rec.get('action', ''):<24} {rec.get('status', ''):<8} {'; '.join(summary_parts)}")
+
+
+def _profile_auth_has_key(prof):
+    auth_raw = _decode_secret(prof.get("auth.json", ""))
+    if not auth_raw:
+        return False
+    try:
+        return bool(json.loads(auth_raw).get("OPENAI_API_KEY"))
+    except Exception:
+        return "OPENAI_API_KEY" in auth_raw
+
+
+def _section_has_provider_header(section, provider):
+    return f"[model_providers.{provider}]" in (section or "")
+
+
+def _section_has_base_url(section):
+    for line in (section or "").splitlines():
+        if line.strip().startswith("base_url") and "=" in line:
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            return bool(value)
+    return False
+
+
+def _active_auth_ok(provider, auth):
+    if provider == "openai" and auth.get("mode") == "chatgpt":
+        return True
+    if auth.get("mode") == "apikey" and auth.get("has_key"):
+        return True
+    return False
+
+
+def build_doctor_report():
+    """Build read-only doctor data for CLI and tests."""
+    running = is_codex_running()
+    cfg = _read_config_info()
+    auth = _read_auth_info()
+    prov_data = _load_providers()
+    profiles = prov_data.get("profiles", {})
+    active = cfg.get("provider")
+    issues = []
+    warnings = []
+
+    if not _active_auth_ok(active, auth):
+        issues.append(f"active auth incomplete for provider '{active}'")
+
+    if active and active not in ("?", "openai") and active not in profiles:
+        warnings.append(f"active provider '{active}' is not saved")
+    elif active == "openai" and profiles and active not in profiles:
+        warnings.append("active provider 'openai' is not saved")
+
+    for name, prof in profiles.items():
+        model_provider = prof.get("model_provider") or name
+        section = prof.get("provider_section", "")
+        if model_provider != name:
+            warnings.append(f"profile '{name}' stores model_provider '{model_provider}'")
+        if not section:
+            issues.append(f"profile '{name}' missing provider_section")
+        elif not _section_has_provider_header(section, model_provider):
+            issues.append(f"profile '{name}' section header does not match '{model_provider}'")
+        if model_provider != "openai" and not _section_has_base_url(section):
+            issues.append(f"profile '{name}' missing base_url")
+        if model_provider != "openai" and prof.get("auth_mode") == "apikey" and not _profile_auth_has_key(prof):
+            issues.append(f"profile '{name}' missing API key")
+
+    return {
+        "running": running,
+        "config": cfg,
+        "auth": auth,
+        "profiles": profiles,
+        "active_saved": prov_data.get("active", "none"),
+        "provider_health": {"issues": issues, "warnings": warnings},
+        "recent_history": load_history(5),
+        "auth_ok": _active_auth_ok(active, auth),
+    }
+
+
 def doctor():
     """Read-only health check of Codex state."""
     print("Codex Chat Transformer - Doctor")
     print("-" * 50)
 
-    running = is_codex_running()
-    cfg = _read_config_info()
-    auth = _read_auth_info()
+    report = build_doctor_report()
+    running = report["running"]
+    cfg = report["config"]
+    auth = report["auth"]
 
     print(f"  Codex running:     {'YES (restart recommended)' if running else 'no'}")
     print(f"  Active provider:   {cfg['provider']}")
     print(f"  Active model:      {cfg['model']}")
     print(f"  Auth mode:         {auth['mode']}")
-    print(f"  API key:           {'present' if auth['has_key'] else 'MISSING'}")
+    api_key_status = "not required" if cfg["provider"] == "openai" and auth["mode"] == "chatgpt" else ("present" if auth["has_key"] else "MISSING")
+    print(f"  API key:           {api_key_status}")
     print(f"  DB:                {'OK' if STATE_DB.exists() else 'NOT FOUND'}")
 
     # Provider profiles
-    prov_data = _load_providers()
-    profiles = prov_data.get("profiles", {})
-    active_saved = prov_data.get("active", "none")
+    profiles = report["profiles"]
+    active_saved = report["active_saved"]
     print(f"  Saved profiles:    {len(profiles)}")
     print(f"  Last active slot:  {active_saved}")
+    print()
+    print("  Provider health:")
+    health = report["provider_health"]
+    if not health["issues"] and not health["warnings"]:
+        print("    OK")
+    for issue in health["issues"]:
+        print(f"    ISSUE: {issue}")
+    for warning in health["warnings"]:
+        print(f"    WARN:  {warning}")
 
     # Thread stats
     if STATE_DB.exists():
@@ -469,8 +716,15 @@ def doctor():
     else:
         print("\n  [!] Database not found - cannot check threads.")
 
+    recent = report["recent_history"]
+    if recent:
+        print()
+        print("  Recent operations:")
+        for rec in recent[:5]:
+            print(f"    {rec.get('ts', '')[:19]}  {rec.get('action', '')}  {rec.get('status', '')}")
+
     print("-" * 50)
-    status = "OK" if not running and auth["has_key"] else "ISSUES DETECTED"
+    status = "OK" if not running and report["auth_ok"] and not health["issues"] else "ISSUES DETECTED"
     print(f"  Status: {status}")
 
 
@@ -581,6 +835,7 @@ def restore_backup(backup_dir):
     print(f"Restored state_5.sqlite from {backup_dir}")
     print("NOTE: JSONL files were NOT restored (they may have been modified in-place).")
     print("      If you need full rollback, restore the entire .codex/sessions/ directory manually.")
+    record_history("restore_backup", backup_path=str(backup_dir))
 
 
 def load_global_state():
@@ -743,6 +998,7 @@ def full_backup():
     zip_size = zip_path.stat().st_size
     print(f"\nDone: {file_count} files, {_fmt_size(total_bytes)} -> {_fmt_size(zip_size)} compressed")
     print(f"Saved to: {zip_path}")
+    record_history("full_backup", backup_path=str(zip_path), details={"files": file_count, "bytes": total_bytes})
     return zip_path
 
 
@@ -781,6 +1037,7 @@ def restore_from_zip(zip_path):
 
         print(f"Restored {restored} files.")
         print("WARNING: Codex must be restarted to pick up changes.")
+        record_history("restore_zip", zip_path=str(zip_path), details={"files": restored})
 
 
 def _fmt_size(n):
@@ -831,6 +1088,383 @@ def fix_dates():
     conn.close()
     print(f"Fixed: {fixed} files (mtime = last message timestamp)")
     print(f"Failed: {failed}")
+
+
+def _parse_csv_list(raw):
+    if raw is None:
+        return None
+    values = [part.strip() for part in str(raw).split(",") if part.strip()]
+    return values
+
+
+def _load_providers_readonly():
+    if not PROVIDERS_FILE.exists():
+        return {"profiles": {}, "active": None}
+    with open(str(PROVIDERS_FILE), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _pack_scope_enabled(scope, part):
+    return scope == "all" or scope == part
+
+
+def _pack_leaf_name(raw_name, kind):
+    name = str(raw_name or "").strip()
+    if not name or any(sep in name for sep in ("/", "\\")) or name in (".", ".."):
+        raise ValueError(f"invalid {kind} name for pack: {raw_name!r}")
+    return name
+
+
+def _session_order_column(conn):
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(threads)")}
+    if "updated_at_ms" in columns:
+        return "updated_at_ms"
+    if "updated_at" in columns:
+        return "updated_at"
+    return "id"
+
+
+def _fetch_session_rows(session_ids=None, project=None):
+    conn = get_db_conn(exit_on_error=False)
+    if conn is None:
+        return []
+    try:
+        order_col = _session_order_column(conn)
+        clauses = []
+        params = []
+        if session_ids:
+            placeholders = ",".join("?" for _ in session_ids)
+            clauses.append(f"id IN ({placeholders})")
+            params.extend(session_ids)
+        if project:
+            clauses.append("cwd LIKE ?")
+            params.append(f"%{project}%")
+        sql = "SELECT * FROM threads"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += f" ORDER BY {order_col} DESC"
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def _normalize_rollout_path(rollout_path):
+    return (rollout_path or "").replace("\\\\?\\", "")
+
+
+def _read_rollout_bytes(rollout_path):
+    path = _normalize_rollout_path(rollout_path)
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _serialize_session_meta(row):
+    meta = dict(row)
+    meta.pop("rollout_path", None)
+    if "archived" in meta:
+        meta["archived"] = bool(meta["archived"])
+    return meta
+
+
+def export_pack(zip_file, scope="all", provider_names=None, session_ids=None, without_keys=False):
+    provider_names = provider_names or []
+    session_ids = session_ids or []
+    warnings = []
+    provider_entries = []
+    session_entries = []
+
+    if _pack_scope_enabled(scope, "providers"):
+        data = _load_providers_readonly()
+        profiles = data.get("profiles", {})
+        selected_names = provider_names or sorted(profiles.keys())
+        for name in selected_names:
+            prof = profiles.get(name)
+            if not prof:
+                warnings.append(f"provider not found: {name}")
+                continue
+            pack_name = _pack_leaf_name(name, "provider")
+            payload = json.loads(json.dumps(prof))
+            payload["name"] = name
+            if without_keys:
+                payload["auth.json"] = ""
+            provider_entries.append((pack_name, payload))
+
+    if _pack_scope_enabled(scope, "sessions"):
+        selected_rows = _fetch_session_rows(session_ids=session_ids or None)
+        row_map = {row.get("id"): row for row in selected_rows}
+        ordered_ids = session_ids or [row.get("id") for row in selected_rows]
+        for sid in ordered_ids:
+            row = row_map.get(sid)
+            if not row:
+                warnings.append(f"session not found: {sid}")
+                continue
+            pack_id = _pack_leaf_name(row.get("id"), "session")
+            rollout_bytes = _read_rollout_bytes(row.get("rollout_path"))
+            if rollout_bytes is None:
+                warnings.append(f"session skipped (missing rollout): {row.get('id')}")
+                continue
+            session_entries.append((pack_id, _serialize_session_meta(row), rollout_bytes))
+
+    if scope == "providers" and not provider_entries:
+        raise ValueError("no providers matched requested scope")
+    if scope == "sessions" and not session_entries:
+        raise ValueError("no sessions matched requested scope")
+    if scope == "all" and not provider_entries and not session_entries:
+        raise ValueError("no providers or sessions matched requested scope")
+
+    zip_path = Path(zip_file)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "format": "codex-pack",
+        "version": 1,
+        "scope": scope,
+        "without_keys": bool(without_keys),
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "provider_count": len(provider_entries),
+        "session_count": len(session_entries),
+    }
+
+    with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            f"{PACK_ROOT}/manifest.json",
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+        )
+        for name, payload in provider_entries:
+            zf.writestr(
+                f"{PACK_ROOT}/providers/{name}.json",
+                json.dumps(payload, indent=2, ensure_ascii=False),
+            )
+        for sid, meta, rollout_bytes in session_entries:
+            zf.writestr(
+                f"{PACK_ROOT}/sessions/{sid}.json",
+                json.dumps(meta, indent=2, ensure_ascii=False),
+            )
+            zf.writestr(f"{PACK_ROOT}/sessions/{sid}.jsonl", rollout_bytes)
+
+    summary = {
+        "zip_path": str(zip_path),
+        "providers_exported": [name for name, _ in provider_entries],
+        "sessions_exported": [sid for sid, _, _ in session_entries],
+        "sessions_skipped": sum(1 for msg in warnings if "missing rollout" in msg),
+        "warnings": warnings,
+    }
+    record_history(
+        "export_pack",
+        zip_path=str(zip_path),
+        details={"providers": len(provider_entries), "sessions": len(session_entries), "without_keys": bool(without_keys)},
+    )
+    return summary
+
+
+def _validate_pack_member(name):
+    parts = PurePosixPath(name).parts
+    if not parts:
+        raise ValueError("empty path in pack")
+    if PurePosixPath(name).is_absolute() or ".." in parts:
+        raise ValueError(f"unsafe path in pack: {name}")
+    return parts
+
+
+def _read_pack(zip_file):
+    zip_path = Path(zip_file)
+    if not zip_path.exists():
+        raise ValueError(f"ZIP not found: {zip_file}")
+
+    providers = {}
+    session_meta = {}
+    session_rollouts = {}
+    manifest = None
+
+    try:
+        with zipfile.ZipFile(str(zip_path), "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                parts = _validate_pack_member(info.filename)
+                if parts[0] != PACK_ROOT:
+                    raise ValueError(f"unexpected path in pack: {info.filename}")
+                if len(parts) == 2 and parts[1] == "manifest.json":
+                    manifest = json.loads(zf.read(info).decode("utf-8"))
+                    continue
+                if len(parts) != 3:
+                    raise ValueError(f"unexpected path in pack: {info.filename}")
+                bucket = parts[1]
+                leaf = parts[2]
+                if bucket == "providers" and leaf.endswith(".json"):
+                    name = _pack_leaf_name(leaf[:-5], "provider")
+                    providers[name] = json.loads(zf.read(info).decode("utf-8"))
+                elif bucket == "sessions" and leaf.endswith(".jsonl"):
+                    sid = _pack_leaf_name(leaf[:-6], "session")
+                    session_rollouts[sid] = zf.read(info)
+                elif bucket == "sessions" and leaf.endswith(".json"):
+                    sid = _pack_leaf_name(leaf[:-5], "session")
+                    session_meta[sid] = json.loads(zf.read(info).decode("utf-8"))
+                else:
+                    raise ValueError(f"unexpected path in pack: {info.filename}")
+    except zipfile.BadZipFile as e:
+        raise ValueError(f"invalid ZIP: {e}") from e
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invalid JSON in pack: {e}") from e
+
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest.json missing or malformed")
+    if manifest.get("format") not in (None, "codex-pack"):
+        raise ValueError("unsupported pack format")
+
+    missing_pairs = sorted(set(session_meta) ^ set(session_rollouts))
+    if missing_pairs:
+        raise ValueError(f"session metadata/rollout mismatch for: {', '.join(missing_pairs)}")
+    return manifest, providers, session_meta, session_rollouts
+
+
+def _align_codex_sync_paths(codex_sync):
+    codex_sync.CODEX_DIR = CODEX_DIR
+    codex_sync.STATE_DB = STATE_DB
+    codex_sync.PROVIDERS_FILE = PROVIDERS_FILE
+    codex_sync.SESSIONS_DIR = SESSIONS_DIR
+
+
+def import_pack(zip_file, scope="all", provider_names=None, session_ids=None):
+    provider_names = provider_names or []
+    session_ids = session_ids or []
+    manifest, providers, session_meta, session_rollouts = _read_pack(zip_file)
+    warnings = []
+
+    selected_provider_names = []
+    selected_session_ids = []
+    if _pack_scope_enabled(scope, "providers"):
+        for name in (provider_names or sorted(providers.keys())):
+            if name not in providers:
+                warnings.append(f"provider not found in pack: {name}")
+                continue
+            selected_provider_names.append(name)
+    if _pack_scope_enabled(scope, "sessions"):
+        for sid in (session_ids or sorted(session_meta.keys())):
+            if sid not in session_meta:
+                warnings.append(f"session not found in pack: {sid}")
+                continue
+            selected_session_ids.append(sid)
+
+    if scope == "providers" and not selected_provider_names:
+        raise ValueError("no providers matched requested scope")
+    if scope == "sessions" and not selected_session_ids:
+        raise ValueError("no sessions matched requested scope")
+    if scope == "all" and not selected_provider_names and not selected_session_ids:
+        raise ValueError("no providers or sessions matched requested scope")
+
+    backup_path = full_backup()
+
+    if selected_provider_names:
+        data = _load_providers_readonly()
+        profiles = data.setdefault("profiles", {})
+        for name in selected_provider_names:
+            record = json.loads(json.dumps(providers[name]))
+            record.pop("name", None)
+            record.setdefault("model_provider", name)
+            record.setdefault("model", "")
+            record.setdefault("auth_mode", "")
+            record.setdefault("provider_section", "")
+            record.setdefault("auth.json", "")
+            record.setdefault("saved_at", datetime.datetime.now().isoformat())
+            profiles[name] = record
+        data["profiles"] = profiles
+        _save_providers(data)
+
+    if selected_session_ids:
+        import base64
+        import codex_sync
+
+        _align_codex_sync_paths(codex_sync)
+        for sid in selected_session_ids:
+            meta = json.loads(json.dumps(session_meta[sid]))
+            meta["id"] = sid
+            codex_sync._store_session(
+                meta,
+                base64.b64encode(session_rollouts[sid]).decode("ascii"),
+            )
+
+    summary = {
+        "backup_path": str(backup_path),
+        "manifest": manifest,
+        "providers_imported": selected_provider_names,
+        "sessions_imported": selected_session_ids,
+        "warnings": warnings,
+    }
+    record_history(
+        "import_pack",
+        zip_path=str(zip_file),
+        backup_path=str(backup_path),
+        details={"providers": len(selected_provider_names), "sessions": len(selected_session_ids)},
+    )
+    return summary
+
+
+def _session_metadata_match(row, query):
+    for field in ("title", "preview", "first_user_message", "cwd", "model_provider", "id"):
+        value = row.get(field, "")
+        if query in str(value or "").casefold():
+            return True
+    return False
+
+
+def search_sessions(query, project=None):
+    needle = (query or "").strip()
+    if not needle:
+        raise ValueError("search query is required")
+    rows = _fetch_session_rows(project=project)
+    needle_cf = needle.casefold()
+    results = []
+    for row in rows:
+        reason = None
+        if _session_metadata_match(row, needle_cf):
+            reason = "metadata"
+        else:
+            rollout_bytes = _read_rollout_bytes(row.get("rollout_path"))
+            if rollout_bytes is not None:
+                rollout_text = rollout_bytes.decode("utf-8", errors="replace")
+                if needle_cf in rollout_text.casefold():
+                    reason = "jsonl"
+        if not reason:
+            continue
+        results.append({
+            "id": row.get("id", ""),
+            "title": row.get("title", "") or "",
+            "model_provider": row.get("model_provider", "") or "",
+            "cwd": row.get("cwd", "") or "",
+            "updated_at_ms": row.get("updated_at_ms") or (row.get("updated_at") or 0) * 1000,
+            "reason": reason,
+        })
+    return results
+
+
+def print_search_results(results):
+    if not results:
+        print("No sessions matched.")
+        return
+    for item in results:
+        title = " ".join(str(item.get("title", "")).split())[:60]
+        cwd = " ".join(str(item.get("cwd", "")).split())[:60]
+        print(f"{item['id']} | {item['model_provider']} | {title} | {cwd}")
+
+
+def print_pack_summary(action, summary):
+    print(f"{action} pack: {summary.get('zip_path') or summary.get('backup_path', '')}")
+    if "providers_exported" in summary:
+        print(f"  Providers: {len(summary['providers_exported'])}")
+        print(f"  Sessions:  {len(summary['sessions_exported'])}")
+        if summary.get("sessions_skipped"):
+            print(f"  Skipped sessions: {summary['sessions_skipped']}")
+    else:
+        print(f"  Providers: {len(summary['providers_imported'])}")
+        print(f"  Sessions:  {len(summary['sessions_imported'])}")
+        print(f"  Backup:    {summary['backup_path']}")
+    for warning in summary.get("warnings", []):
+        print(f"WARNING: {warning}")
 
 
 # ── Provider profiles management ──────────────────────────────────────────
@@ -1163,6 +1797,7 @@ def save_provider(name):
     _save_providers(data)
 
     print(f"Saved profile '{name}' (provider: {provider_name}, model: {model_value}, auth: {auth_mode})")
+    record_history("save_provider", provider=name, details={"model_provider": provider_name, "model": model_value, "auth_mode": auth_mode})
 
 
 def use_provider(name, skip_convert=False):
@@ -1183,6 +1818,7 @@ def use_provider(name, skip_convert=False):
 
     if target_provider == active:
         print(f"Already using '{target_provider}'. No changes needed.")
+        record_history("use_provider", status="noop", provider=name, from_provider=active, to_provider=target_provider)
         return
 
     # 1. Save current active provider back to its profile
@@ -1255,6 +1891,7 @@ def use_provider(name, skip_convert=False):
                 transform(conn, active, target_provider, thread_id=None, skip_pinned=False)
             finally:
                 conn.close()
+    record_history("use_provider", provider=name, from_provider=active, to_provider=target_provider, details={"skip_convert": bool(skip_convert)})
 
 
 def detect_provider():
@@ -1362,6 +1999,7 @@ def add_provider(json_path, api_key=None):
     }
     _save_providers(data)
     print(f"Added provider '{name}' (model: {model}, url: {base_url}, auth: {auth_mode})")
+    record_history("add_provider", provider=name, details={"model": model, "base_url": base_url, "auth_mode": auth_mode})
 
 
 def remove_provider(name):
@@ -1375,6 +2013,7 @@ def remove_provider(name):
     data["profiles"] = profiles
     _save_providers(data)
     print(f"Removed profile '{name}'.")
+    record_history("remove_provider", provider=name)
 
 
 def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, reasoning=None, new_name=None):
@@ -1447,6 +2086,7 @@ def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, 
     if wire_api: changes.append(f"wire_api={wire_api}")
     if reasoning is not None: changes.append(f"reasoning={reasoning or 'default'}")
     print(f"Updated provider '{final_name}': {', '.join(changes)}")
+    record_history("edit_provider", provider=final_name, details={"old_name": name, "changes": changes})
 
     # If this is the active provider (by old or new name), update config.toml
     active = _get_active_provider()
@@ -1512,7 +2152,17 @@ def main():
     parser.add_argument("--backup", action="store_true", help="Create full ZIP backup of .codex")
     parser.add_argument("--restore-zip", metavar="ZIP_FILE", help="Restore from ZIP backup")
     parser.add_argument("--fix-dates", action="store_true", help="Set file mtimes to last message timestamp")
-    parser.add_argument("--providers", action="store_true", help="List saved provider profiles")
+    parser.add_argument("--providers", nargs="?", const=PROVIDERS_LIST_SENTINEL, metavar="NAME1,NAME2",
+                        help="List saved provider profiles, or filter pack commands by provider name")
+    parser.add_argument("--sessions", metavar="ID1,ID2", help="Filter pack commands by session ID")
+    parser.add_argument("--scope", choices=["providers", "sessions", "all"], default="all",
+                        help="Scope for pack import/export")
+    parser.add_argument("--without-keys", action="store_true", help="Strip provider auth when exporting a pack")
+    parser.add_argument("--export-pack", metavar="ZIP_FILE", help="Export providers/sessions into a Codex Pack ZIP")
+    parser.add_argument("--import-pack", metavar="ZIP_FILE", help="Import providers/sessions from a Codex Pack ZIP")
+    parser.add_argument("--search", metavar="QUERY", help="Search sessions by metadata, with JSONL fallback")
+    parser.add_argument("--history", action="store_true", help="Show recent operation history")
+    parser.add_argument("--history-limit", type=int, default=20, metavar="N", help="Number of history entries to show")
     parser.add_argument("--save-provider", metavar="NAME", help="Save current config/auth as a provider profile")
     parser.add_argument("--use-provider", metavar="NAME", help="Switch to a saved provider profile")
     parser.add_argument("--detect-provider", action="store_true", help="Scan for unsaved provider configs")
@@ -1538,6 +2188,30 @@ def main():
     parser.add_argument("--sync-pin", metavar="PIN", help="PIN for sync authentication (prompts if omitted)")
 
     args = parser.parse_args()
+    provider_filter = None
+    session_filter = None
+    if args.providers not in (None, PROVIDERS_LIST_SENTINEL):
+        provider_filter = _parse_csv_list(args.providers)
+        if not provider_filter:
+            print("ERROR: --providers requires at least one provider name.")
+            return
+    if args.sessions is not None:
+        session_filter = _parse_csv_list(args.sessions)
+        if not session_filter:
+            print("ERROR: --sessions requires at least one session ID.")
+            return
+    if args.without_keys and not args.export_pack:
+        print("ERROR: --without-keys is only valid with --export-pack.")
+        return
+    if args.providers == PROVIDERS_LIST_SENTINEL and (args.export_pack or args.import_pack):
+        print("ERROR: --providers requires a comma-separated value with pack commands.")
+        return
+    if provider_filter and not (args.export_pack or args.import_pack):
+        print("ERROR: --providers NAME1,NAME2 is only valid with --export-pack or --import-pack.")
+        return
+    if session_filter and not (args.export_pack or args.import_pack):
+        print("ERROR: --sessions is only valid with --export-pack or --import-pack.")
+        return
 
     if args.restore:
         restore_backup(args.restore)
@@ -1555,7 +2229,49 @@ def main():
         fix_dates()
         return
 
-    if args.providers:
+    if args.export_pack:
+        try:
+            summary = export_pack(
+                args.export_pack,
+                scope=args.scope,
+                provider_names=provider_filter,
+                session_ids=session_filter,
+                without_keys=args.without_keys,
+            )
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            return
+        print_pack_summary("Exported", summary)
+        return
+
+    if args.import_pack:
+        try:
+            summary = import_pack(
+                args.import_pack,
+                scope=args.scope,
+                provider_names=provider_filter,
+                session_ids=session_filter,
+            )
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            return
+        print_pack_summary("Imported", summary)
+        return
+
+    if args.search:
+        try:
+            results = search_sessions(args.search, project=args.project)
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            return
+        print_search_results(results)
+        return
+
+    if args.history:
+        print_history(args.history_limit)
+        return
+
+    if args.providers == PROVIDERS_LIST_SENTINEL:
         providers_list()
         return
 
@@ -1615,18 +2331,19 @@ def main():
             _get_sessions_list, _get_session_jsonl,
         )
         import base64
-        target = args.sync_pull or args.sync_push
-        if ":" in target:
-            host, port_str = target.rsplit(":", 1)
-            port = int(port_str)
-        else:
-            host = target
-            port = 8080
+        try:
+            peer = parse_sync_peer(args.sync_pull or args.sync_push)
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            return
+        host = peer["host"]
+        port = peer["port"]
+        scheme = peer["scheme"]
         pin = args.sync_pin or input("Enter PIN: ").strip().upper()
         mode = "pull" if args.sync_pull else "push"
-        base_url = f"http://{host}:{port}"
+        base_url = f"{scheme}://{host}:{port}"
         print(f"\n=== Codex Sync ({mode}) ===")
-        print(f"  Target: {host}:{port}")
+        print(f"  Target: {scheme}://{host}:{port}")
         try:
             manifest = _client_get_json(f"{base_url}/api/manifest", pin)
             print(f"  Connected! {manifest['session_count']} sessions, {manifest['provider_count']} providers\n")

@@ -39,6 +39,110 @@ def restore_providers(orig, tmp):
         tmp.unlink()
 
 
+def setup_temp_codex_home():
+    import codex_sync
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    (tmp_dir / ".codex-global-state.json").write_text(
+        json.dumps({"pinned-thread-ids": []}),
+        encoding="utf-8",
+    )
+    original = {
+        "ct": {
+            "CODEX_DIR": ct.CODEX_DIR,
+            "STATE_DB": ct.STATE_DB,
+            "GLOBAL_STATE": ct.GLOBAL_STATE,
+            "PROVIDERS_FILE": ct.PROVIDERS_FILE,
+            "SESSIONS_DIR": ct.SESSIONS_DIR,
+            "ARCHIVED_DIR": ct.ARCHIVED_DIR,
+        },
+        "sync": {
+            "CODEX_DIR": codex_sync.CODEX_DIR,
+            "STATE_DB": codex_sync.STATE_DB,
+            "PROVIDERS_FILE": codex_sync.PROVIDERS_FILE,
+            "SESSIONS_DIR": codex_sync.SESSIONS_DIR,
+        },
+    }
+
+    ct.CODEX_DIR = tmp_dir
+    ct.STATE_DB = tmp_dir / "state_5.sqlite"
+    ct.GLOBAL_STATE = tmp_dir / ".codex-global-state.json"
+    ct.PROVIDERS_FILE = tmp_dir / "providers.json"
+    ct.SESSIONS_DIR = tmp_dir / "sessions"
+    ct.ARCHIVED_DIR = tmp_dir / "archived_sessions"
+
+    codex_sync.CODEX_DIR = tmp_dir
+    codex_sync.STATE_DB = ct.STATE_DB
+    codex_sync.PROVIDERS_FILE = ct.PROVIDERS_FILE
+    codex_sync.SESSIONS_DIR = ct.SESSIONS_DIR
+    return original, tmp_dir
+
+
+def restore_temp_codex_home(original, tmp_dir):
+    import codex_sync
+    import gc
+    import shutil
+    import time
+
+    ct.CODEX_DIR = original["ct"]["CODEX_DIR"]
+    ct.STATE_DB = original["ct"]["STATE_DB"]
+    ct.GLOBAL_STATE = original["ct"]["GLOBAL_STATE"]
+    ct.PROVIDERS_FILE = original["ct"]["PROVIDERS_FILE"]
+    ct.SESSIONS_DIR = original["ct"]["SESSIONS_DIR"]
+    ct.ARCHIVED_DIR = original["ct"]["ARCHIVED_DIR"]
+
+    codex_sync.CODEX_DIR = original["sync"]["CODEX_DIR"]
+    codex_sync.STATE_DB = original["sync"]["STATE_DB"]
+    codex_sync.PROVIDERS_FILE = original["sync"]["PROVIDERS_FILE"]
+    codex_sync.SESSIONS_DIR = original["sync"]["SESSIONS_DIR"]
+    for attempt in range(5):
+        try:
+            shutil.rmtree(tmp_dir)
+            return
+        except PermissionError:
+            gc.collect()
+            time.sleep(0.1 * (attempt + 1))
+    shutil.rmtree(tmp_dir)
+
+
+def create_temp_threads_db():
+    import sqlite3
+
+    conn = sqlite3.connect(str(ct.STATE_DB))
+    _create_current_threads_schema(conn)
+    conn.commit()
+    conn.close()
+
+
+def store_temp_session(session_id, title, cwd, jsonl_text="", **extra):
+    import base64
+    import codex_sync
+
+    meta = {
+        "id": session_id,
+        "model_provider": extra.pop("model_provider", "openai"),
+        "model": extra.pop("model", "gpt-5"),
+        "title": title,
+        "created_at_ms": extra.pop("created_at_ms", 1700000000000),
+        "updated_at_ms": extra.pop("updated_at_ms", 1700000001000),
+        "archived": extra.pop("archived", False),
+        "source": extra.pop("source", "cli"),
+        "cwd": cwd,
+        "git_branch": extra.pop("git_branch", "main"),
+        "git_sha": extra.pop("git_sha", "a" * 40),
+        "git_origin_url": extra.pop("git_origin_url", "https://example.invalid/repo.git"),
+        "sandbox_policy": extra.pop("sandbox_policy", "{}"),
+        "approval_mode": extra.pop("approval_mode", "never"),
+        "has_user_event": extra.pop("has_user_event", 1),
+        "first_user_message": extra.pop("first_user_message", ""),
+        "preview": extra.pop("preview", ""),
+        "reasoning_effort": extra.pop("reasoning_effort", None),
+    }
+    meta.update(extra)
+    jsonl_b64 = base64.b64encode(jsonl_text.encode("utf-8")).decode("ascii") if jsonl_text else ""
+    return codex_sync._store_session(meta, jsonl_b64)
+
+
 # --- Tests ---
 
 def test_gui_syntax():
@@ -180,6 +284,27 @@ def test_cli_sync_push_not_hardcoded_to_8080():
     text = Path("codex_chat_transformer.py").read_text(encoding="utf-8")
     assert "127.0.0.1:8080/api/providers" not in text, "CLI provider push must not depend on local port 8080"
     assert "_providers_summary" in text and "_provider_full" in text, "CLI provider push should read local providers directly"
+
+
+def test_parse_sync_peer_accepts_supported_forms():
+    cases = [
+        ("example.com", {"scheme": "http", "host": "example.com", "port": 8080}),
+        ("example.com:9090", {"scheme": "http", "host": "example.com", "port": 9090}),
+        ("http://example.com:7000", {"scheme": "http", "host": "example.com", "port": 7000}),
+        ("https://example.com:7443", {"scheme": "https", "host": "example.com", "port": 7443}),
+    ]
+    for raw, expected in cases:
+        parsed = ct.parse_sync_peer(raw)
+        assert parsed == expected, f"{raw}: expected {expected}, got {parsed}"
+
+
+def test_parse_sync_peer_rejects_invalid_inputs():
+    for raw in ("", ":8080", "example.com:nope", "http://:8080", "example.com:0", "example.com:65536"):
+        try:
+            ct.parse_sync_peer(raw)
+        except ValueError:
+            continue
+        raise AssertionError(f"{raw!r} should raise ValueError")
 
 
 def test_is_codex_running():
@@ -326,6 +451,334 @@ def test_cli_syntax():
     )
 
 
+def test_export_pack_without_keys_strips_provider_auth():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        ct._save_providers({
+            "profiles": {
+                "PackProv": {
+                    "model_provider": "PackProv",
+                    "model": "gpt-5",
+                    "auth_mode": "apikey",
+                    "provider_section": '[model_providers.PackProv]\nname = "PackProv"\nbase_url = "https://pack.invalid/v1"\nwire_api = "responses"',
+                    "auth.json": json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-pack"}),
+                    "saved_at": "2026-01-01T00:00:00",
+                }
+            },
+            "active": "PackProv",
+        })
+        zip_path = tmp_dir / "providers-pack.zip"
+        summary = ct.export_pack(zip_path, scope="providers", provider_names=["PackProv"], without_keys=True)
+
+        import zipfile
+        with zipfile.ZipFile(str(zip_path), "r") as zf:
+            provider = json.loads(zf.read("codex-pack/providers/PackProv.json").decode("utf-8"))
+
+        assert summary["providers_exported"] == ["PackProv"], f"unexpected summary: {summary}"
+        assert provider["auth.json"] == "", "without-keys export should strip auth payload"
+        assert provider["auth_mode"] == "apikey", "auth mode should remain visible"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_import_pack_upserts_provider_and_stores_auth_obfuscated():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        zip_path = tmp_dir / "import-provider-pack.zip"
+        import zipfile
+        with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("codex-pack/manifest.json", json.dumps({"version": 1, "scope": "providers"}))
+            zf.writestr("codex-pack/providers/ImportProv.json", json.dumps({
+                "name": "ImportProv",
+                "model_provider": "ImportProv",
+                "model": "gpt-5.5",
+                "auth_mode": "apikey",
+                "provider_section": '[model_providers.ImportProv]\nname = "ImportProv"\nbase_url = "https://import.invalid/v1"\nwire_api = "responses"',
+                "auth.json": json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-import"}),
+                "saved_at": "2026-01-01T00:00:00",
+            }))
+
+        backup_calls = []
+        original_full_backup = ct.full_backup
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+        try:
+            summary = ct.import_pack(zip_path, scope="providers")
+        finally:
+            ct.full_backup = original_full_backup
+
+        raw = json.loads(ct.PROVIDERS_FILE.read_text(encoding="utf-8"))
+        stored = raw["profiles"]["ImportProv"]["auth.json"]
+        assert summary["providers_imported"] == ["ImportProv"], f"unexpected summary: {summary}"
+        assert backup_calls == ["called"], f"import should create one backup, got {backup_calls}"
+        assert stored.startswith("b64:"), "imported provider auth should be stored obfuscated"
+        decoded = json.loads(ct._decode_secret(stored))
+        assert decoded["OPENAI_API_KEY"] == "sk-import", "decoded auth should preserve the key"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_pack_sessions_export_import_round_trip():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        jsonl_text = '\n'.join([
+            json.dumps({"type": "session_meta", "payload": {"model_provider": "openai", "model": "gpt-5"}}),
+            json.dumps({"type": "user_message", "text": "hello pack"}),
+        ]) + "\n"
+        store_temp_session(
+            "sess-pack",
+            "Pack Session",
+            r"C:\Projects\Pack",
+            jsonl_text=jsonl_text,
+            first_user_message="hello pack",
+            preview="pack preview",
+        )
+
+        zip_path = tmp_dir / "sessions-pack.zip"
+        export_summary = ct.export_pack(zip_path, scope="sessions")
+
+        import shutil
+        shutil.rmtree(ct.SESSIONS_DIR)
+        ct.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        import sqlite3
+        conn = sqlite3.connect(str(ct.STATE_DB))
+        conn.execute("DELETE FROM threads")
+        conn.commit()
+        conn.close()
+
+        backup_calls = []
+        original_full_backup = ct.full_backup
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+        try:
+            import_summary = ct.import_pack(zip_path, scope="sessions")
+        finally:
+            ct.full_backup = original_full_backup
+
+        conn = sqlite3.connect(str(ct.STATE_DB))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT id, title, cwd, first_user_message, preview FROM threads WHERE id = ?", ("sess-pack",)).fetchone()
+        conn.close()
+
+        rollout_files = list(ct.SESSIONS_DIR.rglob("rollout-sess-pack.jsonl"))
+        assert export_summary["sessions_exported"] == ["sess-pack"], f"unexpected export summary: {export_summary}"
+        assert import_summary["sessions_imported"] == ["sess-pack"], f"unexpected import summary: {import_summary}"
+        assert backup_calls == ["called"], f"import should create one backup, got {backup_calls}"
+        assert row is not None, "import should upsert the session row"
+        assert row["title"] == "Pack Session", "session title should round-trip"
+        assert row["first_user_message"] == "hello pack", "first user message should round-trip"
+        assert row["preview"] == "pack preview", "preview should round-trip"
+        assert rollout_files, "session import should restore a rollout file"
+        assert "hello pack" in rollout_files[0].read_text(encoding="utf-8"), "rollout file should round-trip"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_pack_filters_limit_exported_items():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        ct._save_providers({
+            "profiles": {
+                "KeepProv": {
+                    "model_provider": "KeepProv",
+                    "model": "gpt-5",
+                    "auth_mode": "apikey",
+                    "provider_section": '[model_providers.KeepProv]\nname = "KeepProv"\nbase_url = "https://keep.invalid/v1"',
+                    "auth.json": json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-keep"}),
+                    "saved_at": "2026-01-01T00:00:00",
+                },
+                "DropProv": {
+                    "model_provider": "DropProv",
+                    "model": "gpt-5",
+                    "auth_mode": "apikey",
+                    "provider_section": '[model_providers.DropProv]\nname = "DropProv"\nbase_url = "https://drop.invalid/v1"',
+                    "auth.json": json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-drop"}),
+                    "saved_at": "2026-01-01T00:00:00",
+                },
+            },
+            "active": "KeepProv",
+        })
+        store_temp_session("keep-session", "Keep Session", r"C:\Projects\Keep", jsonl_text='{"type":"user_message","text":"keep"}\n')
+        store_temp_session("drop-session", "Drop Session", r"C:\Projects\Drop", jsonl_text='{"type":"user_message","text":"drop"}\n')
+
+        zip_path = tmp_dir / "filtered-pack.zip"
+        summary = ct.export_pack(
+            zip_path,
+            scope="all",
+            provider_names=["KeepProv"],
+            session_ids=["keep-session"],
+        )
+
+        import zipfile
+        with zipfile.ZipFile(str(zip_path), "r") as zf:
+            names = set(zf.namelist())
+
+        assert summary["providers_exported"] == ["KeepProv"], f"unexpected provider summary: {summary}"
+        assert summary["sessions_exported"] == ["keep-session"], f"unexpected session summary: {summary}"
+        assert "codex-pack/providers/KeepProv.json" in names, "selected provider should be exported"
+        assert "codex-pack/providers/DropProv.json" not in names, "unselected provider should be omitted"
+        assert "codex-pack/sessions/keep-session.json" in names, "selected session metadata should be exported"
+        assert "codex-pack/sessions/drop-session.json" not in names, "unselected session should be omitted"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_export_pack_skips_missing_rollout_with_warning():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        store_temp_session("good-session", "Good Session", r"C:\Projects\Good", jsonl_text='{"type":"user_message","text":"good"}\n')
+        store_temp_session("missing-session", "Missing Session", r"C:\Projects\Missing", jsonl_text="")
+
+        zip_path = tmp_dir / "missing-rollout-pack.zip"
+        summary = ct.export_pack(zip_path, scope="sessions")
+
+        import zipfile
+        with zipfile.ZipFile(str(zip_path), "r") as zf:
+            names = set(zf.namelist())
+
+        assert summary["sessions_exported"] == ["good-session"], f"unexpected exported sessions: {summary}"
+        assert summary["sessions_skipped"] == 1, f"missing rollout should be counted as skipped: {summary}"
+        assert summary["warnings"], "missing rollout should emit at least one warning"
+        assert "codex-pack/sessions/good-session.jsonl" in names, "readable rollout should be exported"
+        assert "codex-pack/sessions/missing-session.jsonl" not in names, "missing rollout should be skipped"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_search_sessions_metadata_hit():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "meta-hit",
+            "Needle Title",
+            r"C:\Projects\Meta",
+            jsonl_text="",
+            preview="compact preview",
+            first_user_message="first prompt",
+        )
+        results = ct.search_sessions("needle")
+        assert [r["id"] for r in results] == ["meta-hit"], f"metadata search should match by title: {results}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_search_sessions_jsonl_fallback_hit():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        jsonl_text = '\n'.join([
+            json.dumps({"type": "session_meta", "payload": {"model_provider": "openai"}}),
+            json.dumps({"type": "assistant_message", "text": "plain fallback needle"}),
+        ]) + "\n"
+        store_temp_session(
+            "jsonl-hit",
+            "Unrelated Title",
+            r"C:\Projects\Jsonl",
+            jsonl_text=jsonl_text,
+            preview="no match here",
+            first_user_message="still no match",
+        )
+        results = ct.search_sessions("needle")
+        assert [r["id"] for r in results] == ["jsonl-hit"], f"search should fall back to JSONL scan: {results}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_search_sessions_project_filter():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        store_temp_session("proj-a", "Needle A", r"C:\Projects\Alpha", jsonl_text="")
+        store_temp_session("proj-b", "Needle B", r"C:\Projects\Beta", jsonl_text="")
+        results = ct.search_sessions("needle", project="Alpha")
+        assert [r["id"] for r in results] == ["proj-a"], f"project filter should limit search results: {results}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_operation_history_redacts_and_loads_newest():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        ct.record_history("first", api_key="sk-secret", details={"remote_pin": "ABC123", "safe": "shown"})
+        ct.record_history("second", provider="HistProv")
+        records = ct.load_history(2)
+        raw = (tmp_dir / "operation_history.jsonl").read_text(encoding="utf-8")
+        assert [r["action"] for r in records] == ["second", "first"], f"history should load newest-first: {records}"
+        assert "sk-secret" not in raw, "history should not contain raw API keys"
+        assert "ABC123" not in raw, "history should not contain raw PINs"
+        assert records[1]["details"]["safe"] == "shown", "safe details should be preserved"
+        assert records[1]["api_key"] == "***", "API key field should be redacted"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_provider_action_emits_history_without_secret():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        provider_json = tmp_dir / "provider.json"
+        provider_json.write_text(json.dumps({
+            "name": "HistoryProv",
+            "model": "gpt-5",
+            "base_url": "https://history.invalid/v1",
+            "wire_api": "responses",
+        }), encoding="utf-8")
+        ct.add_provider(str(provider_json), "sk-history")
+        records = ct.load_history(1)
+        raw = (tmp_dir / "operation_history.jsonl").read_text(encoding="utf-8")
+        assert records[0]["action"] == "add_provider", f"expected add_provider history, got {records}"
+        assert records[0]["provider"] == "HistoryProv", f"provider name should be recorded: {records}"
+        assert "sk-history" not in raw, "history must not record provider API keys"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_doctor_report_accepts_chatgpt_auth_without_api_key():
+    original, tmp_dir = setup_temp_codex_home()
+    old_running = ct.is_codex_running
+    ct.is_codex_running = lambda: False
+    try:
+        (tmp_dir / "config.toml").write_text('model_provider = "openai"\nmodel = "gpt-5"\n', encoding="utf-8")
+        (tmp_dir / "auth.json").write_text(json.dumps({"auth_mode": "chatgpt"}), encoding="utf-8")
+        report = ct.build_doctor_report()
+        assert report["auth_ok"], f"chatgpt auth should not require API key: {report}"
+        assert not report["provider_health"]["issues"], f"chatgpt auth should not create provider issues: {report}"
+    finally:
+        ct.is_codex_running = old_running
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_doctor_report_flags_provider_health_issues():
+    original, tmp_dir = setup_temp_codex_home()
+    old_running = ct.is_codex_running
+    ct.is_codex_running = lambda: False
+    try:
+        (tmp_dir / "config.toml").write_text('model_provider = "BadProv"\nmodel = "gpt-5"\n', encoding="utf-8")
+        (tmp_dir / "auth.json").write_text(json.dumps({"auth_mode": "apikey"}), encoding="utf-8")
+        ct._save_providers({
+            "profiles": {
+                "BadProv": {
+                    "model_provider": "BadProv",
+                    "model": "gpt-5",
+                    "auth_mode": "apikey",
+                    "provider_section": "[model_providers.BadProv]\nname = \"BadProv\"",
+                    "auth.json": "",
+                    "saved_at": "2026-01-01T00:00:00",
+                }
+            },
+            "active": "BadProv",
+        })
+        report = ct.build_doctor_report()
+        issues = "\n".join(report["provider_health"]["issues"])
+        assert "active auth incomplete" in issues, f"missing active API key should be reported: {issues}"
+        assert "missing base_url" in issues, f"missing base_url should be reported: {issues}"
+        assert "missing API key" in issues, f"missing saved provider key should be reported: {issues}"
+    finally:
+        ct.is_codex_running = old_running
+        restore_temp_codex_home(original, tmp_dir)
+
+
 # --- Sync tests ---
 
 def _create_current_threads_schema(conn):
@@ -441,6 +894,188 @@ def test_compute_hashes_excludes_sensitive_and_temp_paths():
         assert not any(p.startswith("__pytest_tmp_probe/") for p in hashes), "dunder pytest temp dirs should be excluded"
     finally:
         shutil.rmtree(tmp)
+
+
+def test_repo_hashes_include_meta_and_excluded_summary():
+    import codex_sync, threading, json, shutil, http.client
+    from urllib.parse import quote
+    tmp = tempfile.mkdtemp()
+    server, pin, port = codex_sync.start_server(port=0)
+    actual_port = server.server_address[1]
+    codex_sync.SyncHandler.pin = pin
+    codex_sync.SyncHandler.server_port = actual_port
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        (Path(tmp) / "src").mkdir()
+        include = Path(tmp) / "src" / "app.py"
+        include.write_text("print(1)\n", encoding="utf-8")
+        (Path(tmp) / "secrets").mkdir()
+        (Path(tmp) / "secrets" / "token.txt").write_text("secret", encoding="utf-8")
+        (Path(tmp) / ".env").write_text("SECRET=1\n", encoding="utf-8")
+
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request(
+            "GET",
+            "/api/repo-hashes?dir=" + quote(tmp, safe=""),
+            headers={"Authorization": "Bearer " + pin},
+        )
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        assert resp.status == 200, f"Expected 200, got {resp.status}"
+        assert data["files"]["src/app.py"], "hash entry should be present"
+        assert data["meta"]["src/app.py"]["size"] == include.stat().st_size, "size should be reported"
+        assert data["meta"]["src/app.py"]["mtime_ms"] > 0, "mtime_ms should be reported"
+        assert data["excluded"]["count"] >= 2, "excluded files should be counted"
+        sample = data["excluded"]["sample_paths"]
+        assert ".env" in sample or "secrets/token.txt" in sample, "excluded sample should include blocked paths"
+    finally:
+        codex_sync.stop_server(server)
+        shutil.rmtree(tmp)
+
+
+def _sync_request(port, pin, path, payload):
+    import http.client
+    import json
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request(
+        "POST",
+        path,
+        body=json.dumps(payload),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + pin},
+    )
+    resp = conn.getresponse()
+    data = json.loads(resp.read().decode("utf-8"))
+    conn.close()
+    return resp.status, data
+
+
+def _start_sync_server_thread(codex_sync, pin):
+    import threading
+    server, _, _ = codex_sync.start_server(port=0, pin=pin)
+    actual_port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, actual_port
+
+
+def test_push_files_preview_does_not_mutate_remote():
+    import codex_sync, shutil
+    pin = "ABC123"
+    local_dir = tempfile.mkdtemp()
+    remote_dir = tempfile.mkdtemp()
+    local_server, local_port = _start_sync_server_thread(codex_sync, pin)
+    remote_server, remote_port = _start_sync_server_thread(codex_sync, pin)
+    try:
+        (Path(local_dir) / "replace.txt").write_text("local-new", encoding="utf-8")
+        (Path(local_dir) / "add.txt").write_text("brand-new", encoding="utf-8")
+        (Path(remote_dir) / "replace.txt").write_text("remote-old", encoding="utf-8")
+        (Path(remote_dir) / "remove.txt").write_text("delete-me", encoding="utf-8")
+
+        status, data = _sync_request(local_port, pin, "/api/push/files", {
+            "remote_host": "127.0.0.1",
+            "remote_port": remote_port,
+            "remote_pin": pin,
+            "files": ["replace.txt", "add.txt"],
+            "delete_files": ["remove.txt"],
+            "base_dir": local_dir,
+            "remote_dir": remote_dir,
+            "preview": True,
+            "conflict": "remote",
+        })
+
+        assert status == 200, f"Expected 200, got {status}"
+        assert data["preview"] is True, "response should indicate preview mode"
+        assert data["counts"]["transfer"] == 2, f"expected 2 planned transfers, got {data['counts']}"
+        assert data["counts"]["delete"] == 1, f"expected 1 planned delete, got {data['counts']}"
+        assert (Path(remote_dir) / "replace.txt").read_text(encoding="utf-8") == "remote-old", "preview must not overwrite remote files"
+        assert not (Path(remote_dir) / "add.txt").exists(), "preview must not create remote files"
+        assert (Path(remote_dir) / "remove.txt").exists(), "preview must not delete remote files"
+        assert not list(Path(remote_dir).glob(".sync_backup_*")), "preview must not create backups"
+    finally:
+        codex_sync.stop_server(local_server)
+        codex_sync.stop_server(remote_server)
+        shutil.rmtree(local_dir)
+        shutil.rmtree(remote_dir)
+
+
+def test_pull_files_conflict_policies():
+    import codex_sync, shutil
+    pin = "ABC123"
+
+    def set_mtime(path, seconds):
+        os.utime(path, (seconds, seconds))
+
+    def run_policy(policy):
+        base_ts = 1700000000
+        local_dir = tempfile.mkdtemp()
+        remote_dir = tempfile.mkdtemp()
+        local_server, local_port = _start_sync_server_thread(codex_sync, pin)
+        remote_server, remote_port = _start_sync_server_thread(codex_sync, pin)
+        try:
+            remote_older = Path(remote_dir) / "older.txt"
+            remote_newer = Path(remote_dir) / "newer.txt"
+            remote_added = Path(remote_dir) / "added.txt"
+            remote_older.write_text("remote-older", encoding="utf-8")
+            remote_newer.write_text("remote-newer", encoding="utf-8")
+            remote_added.write_text("remote-added", encoding="utf-8")
+            set_mtime(remote_older, base_ts + 1000)
+            set_mtime(remote_newer, base_ts + 4000)
+            set_mtime(remote_added, base_ts + 5000)
+
+            local_older = Path(local_dir) / "older.txt"
+            local_newer = Path(local_dir) / "newer.txt"
+            local_remove = Path(local_dir) / "remove.txt"
+            local_older.write_text("local-newest", encoding="utf-8")
+            local_newer.write_text("local-old", encoding="utf-8")
+            local_remove.write_text("keep-or-delete", encoding="utf-8")
+            set_mtime(local_older, base_ts + 3000)
+            set_mtime(local_newer, base_ts + 2000)
+            set_mtime(local_remove, base_ts + 3500)
+
+            status, data = _sync_request(local_port, pin, "/api/pull/files", {
+                "remote_host": "127.0.0.1",
+                "remote_port": remote_port,
+                "remote_pin": pin,
+                "files": ["older.txt", "newer.txt", "added.txt"],
+                "delete_files": ["remove.txt"],
+                "base_dir": local_dir,
+                "remote_dir": remote_dir,
+                "preview": False,
+                "conflict": policy,
+            })
+            assert status == 200, f"{policy}: expected 200, got {status}"
+            return {
+                "data": data,
+                "older": local_older.read_text(encoding="utf-8"),
+                "newer": local_newer.read_text(encoding="utf-8"),
+                "added": (Path(local_dir) / "added.txt").read_text(encoding="utf-8"),
+                "remove_exists": local_remove.exists(),
+            }
+        finally:
+            codex_sync.stop_server(local_server)
+            codex_sync.stop_server(remote_server)
+            shutil.rmtree(local_dir)
+            shutil.rmtree(remote_dir)
+
+    remote_result = run_policy("remote")
+    assert remote_result["older"] == "remote-older", "remote policy should overwrite destination conflicts"
+    assert remote_result["newer"] == "remote-newer", "remote policy should apply remote updates"
+    assert remote_result["added"] == "remote-added", "remote policy should add missing files"
+    assert not remote_result["remove_exists"], "remote policy should delete destination-only files"
+
+    local_result = run_policy("local")
+    assert local_result["older"] == "local-newest", "local policy should keep conflicting destination files"
+    assert local_result["newer"] == "local-old", "local policy should skip overwriting conflicting files"
+    assert local_result["added"] == "remote-added", "local policy should still add missing files"
+    assert local_result["remove_exists"], "local policy should skip deletes"
+
+    newer_result = run_policy("newer")
+    assert newer_result["older"] == "local-newest", "newer policy should skip when source is older"
+    assert newer_result["newer"] == "remote-newer", "newer policy should apply when source mtime is newer"
+    assert newer_result["added"] == "remote-added", "newer policy should add missing files"
+    assert newer_result["remove_exists"], "newer policy should skip deletes conservatively"
 
 
 def test_file_diff():
@@ -725,6 +1360,14 @@ def test_dashboard_uses_local_pin_for_protected_local_api():
     assert "fetch('/api/providers',{headers:localAuthHeaders()})" in text, "local providers fetch should include auth"
     assert "fetch('/api/sessions',{headers:localAuthHeaders()})" in text, "local sessions fetch should include auth"
     assert "fetch('/api/repo-hashes?dir='+encodeURIComponent(dir),{headers:localAuthHeaders()})" in text, "local repo scan should include auth"
+
+
+def test_dashboard_file_sync_wires_preview_conflict_and_scan_summary():
+    text = Path("codex_sync.py").read_text(encoding="utf-8")
+    assert "preview" in text, "dashboard should wire preview flag for file sync"
+    assert "conflict" in text, "dashboard should wire conflict mode for file sync"
+    assert "excluded" in text, "dashboard should show excluded scan summary"
+    assert "remoteFields()" in text and "remote_scheme:remoteScheme" in text, "dashboard should pass remote scheme through local handlers"
 
 
 def test_sync_tray_syntax():
@@ -1129,6 +1772,8 @@ if __name__ == "__main__":
     test("transform() has project/from_model/to_model params", test_transform_signature)
     test("project filter uses cwd column", test_project_filter_uses_cwd_column)
     test("CLI sync push does not hardcode localhost:8080", test_cli_sync_push_not_hardcoded_to_8080)
+    test("sync peer parser accepts supported forms", test_parse_sync_peer_accepts_supported_forms)
+    test("sync peer parser rejects invalid inputs", test_parse_sync_peer_rejects_invalid_inputs)
     test("is_codex_running returns bool", test_is_codex_running)
     test("_merge_config handles reasoning effort", test_merge_reasoning)
     test("_merge_config adds reasoning when absent", test_merge_add_reasoning_when_absent)
@@ -1136,6 +1781,18 @@ if __name__ == "__main__":
     test("edit_provider rename + update", test_rename_provider)
     test("provider name sanitization", test_sanitize_name)
     test("set_model changes config", test_set_model)
+    test("pack export strips provider auth with --without-keys", test_export_pack_without_keys_strips_provider_auth)
+    test("pack import upserts provider with obfuscated auth", test_import_pack_upserts_provider_and_stores_auth_obfuscated)
+    test("pack sessions export/import round-trip", test_pack_sessions_export_import_round_trip)
+    test("pack filters limit exported items", test_pack_filters_limit_exported_items)
+    test("pack export skips missing rollout with warning", test_export_pack_skips_missing_rollout_with_warning)
+    test("session search metadata hit", test_search_sessions_metadata_hit)
+    test("session search JSONL fallback hit", test_search_sessions_jsonl_fallback_hit)
+    test("session search project filter", test_search_sessions_project_filter)
+    test("operation history redacts and loads newest first", test_operation_history_redacts_and_loads_newest)
+    test("provider action emits history without secret", test_provider_action_emits_history_without_secret)
+    test("doctor accepts chatgpt auth without API key", test_doctor_report_accepts_chatgpt_auth_without_api_key)
+    test("doctor flags provider health issues", test_doctor_report_flags_provider_health_issues)
 
     # Sync tests
     test("codex_sync.py syntax valid", test_sync_syntax)
@@ -1143,10 +1800,13 @@ if __name__ == "__main__":
     test("PIN format: 6 uppercase hex chars", test_pin_format)
     test("compute_local_hashes", test_compute_hashes)
     test("compute_local_hashes excludes sensitive/temp paths", test_compute_hashes_excludes_sensitive_and_temp_paths)
+    test("repo hashes include meta and excluded summary", test_repo_hashes_include_meta_and_excluded_summary)
     test("compute_file_diff", test_file_diff)
     test("path traversal protection", test_path_traversal)
     test("chunked pack + extract (temp file based)", test_chunked_pack_extract)
     test("delete_files backs up and removes targets", test_delete_files_backs_up_and_removes_targets)
+    test("push files preview does not mutate remote", test_push_files_preview_does_not_mutate_remote)
+    test("pull files honor conflict policies", test_pull_files_conflict_policies)
     test("server ping", test_server_ping)
     test("server auth required (401 without PIN, 200 with PIN)", test_server_auth_required)
     test("server CORS headers", test_server_cors)
@@ -1155,6 +1815,7 @@ if __name__ == "__main__":
     test("current schema sessions list handles worktree rows", test_current_schema_sessions_list_handles_worktree_rows)
     test("upload session inserts new row with current schema", test_upload_session_inserts_new_row_with_current_schema)
     test("dashboard local API uses local auth", test_dashboard_uses_local_pin_for_protected_local_api)
+    test("dashboard file sync wires preview/conflict/scan summary", test_dashboard_file_sync_wires_preview_conflict_and_scan_summary)
     test("sync_tray.py syntax valid", test_sync_tray_syntax)
     test("sync_tray imports optional (graceful)", test_sync_tray_imports_optional)
     test("trusted device storage (add/check/remove)", test_trusted_device_storage)

@@ -27,7 +27,7 @@ import zipfile
 from datetime import datetime
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 # ── Paths (same resolution as codex_chat_transformer.py) ──────────────────
 
@@ -674,22 +674,44 @@ def _get_session_jsonl(session_id):
 # ── File sync helpers ────────────────────────────────────────────────────
 
 
-def compute_local_hashes(project_dir):
+def scan_local_files(project_dir, excluded_sample_limit=8):
     result = {}
+    meta = {}
     base = os.path.realpath(project_dir)
+    excluded_count = 0
+    excluded_samples = []
     if not os.path.isdir(base):
-        return result
+        return {
+            "files": result,
+            "meta": meta,
+            "excluded": {"count": 0, "sample_paths": []},
+            "base_dir": base,
+            "count": 0,
+        }
+
+    def record_excluded(rel_path):
+        nonlocal excluded_count
+        excluded_count += 1
+        if len(excluded_samples) < excluded_sample_limit:
+            excluded_samples.append(rel_path)
+
     for root, dirs, files in os.walk(base):
-        dirs[:] = [
-            d for d in dirs
-            if not _is_excluded_path(os.path.relpath(os.path.join(root, d), base).replace("\\", "/"))
-        ]
+        kept_dirs = []
+        for d in dirs:
+            rel_dir = os.path.relpath(os.path.join(root, d), base).replace("\\", "/")
+            if _is_excluded_path(rel_dir):
+                record_excluded(rel_dir)
+                continue
+            kept_dirs.append(d)
+        dirs[:] = kept_dirs
         for fname in files:
             full = os.path.join(root, fname)
             rel = os.path.relpath(full, base).replace("\\", "/")
             if _is_excluded_path(rel):
+                record_excluded(rel)
                 continue
             try:
+                st = os.stat(full)
                 h = hashlib.sha256()
                 with open(full, "rb") as f:
                     while True:
@@ -698,9 +720,20 @@ def compute_local_hashes(project_dir):
                             break
                         h.update(chunk)
                 result[rel] = h.hexdigest()
+                meta[rel] = {"mtime_ms": int(st.st_mtime * 1000), "size": int(st.st_size)}
             except Exception:
                 pass
-    return result
+    return {
+        "files": result,
+        "meta": meta,
+        "excluded": {"count": excluded_count, "sample_paths": excluded_samples},
+        "base_dir": base,
+        "count": len(result),
+    }
+
+
+def compute_local_hashes(project_dir):
+    return scan_local_files(project_dir)["files"]
 
 
 def compute_file_diff(local_hashes, remote_hashes):
@@ -716,6 +749,108 @@ def compute_file_diff(local_hashes, remote_hashes):
         "modified": modified,
         "deleted": deleted_files,
         "unchanged": unchanged,
+    }
+
+
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _normalize_conflict_policy(value):
+    policy = (value or "remote").strip().lower()
+    if policy == "skip":
+        policy = "local"
+    elif policy == "overwrite":
+        policy = "remote"
+    if policy not in ("local", "remote", "newer"):
+        return "remote"
+    return policy
+
+
+def _remote_request_parts(req):
+    remote = req.get("remote_host", "")
+    scheme = (req.get("remote_scheme") or "http").lower()
+    if scheme not in ("http", "https"):
+        raise ValueError("invalid remote_scheme")
+    try:
+        port = int(req.get("remote_port", 8080))
+    except Exception as e:
+        raise ValueError("invalid remote_port") from e
+    if port < 1 or port > 65535:
+        raise ValueError("invalid remote_port")
+    return scheme, remote, port
+
+
+def _unique_paths(paths):
+    seen = set()
+    result = []
+    for raw in paths or []:
+        rel = _norm_rel(raw)
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        result.append(rel)
+    return result
+
+
+def _build_file_sync_plan(source_scan, dest_scan, files, delete_list, conflict):
+    source_files = (source_scan or {}).get("files", {})
+    source_meta = (source_scan or {}).get("meta", {})
+    dest_files = (dest_scan or {}).get("files", {})
+    dest_meta = (dest_scan or {}).get("meta", {})
+    policy = _normalize_conflict_policy(conflict)
+
+    transfer_files = []
+    planned_deletes = []
+    skipped = []
+
+    for rel in _unique_paths(files):
+        if rel not in source_files:
+            skipped.append({"path": rel, "reason": "missing_source"})
+            continue
+        source_hash = source_files[rel]
+        dest_hash = dest_files.get(rel)
+        dest_exists = rel in dest_files
+
+        if policy == "local" and dest_exists and dest_hash != source_hash:
+            skipped.append({"path": rel, "reason": "destination_conflict"})
+            continue
+
+        if policy == "newer" and dest_exists and dest_hash != source_hash:
+            src_mtime = int(source_meta.get(rel, {}).get("mtime_ms") or 0)
+            dest_mtime = int(dest_meta.get(rel, {}).get("mtime_ms") or 0)
+            if src_mtime <= dest_mtime:
+                skipped.append({"path": rel, "reason": "source_not_newer"})
+                continue
+
+        transfer_files.append(rel)
+
+    for rel in _unique_paths(delete_list):
+        if rel not in dest_files:
+            skipped.append({"path": rel, "reason": "missing_destination"})
+            continue
+        if policy == "newer":
+            skipped.append({"path": rel, "reason": "delete_skipped_newer"})
+            continue
+        if policy == "local":
+            skipped.append({"path": rel, "reason": "destination_conflict"})
+            continue
+        planned_deletes.append(rel)
+
+    return {
+        "conflict": policy,
+        "transfer_files": transfer_files,
+        "delete_files": planned_deletes,
+        "skipped": skipped,
+        "counts": {
+            "transfer": len(transfer_files),
+            "delete": len(planned_deletes),
+            "skip": len(skipped),
+        },
     }
 
 
@@ -867,7 +1002,25 @@ def _create_sync_backup():
                 shutil.copy2(src, str(bak_dir / "state_5.sqlite") + ext)
     if PROVIDERS_FILE.exists():
         shutil.copy2(str(PROVIDERS_FILE), str(bak_dir / "providers.json"))
+    _record_sync_history("sync_backup_created", backup_path=str(bak_dir))
     return str(bak_dir)
+
+
+def _record_sync_history(action, **fields):
+    try:
+        path = CODEX_DIR / "operation_history.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "source": "sync",
+            "action": action,
+            "status": "ok",
+        }
+        record.update(fields)
+        with open(str(path), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
 
 
 def is_local_origin(origin):
@@ -1111,9 +1264,14 @@ class SyncHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "dir not found", "dir": dir_path}, status=404)
             return
         is_git, is_dirty, dirty_files = check_git_dirty(dir_path)
-        hashes = compute_local_hashes(dir_path)
-        result = {"files": hashes, "base_dir": os.path.realpath(dir_path),
-                  "count": len(hashes)}
+        scan = scan_local_files(dir_path)
+        result = {
+            "files": scan["files"],
+            "meta": scan["meta"],
+            "excluded": scan["excluded"],
+            "base_dir": scan["base_dir"],
+            "count": scan["count"],
+        }
         if is_git:
             result["git"] = True
             result["git_dirty"] = is_dirty
@@ -1449,8 +1607,11 @@ class SyncHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json({"error": "invalid json"}, status=400)
             return
-        remote = req.get("remote_host", "")
-        port = int(req.get("remote_port", 8080))
+        try:
+            scheme, remote, port = _remote_request_parts(req)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
         rpin = req.get("remote_pin", "")
         names = req.get("names", [])
         mode = req.get("mode", "with_key")
@@ -1462,9 +1623,9 @@ class SyncHandler(BaseHTTPRequestHandler):
         for name in names:
             try:
                 if mode == "with_key":
-                    prof = _client_get_provider_full(remote, port, rpin, name)
+                    prof = _client_get_provider_full(remote, port, rpin, name, scheme)
                 else:
-                    prof = _client_get_provider_no_key(remote, port, rpin, name)
+                    prof = _client_get_provider_no_key(remote, port, rpin, name, scheme)
                 if prof:
                     local_data.setdefault("profiles", {})[name] = _provider_storage_record(name, prof)
                     results.append({"name": name, "status": "imported"})
@@ -1485,15 +1646,18 @@ class SyncHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json({"error": "invalid json"}, status=400)
             return
-        remote = req.get("remote_host", "")
-        port = int(req.get("remote_port", 8080))
+        try:
+            scheme, remote, port = _remote_request_parts(req)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
         rpin = req.get("remote_pin", "")
         ids = req.get("session_ids", [])
 
         bak = _create_sync_backup()
         results = []
 
-        remote_sessions = _client_get_json(f"http://{remote}:{port}/api/sessions",
+        remote_sessions = _client_get_json(f"{scheme}://{remote}:{port}/api/sessions",
                                             rpin).get("sessions", [])
         remote_map = {s["id"]: s for s in remote_sessions}
 
@@ -1503,7 +1667,7 @@ class SyncHandler(BaseHTTPRequestHandler):
                 if not meta:
                     results.append({"id": sid, "status": "not_found"})
                     continue
-                jsonl_bytes = _client_get_bytes(f"http://{remote}:{port}/api/session?id={sid}", rpin)
+                jsonl_bytes = _client_get_bytes(f"{scheme}://{remote}:{port}/api/session?id={sid}", rpin)
                 if jsonl_bytes is None:
                     results.append({"id": sid, "status": "no_jsonl"})
                     continue
@@ -1524,29 +1688,56 @@ class SyncHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json({"error": "invalid json"}, status=400)
             return
-        remote = req.get("remote_host", "")
-        port = int(req.get("remote_port", 8080))
+        try:
+            scheme, remote, port = _remote_request_parts(req)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
         rpin = req.get("remote_pin", "")
         files = req.get("files", [])
         delete_list = req.get("delete_files", [])
         base_dir = req.get("base_dir", ".")
         remote_dir = req.get("remote_dir", base_dir)
+        preview = _coerce_bool(req.get("preview", False))
+        conflict = _normalize_conflict_policy(req.get("conflict", "remote"))
 
         try:
-            result = {"extracted": 0, "replaced": 0, "errors": []}
-            if files:
+            local_scan = scan_local_files(base_dir)
+            remote_scan = _client_get_json(
+                f"{scheme}://{remote}:{port}/api/repo-hashes?dir={quote(remote_dir, safe='')}",
+                rpin,
+            )
+            plan = _build_file_sync_plan(remote_scan, local_scan, files, delete_list, conflict)
+            if preview:
+                self._send_json({"preview": True, "plan": plan, "counts": plan["counts"]})
+                return
+
+            result = {
+                "preview": False,
+                "remote_scheme": scheme,
+                "conflict": plan["conflict"],
+                "plan": plan,
+                "counts": plan["counts"],
+                "extracted": 0,
+                "replaced": 0,
+                "deleted": 0,
+                "errors": [],
+            }
+            if plan["transfer_files"]:
                 zip_path = _client_post_zip(
-                    f"http://{remote}:{port}/api/download-pack",
-                    rpin, {"files": files, "base_dir": remote_dir})
+                    f"{scheme}://{remote}:{port}/api/download-pack",
+                    rpin,
+                    {"files": plan["transfer_files"], "base_dir": remote_dir},
+                )
                 try:
-                    result = extract_pack(zip_path, base_dir, backup=True)
+                    result.update(extract_pack(zip_path, base_dir, backup=True))
                 finally:
                     try:
                         os.unlink(zip_path)
                     except Exception:
                         pass
-            if delete_list:
-                delete_result = delete_files(delete_list, base_dir, backup=True)
+            if plan["delete_files"]:
+                delete_result = delete_files(plan["delete_files"], base_dir, backup=True)
                 result["deleted"] = delete_result["deleted"]
                 result.setdefault("errors", []).extend(delete_result.get("errors", []))
             self._send_json(result)
@@ -1560,8 +1751,11 @@ class SyncHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json({"error": "invalid json"}, status=400)
             return
-        remote = req.get("remote_host", "")
-        port = int(req.get("remote_port", 8080))
+        try:
+            scheme, remote, port = _remote_request_parts(req)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
         rpin = req.get("remote_pin", "")
         names = req.get("names", [])
         mode = req.get("mode", "with_key")
@@ -1579,7 +1773,7 @@ class SyncHandler(BaseHTTPRequestHandler):
                 if not prof:
                     results.append({"name": name, "status": "not_found"})
                     continue
-                _client_post_json(f"http://{remote}:{port}/api/upload/provider", rpin, prof)
+                _client_post_json(f"{scheme}://{remote}:{port}/api/upload/provider", rpin, prof)
                 results.append({"name": name, "status": "pushed"})
             except Exception as e:
                 results.append({"name": name, "status": "error", "error": str(e)})
@@ -1592,8 +1786,11 @@ class SyncHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json({"error": "invalid json"}, status=400)
             return
-        remote = req.get("remote_host", "")
-        port = int(req.get("remote_port", 8080))
+        try:
+            scheme, remote, port = _remote_request_parts(req)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
         rpin = req.get("remote_pin", "")
         ids = req.get("session_ids", [])
 
@@ -1613,7 +1810,7 @@ class SyncHandler(BaseHTTPRequestHandler):
                     results.append({"id": sid, "status": "no_jsonl"})
                     continue
                 payload = {"meta": meta, "jsonl": base64.b64encode(jsonl_data).decode("ascii")}
-                _client_post_json(f"http://{remote}:{port}/api/upload/session", rpin, payload)
+                _client_post_json(f"{scheme}://{remote}:{port}/api/upload/session", rpin, payload)
                 results.append({"id": sid, "status": "pushed"})
             except Exception as e:
                 results.append({"id": sid, "status": "error", "error": str(e)})
@@ -1626,37 +1823,60 @@ class SyncHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json({"error": "invalid json"}, status=400)
             return
-        remote = req.get("remote_host", "")
-        port = int(req.get("remote_port", 8080))
+        try:
+            scheme, remote, port = _remote_request_parts(req)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
         rpin = req.get("remote_pin", "")
         files = req.get("files", [])
         delete_list = req.get("delete_files", [])
         base_dir = req.get("base_dir", ".")
         remote_dir = req.get("remote_dir", base_dir)
+        preview = _coerce_bool(req.get("preview", False))
+        conflict = _normalize_conflict_policy(req.get("conflict", "remote"))
 
         try:
+            local_scan = scan_local_files(base_dir)
+            remote_scan = _client_get_json(
+                f"{scheme}://{remote}:{port}/api/repo-hashes?dir={quote(remote_dir, safe='')}",
+                rpin,
+            )
+            plan = _build_file_sync_plan(local_scan, remote_scan, files, delete_list, conflict)
+            if preview:
+                self._send_json({"preview": True, "plan": plan, "counts": plan["counts"]})
+                return
+
             pushed = 0
-            if files:
-                zip_path = _create_pack(files, base_dir)
+            if plan["transfer_files"]:
+                zip_path = _create_pack(plan["transfer_files"], base_dir)
                 try:
                     _client_post_zip_raw(
-                        f"http://{remote}:{port}/api/upload/pack", rpin, zip_path, remote_dir)
-                    pushed = len(files)
+                        f"{scheme}://{remote}:{port}/api/upload/pack", rpin, zip_path, remote_dir)
+                    pushed = len(plan["transfer_files"])
                 finally:
                     try:
                         os.unlink(zip_path)
                     except Exception:
                         pass
             delete_result = {"deleted": 0, "errors": []}
-            if delete_list:
+            if plan["delete_files"]:
                 delete_result = _client_post_json(
-                    f"http://{remote}:{port}/api/delete-files",
+                    f"{scheme}://{remote}:{port}/api/delete-files",
                     rpin,
-                    {"base_dir": remote_dir, "files": delete_list, "backup": True},
+                    {"base_dir": remote_dir, "files": plan["delete_files"], "backup": True},
                 )
-            self._send_json({"status": "ok", "pushed": pushed,
-                             "deleted": delete_result.get("deleted", 0),
-                             "errors": delete_result.get("errors", [])})
+            self._send_json({
+                "status": "ok",
+                "preview": False,
+                "remote_scheme": scheme,
+                "conflict": plan["conflict"],
+                "plan": plan,
+                "counts": plan["counts"],
+                "pushed": pushed,
+                "deleted": delete_result.get("deleted", 0),
+                "errors": delete_result.get("errors", []),
+            })
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
 
@@ -1670,11 +1890,11 @@ class SyncHandler(BaseHTTPRequestHandler):
 def _http_request(url, method="GET", pin=None, body=None, timeout=30):
     parsed = urlparse(url)
     host = parsed.hostname
-    port = parsed.port or 80
+    port = parsed.port or _default_port(parsed)
     path = parsed.path
     if parsed.query:
         path += "?" + parsed.query
-    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    conn = _open_http_connection(parsed, timeout)
     headers = {}
     if pin:
         headers["Authorization"] = f"Bearer {pin}"
@@ -1688,6 +1908,21 @@ def _http_request(url, method="GET", pin=None, body=None, timeout=30):
     data = resp.read()
     conn.close()
     return resp.status, data
+
+
+def _default_port(parsed):
+    return 443 if (parsed.scheme or "http").lower() == "https" else 80
+
+
+def _open_http_connection(parsed, timeout):
+    scheme = (parsed.scheme or "http").lower()
+    host = parsed.hostname
+    port = parsed.port or _default_port(parsed)
+    if scheme == "https":
+        return http.client.HTTPSConnection(host, port, timeout=timeout)
+    if scheme == "http":
+        return http.client.HTTPConnection(host, port, timeout=timeout)
+    raise ValueError("unsupported URL scheme: {}".format(scheme))
 
 
 def _client_get_json(url, pin):
@@ -1709,12 +1944,10 @@ def _client_get_bytes(url, pin):
 def _client_download_to_file(url, pin):
     """Download large binary to temp file. Returns file path."""
     parsed = urlparse(url)
-    host = parsed.hostname
-    port = parsed.port or 80
     path = parsed.path
     if parsed.query:
         path += "?" + parsed.query
-    conn = http.client.HTTPConnection(host, port, timeout=120)
+    conn = _open_http_connection(parsed, 120)
     headers = {}
     if pin:
         headers["Authorization"] = f"Bearer {pin}"
@@ -1744,12 +1977,12 @@ def _client_download_to_file(url, pin):
         raise
 
 
-def _client_get_provider_full(host, port, pin, name):
-    return _client_get_json(f"http://{host}:{port}/api/providers/full?name={name}", pin)
+def _client_get_provider_full(host, port, pin, name, scheme="http"):
+    return _client_get_json(f"{scheme}://{host}:{port}/api/providers/full?name={name}", pin)
 
 
-def _client_get_provider_no_key(host, port, pin, name):
-    data = _client_get_json(f"http://{host}:{port}/api/providers", pin)
+def _client_get_provider_no_key(host, port, pin, name, scheme="http"):
+    data = _client_get_json(f"{scheme}://{host}:{port}/api/providers", pin)
     for p in data.get("providers", []):
         if p["name"] == name:
             return {
@@ -1773,15 +2006,16 @@ def _client_post_json(url, pin, payload):
 def _client_post_zip(url, pin, payload):
     """POST JSON request, download ZIP response to temp file. Returns file path."""
     parsed = urlparse(url)
-    host = parsed.hostname
-    port = parsed.port or 80
-    conn = http.client.HTTPConnection(host, port, timeout=120)
+    conn = _open_http_connection(parsed, 120)
     body = json.dumps(payload).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {pin}",
         "Content-Type": "application/json",
     }
-    conn.request("POST", parsed.path, body=body, headers=headers)
+    path = parsed.path
+    if parsed.query:
+        path += "?" + parsed.query
+    conn.request("POST", path, body=body, headers=headers)
     resp = conn.getresponse()
     if resp.status != 200:
         data = resp.read()
@@ -1809,17 +2043,18 @@ def _client_post_zip(url, pin, payload):
 
 def _client_post_zip_raw(url, pin, zip_path, base_dir):
     parsed = urlparse(url)
-    host = parsed.hostname
-    port = parsed.port or 80
     size = os.path.getsize(zip_path)
-    conn = http.client.HTTPConnection(host, port, timeout=120)
+    conn = _open_http_connection(parsed, 120)
     headers = {
         "Authorization": f"Bearer {pin}",
         "Content-Type": "application/zip",
         "Content-Length": str(size),
         "X-Target-Dir": base_dir,
     }
-    conn.request("POST", parsed.path, body=None, headers=headers)
+    path = parsed.path
+    if parsed.query:
+        path += "?" + parsed.query
+    conn.request("POST", path, body=None, headers=headers)
     with open(zip_path, "rb") as f:
         while True:
             chunk = f.read(CHUNK_SIZE)
@@ -2085,9 +2320,11 @@ select{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4
       <div style="margin-bottom:8px">
         <button class="btn small" onclick="selectChanged()">Select Changed</button>
         <button class="btn small" onclick="deselectAll('file')">Deselect All</button>
+        <label style="margin-left:8px;color:#a6adc8;font-size:13px"><input id="filePreview" type="checkbox" class="checkbox" style="margin-right:6px;vertical-align:middle">Preview only</label>
         <button class="btn primary small" onclick="pullSelectedFiles()">Pull Selected</button>
         <button class="btn success small" onclick="pushSelectedFiles()">Push Selected</button>
       </div>
+      <div id="fileScanSummary" style="margin-bottom:8px;color:#a6adc8;font-size:12px"></div>
       <table>
         <thead><tr><th><input type="checkbox" class="checkbox" onchange="toggleAll(this,'file')"></th><th>Path</th><th>Status</th><th>Actions</th></tr></thead>
         <tbody id="fileBody"></tbody>
@@ -2121,8 +2358,8 @@ select{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4
       <div class="info-row">
         <label>Conflict resolution:</label>
         <select id="settingConflict" onchange="setSetting('conflict',this.value)">
-          <option value="skip">Skip (don't overwrite)</option>
-          <option value="overwrite">Overwrite</option>
+          <option value="local">Keep destination</option>
+          <option value="remote">Apply source</option>
           <option value="newer">Newer wins</option>
         </select>
       </div>
@@ -2197,7 +2434,7 @@ select{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4
 </div>
 
 <script>
-let localPin='', remoteHost='', remotePort=8080, remotePinVal='';
+let localPin='', remoteScheme='http', remoteHost='', remotePort=8080, remotePinVal='';
 let localProviders=[], remoteProviders=[], localSessions=[], remoteSessions=[];
 let fileDiff=null;
 let _modalResolveFunc=null;
@@ -2221,6 +2458,65 @@ function localAuthHeaders(){
 }
 function jsonHeaders(){
   const h=localAuthHeaders();h['Content-Type']='application/json';return h
+}
+
+function remoteBaseUrl(){
+  return remoteScheme+'://'+remoteHost+':'+remotePort;
+}
+
+function parseRemoteAddress(addr){
+  const raw=(addr||'').trim();
+  if(!raw) throw new Error('Enter address');
+  let scheme='http', host='', port=8080;
+  if(raw.indexOf('://')>=0){
+    let parsed;
+    try{parsed=new URL(raw)}catch(e){throw new Error('Invalid address')}
+    if(parsed.protocol!=='http:'&&parsed.protocol!=='https:') throw new Error('Use http:// or https://');
+    if(!parsed.hostname) throw new Error('Missing host');
+    scheme=parsed.protocol.slice(0,-1);
+    host=parsed.hostname;
+    if(parsed.port){
+      if(!/^\d+$/.test(parsed.port)) throw new Error('Port must be numeric');
+      port=parseInt(parsed.port,10);
+    }
+  }else{
+    const parts=raw.split(':');
+    if(parts.length>2) throw new Error('Use host, host:port, or http(s)://host:port');
+    host=(parts[0]||'').trim();
+    if(!host) throw new Error('Missing host');
+    if(parts.length===2&&parts[1]){
+      if(!/^\d+$/.test(parts[1])) throw new Error('Port must be numeric');
+      port=parseInt(parts[1],10);
+    }
+  }
+  if(!(port>=1&&port<=65535)) throw new Error('Port must be between 1 and 65535');
+  return {scheme:scheme,host:host,port:port};
+}
+
+function getConflictMode(){
+  const raw=(document.getElementById('settingConflict').value||'local').toLowerCase();
+  if(raw==='skip') return 'local';
+  if(raw==='overwrite') return 'remote';
+  return raw;
+}
+
+function isFilePreviewEnabled(){
+  const el=document.getElementById('filePreview');
+  return !!(el&&el.checked);
+}
+
+function remoteFields(){
+  return {remote_scheme:remoteScheme,remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal};
+}
+
+function renderScanSummary(localScan,remoteScan){
+  const fmt=function(label,scan){
+    const included=(scan&&typeof scan.count==='number')?scan.count:Object.keys((scan&&scan.files)||{}).length;
+    const excluded=(scan&&scan.excluded)||{count:0,sample_paths:[]};
+    const sample=(excluded.sample_paths||[]).slice(0,3).join(', ');
+    return label+': '+included+' included, '+excluded.count+' excluded'+(sample?' ('+sample+')':'');
+  };
+  document.getElementById('fileScanSummary').textContent=fmt('Local',localScan)+' | '+fmt('Remote',remoteScan);
 }
 
 async function init(){
@@ -2271,14 +2567,17 @@ function modalResolve(val){
 async function connectRemote(){
   const addr=document.getElementById('remoteAddr').value.trim();
   remotePinVal=document.getElementById('remotePin').value.trim().toUpperCase();
-  if(!addr){showToast('Enter address','error');return}
-  const parts=addr.split(':');
-  remoteHost=parts[0];remotePort=parts[1]?parseInt(parts[1]):8080;
+  try{
+    const parsed=parseRemoteAddress(addr);
+    remoteScheme=parsed.scheme;remoteHost=parsed.host;remotePort=parsed.port;
+  }catch(e){
+    showToast(e.message,'error');return;
+  }
   await _doConnect();
 }
 
 async function _connectDiscovered(ip,port,serverId,serverName){
-  remoteHost=ip;remotePort=port;
+  remoteScheme='http';remoteHost=ip;remotePort=port;
   // Try trusted token first
   const stored=getStoredToken(serverId);
   if(stored&&stored.token){
@@ -2306,7 +2605,7 @@ async function _doConnect(){
 
 async function _tryConnect(){
   try{
-    const status=await fetch('http://'+remoteHost+':'+remotePort+'/api/manifest',{
+    const status=await fetch(remoteBaseUrl()+'/api/manifest',{
       headers:{'Authorization':'Bearer '+remotePinVal}});
     if(!status.ok) throw new Error('HTTP '+status.status);
     const d=await status.json();
@@ -2329,7 +2628,7 @@ async function _tryConnect(){
 async function _pairDevice(serverId,serverName){
   const clientToken=crypto.randomUUID?crypto.randomUUID().replace(/-/g,''):(Date.now().toString(16)+Math.random().toString(16).slice(2));
   try{
-    const r=await fetch('http://'+remoteHost+':'+remotePort+'/api/pair',{
+    const r=await fetch(remoteBaseUrl()+'/api/pair',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({pin:remotePinVal,client_token:clientToken,device_name:navigator.userAgent.includes('Win')?'Windows PC':navigator.userAgent.includes('Mac')?'Mac':navigator.userAgent.includes('Linux')?'Linux PC':'Device'})});
@@ -2342,7 +2641,7 @@ async function _pairDevice(serverId,serverName){
 }
 
 function disconnectRemote(){
-  remoteHost='';remotePort=8080;remotePinVal='';
+  remoteScheme='http';remoteHost='';remotePort=8080;remotePinVal='';
   if(_pollTimer){clearInterval(_pollTimer);_pollTimer=null;}
   document.getElementById('connStatus').innerHTML='<span class="badge">Disconnected</span>';
   document.getElementById('provNotConnected').style.display='';
@@ -2356,7 +2655,7 @@ function disconnectRemote(){
 async function loadProviders(){
   const [lr,rr]=await Promise.all([
     fetch('/api/providers',{headers:localAuthHeaders()}).then(r=>r.json()),
-    fetch('http://'+remoteHost+':'+remotePort+'/api/providers',{headers:{'Authorization':'Bearer '+remotePinVal}}).then(r=>r.json())
+    fetch(remoteBaseUrl()+'/api/providers',{headers:{'Authorization':'Bearer '+remotePinVal}}).then(r=>r.json())
   ]);
   localProviders=lr.providers||[];remoteProviders=rr.providers||[];
   const tbody=document.getElementById('provBody');tbody.innerHTML='';
@@ -2394,13 +2693,13 @@ async function pullProvider(name){
   const mode=modeEl?modeEl.value:'with_key';
   if(mode==='skip'){showToast('Skipped '+name,'error');return}
   try{const r=await fetch('/api/pull/providers',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:[name],mode:mode})});
+    body:JSON.stringify(Object.assign(remoteFields(),{names:[name],mode:mode}))});
     showResult(r);loadProviders();}catch(e){showToast(e.message,'error')}
 }
 
 async function pushProvider(name){
   try{const r=await fetch('/api/push/providers',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:[name],mode:'with_key'})});
+    body:JSON.stringify(Object.assign(remoteFields(),{names:[name],mode:'with_key'}))});
     showResult(r);loadProviders();}catch(e){showToast(e.message,'error')}
 }
 
@@ -2411,7 +2710,7 @@ async function pullSelectedProviders(){
     const mode=modeEl?modeEl.value:'with_key';
     if(mode==='skip') continue;
     try{await fetch('/api/pull/providers',{method:'POST',headers:jsonHeaders(),
-      body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:[name],mode:mode})});
+      body:JSON.stringify(Object.assign(remoteFields(),{names:[name],mode:mode}))});
     }catch(e){showToast(e.message,'error')}
   }
   loadProviders();showToast('Pull done','success');
@@ -2420,14 +2719,14 @@ async function pullSelectedProviders(){
 async function pushSelectedProviders(){
   const names=getSelected('prov');if(!names.length){showToast('Nothing selected','error');return}
   try{const r=await fetch('/api/push/providers',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:names,mode:'with_key'})});
+    body:JSON.stringify(Object.assign(remoteFields(),{names:names,mode:'with_key'}))});
     showResult(r);loadProviders();}catch(e){showToast(e.message,'error')}
 }
 
 async function loadSessions(){
   const [lr,rr]=await Promise.all([
     fetch('/api/sessions',{headers:localAuthHeaders()}).then(r=>r.json()),
-    fetch('http://'+remoteHost+':'+remotePort+'/api/sessions',{headers:{'Authorization':'Bearer '+remotePinVal}}).then(r=>r.json())
+    fetch(remoteBaseUrl()+'/api/sessions',{headers:{'Authorization':'Bearer '+remotePinVal}}).then(r=>r.json())
   ]);
   localSessions=lr.sessions||[];remoteSessions=rr.sessions||[];
   const tbody=document.getElementById('sessBody');tbody.innerHTML='';
@@ -2457,7 +2756,7 @@ async function loadSessions(){
 
 async function pullSession(id){
   try{const r=await fetch('/api/pull/sessions',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:[id]})});
+    body:JSON.stringify(Object.assign(remoteFields(),{session_ids:[id]}))});
     await showResult(r);loadSessions();
     await offerProjectFileSync(id,'pull');
   }catch(e){showToast(e.message,'error')}
@@ -2465,7 +2764,7 @@ async function pullSession(id){
 
 async function pushSession(id){
   try{const r=await fetch('/api/push/sessions',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:[id]})});
+    body:JSON.stringify(Object.assign(remoteFields(),{session_ids:[id]}))});
     await showResult(r);loadSessions();
     await offerProjectFileSync(id,'push');
   }catch(e){showToast(e.message,'error')}
@@ -2474,7 +2773,7 @@ async function pushSession(id){
 async function pullSelectedSessions(){
   const ids=getSelected('sess');if(!ids.length){showToast('Nothing selected','error');return}
   try{const r=await fetch('/api/pull/sessions',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:ids})});
+    body:JSON.stringify(Object.assign(remoteFields(),{session_ids:ids}))});
     await showResult(r);loadSessions();
     await offerBulkProjectFileSync(ids,'pull');
   }catch(e){showToast(e.message,'error')}
@@ -2483,7 +2782,7 @@ async function pullSelectedSessions(){
 async function pushSelectedSessions(){
   const ids=getSelected('sess');if(!ids.length){showToast('Nothing selected','error');return}
   try{const r=await fetch('/api/push/sessions',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:ids})});
+    body:JSON.stringify(Object.assign(remoteFields(),{session_ids:ids}))});
     await showResult(r);loadSessions();
     await offerBulkProjectFileSync(ids,'push');
   }catch(e){showToast(e.message,'error')}
@@ -2513,6 +2812,7 @@ function onLocalDirChange() {
 async function scanFiles(){
   const dir=document.getElementById('projectDir').value.trim();
   if(!dir){showToast('Enter project directory','error');return}
+  if(!remoteHost){showToast('Connect to a remote server first','error');return}
   const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
 
   if (rdir && rdir !== dir) {
@@ -2530,12 +2830,15 @@ async function scanFiles(){
   try{
     const [lr,rr]=await Promise.all([
       fetch('/api/repo-hashes?dir='+encodeURIComponent(dir),{headers:localAuthHeaders()}).then(r=>r.json()),
-      fetch('http://'+remoteHost+':'+remotePort+'/api/repo-hashes?dir='+encodeURIComponent(rdir),
+      fetch(remoteBaseUrl()+'/api/repo-hashes?dir='+encodeURIComponent(rdir),
         {headers:{'Authorization':'Bearer '+remotePinVal}}).then(r=>r.json())
     ]);
+    if(lr.error) throw new Error('Local scan failed: '+lr.error);
+    if(rr.error) throw new Error('Remote scan failed: '+rr.error);
     const local=lr.files||{};const remote=rr.files||{};
     fileDiff=computeFileDiff(local,remote);
     renderFileDiff();
+    renderScanSummary(lr,rr);
 
     if (lr.git && rr.git) {
       if (lr.git_branch !== rr.git_branch || lr.git_sha !== rr.git_sha) {
@@ -2591,7 +2894,7 @@ async function pullFile(path){
   const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
   const split=splitFileSelection([path],'pull');
   try{const r=await fetch('/api/pull/files',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir})});
+    body:JSON.stringify(Object.assign(remoteFields(),{files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir,preview:isFilePreviewEnabled(),conflict:getConflictMode()}))});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
@@ -2600,7 +2903,7 @@ async function pushFile(path){
   const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
   const split=splitFileSelection([path],'push');
   try{const r=await fetch('/api/push/files',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir})});
+    body:JSON.stringify(Object.assign(remoteFields(),{files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir,preview:isFilePreviewEnabled(),conflict:getConflictMode()}))});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
@@ -2610,7 +2913,7 @@ async function pullSelectedFiles(){
   const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
   const split=splitFileSelection(paths,'pull');
   try{const r=await fetch('/api/pull/files',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir})});
+    body:JSON.stringify(Object.assign(remoteFields(),{files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir,preview:isFilePreviewEnabled(),conflict:getConflictMode()}))});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
@@ -2620,7 +2923,7 @@ async function pushSelectedFiles(){
   const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
   const split=splitFileSelection(paths,'push');
   try{const r=await fetch('/api/push/files',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir})});
+    body:JSON.stringify(Object.assign(remoteFields(),{files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir,preview:isFilePreviewEnabled(),conflict:getConflictMode()}))});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
@@ -2655,6 +2958,10 @@ async function showResult(response){
     if(d.results){
       const ok=d.results.filter(r=>r.status==='imported'||r.status==='pushed').length;
       showToast(ok+'/'+d.results.length+' done'+(d.backup?' (backup: '+d.backup+')':''),'success');
+    }else if(d.preview&&d.counts){
+      showToast('Preview: '+d.counts.transfer+' transfer, '+d.counts.delete+' delete, '+d.counts.skip+' skip','success');
+    }else if(d.counts&&(typeof d.pushed!=='undefined'||typeof d.extracted!=='undefined'||typeof d.deleted!=='undefined')){
+      showToast('Done: '+d.counts.transfer+' transfer, '+d.counts.delete+' delete, '+d.counts.skip+' skip','success');
     }else if(d.error){
       showToast(d.error,'error');
     }else{
@@ -2765,7 +3072,7 @@ async function pollRemote(){
   try{
     document.getElementById('autoSyncStatus').textContent='Polling...';
     document.getElementById('autoSyncStatus').style.color='#f9e2af';
-    var remote=await fetch('http://'+remoteHost+':'+remotePort+'/api/manifest',{
+    var remote=await fetch(remoteBaseUrl()+'/api/manifest',{
       headers:{'Authorization':'Bearer '+remotePinVal}}).then(function(r){return r.json()});
     var local=await fetch('/api/manifest',{headers:localAuthHeaders()}).then(function(r){return r.json()});
     if(_lastRemoteHash!==null&&remote.hash!==_lastRemoteHash){
@@ -2791,7 +3098,7 @@ async function pollRemote(){
 
 async function autoPullSessions(){
   var lr=await fetch('/api/sessions',{headers:localAuthHeaders()}).then(function(r){return r.json()});
-  var rr=await fetch('http://'+remoteHost+':'+remotePort+'/api/sessions',{
+  var rr=await fetch(remoteBaseUrl()+'/api/sessions',{
     headers:{'Authorization':'Bearer '+remotePinVal}}).then(function(r){return r.json()});
   var localIds={};
   (lr.sessions||[]).forEach(function(s){localIds[s.id]=s.updated_at_ms});
@@ -2801,21 +3108,21 @@ async function autoPullSessions(){
   if(!toPull.length) return;
   var ids=toPull.map(function(s){return s.id});
   await fetch('/api/pull/sessions',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:ids})});
+    body:JSON.stringify(Object.assign(remoteFields(),{session_ids:ids}))});
   showToast('Auto-pulled '+ids.length+' session(s)','success');
   if(document.querySelector('[data-tab="sessions"]').classList.contains('active')) loadSessions();
 }
 
 async function autoPullProviders(){
   var lr=await fetch('/api/providers',{headers:localAuthHeaders()}).then(function(r){return r.json()});
-  var rr=await fetch('http://'+remoteHost+':'+remotePort+'/api/providers',{
+  var rr=await fetch(remoteBaseUrl()+'/api/providers',{
     headers:{'Authorization':'Bearer '+remotePinVal}}).then(function(r){return r.json()});
   var localNames=new Set((lr.providers||[]).map(function(p){return p.name}));
   var toPull=(rr.providers||[]).filter(function(p){return !localNames.has(p.name)});
   if(!toPull.length) return;
   var names=toPull.map(function(p){return p.name});
   await fetch('/api/pull/providers',{method:'POST',headers:jsonHeaders(),
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:names,mode:'with_key'})});
+    body:JSON.stringify(Object.assign(remoteFields(),{names:names,mode:'with_key'}))});
   showToast('Auto-pulled '+names.length+' provider(s)','success');
 }
 
@@ -2823,7 +3130,13 @@ async function autoPullProviders(){
 
 const SETTINGS_KEY='codex_sync_settings';
 function loadSettings(){
-  try{const s=localStorage.getItem(SETTINGS_KEY);return s?JSON.parse(s):{lang:'en',backup:'true',conflict:'skip'}}catch(e){return{lang:'en',backup:'true',conflict:'skip'}}
+  try{
+    const s=localStorage.getItem(SETTINGS_KEY);
+    const data=s?JSON.parse(s):{lang:'en',backup:'true',conflict:'local'};
+    if(data.conflict==='skip') data.conflict='local';
+    if(data.conflict==='overwrite') data.conflict='remote';
+    return data;
+  }catch(e){return{lang:'en',backup:'true',conflict:'local'}}
 }
 function saveSettings(s){try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(s))}catch(e){}}
 function setLang(lang){const s=loadSettings();s.lang=lang;saveSettings(s)}

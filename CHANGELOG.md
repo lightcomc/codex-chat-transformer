@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.4.0] - 2026-05-25
+
+### Sync hardening
+- CLI sync peer parsing now accepts `host`, `host:port`, `http://host:port`, and `https://host:port`, with explicit host/port validation before network I/O.
+- File sync endpoints accept `preview` and `conflict` (`local`, `remote`, `newer`) fields; preview returns a plan without mutating files.
+- `/api/repo-hashes` now returns compatible `files` plus per-file `meta` and excluded-file summary.
+- Dashboard wires preview/conflict settings into file sync requests and shows included/excluded scan counts.
+
+### Codex Pack, search, and history
+- Added `--export-pack`, `--import-pack`, `--scope`, `--sessions`, and `--without-keys` for portable provider/session ZIP bundles.
+- `--providers` still lists profiles when used alone, and filters pack import/export when passed a comma-separated value.
+- Added `--search QUERY` with metadata-first session search and JSONL fallback.
+- Added `.codex/operation_history.jsonl`, `--history`, and `--history-limit`; API keys, PINs, and auth payloads are redacted.
+- `--doctor` now reports provider profile health and treats `openai` + `chatgpt` auth as valid without an API key.
+
+### Tests
+- 65 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, and provider health checks.
+
 ## [1.3.0] — 2026-05-25
 
 ### Multiplatform Sync & Git Safety / Мультиплатформенная синхронизация и безопасность Git

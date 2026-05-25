@@ -165,9 +165,36 @@ python codex_chat_transformer.py --restore backup_20260518_120000
 python codex_chat_transformer.py --restore-zip codex_backup_20260518.zip
 ```
 
+### Codex Pack
+
+Portable subset ZIP for moving providers and sessions without copying the full `.codex` folder.
+
+```bash
+python codex_chat_transformer.py --export-pack my.codex-pack.zip --scope all
+```
+```bash
+python codex_chat_transformer.py --export-pack providers.zip --scope providers --providers OpenRouter --without-keys
+```
+```bash
+python codex_chat_transformer.py --import-pack my.codex-pack.zip --scope sessions --sessions SESSION_ID
+```
+
+Pack import is upsert-only: it does not delete local data and does not switch the active provider.
+
+### Search & History
+
+```bash
+python codex_chat_transformer.py --search "database migration" --project C:\Research\my_project
+```
+```bash
+python codex_chat_transformer.py --history --history-limit 20
+```
+
+Search scans session metadata first and falls back to JSONL text. Operation history is stored as `.codex/operation_history.jsonl` with API keys, PINs, and auth payloads redacted.
+
 ### Doctor
 
-Read-only health check: database, config, auth, providers, pinned threads.
+Read-only health check: database, config, auth, provider profile health, pinned threads, and recent operations.
 
 ```bash
 python codex_chat_transformer.py --doctor
@@ -196,7 +223,8 @@ Features:
 - Bidirectional: Push + Pull per item
 - Provider import modes: with key / without key / skip / keep both
 - Session sync: JSONL download + DB insertion
-- File sync: SHA-256 hash diff + ZIP packaging
+- File sync: SHA-256 hash diff + ZIP packaging, preview mode, conflict policy (`local`, `remote`, `newer`)
+- File scans report included/excluded counts and sample excluded paths
 - Auto-link: session Pull/Push detects linked project and offers file sync
 - Background auto-sync polling (30s–5 min, configurable)
 - Auto port selection (tries 8080-8099)
@@ -341,6 +369,7 @@ A: Yes: `--sync-pull IP:PORT --pin XXXXXX` opens an interactive CLI menu.
 | `config.toml` | All providers `[model_providers.*]` + settings |
 | `auth.json` | Current auth (API key or OAuth) |
 | `providers.json` | Provider profiles (`provider_section` + `model` + auth, b64 obfuscation) |
+| `operation_history.jsonl` | Append-only operation log with secrets redacted |
 
 ---
 
