@@ -351,7 +351,7 @@ codex_chat_transformer.py    — CLI：转换、提供商、固定、备份、�
 codex_manager_gui.py         — GUI：切换、编辑、更改模型、同步（CLI 封装）
 codex_sync.py                — P2P 同步引擎：服务器、客户端、Dashboard、文件同步、自动同步
 sync_tray.py                 — 系统托盘小组件（可选，需 pystray + Pillow）
-test_smoke.py                — 冒烟测试（38 个测试）
+test_smoke.py                — 冒烟测试（47 个测试）
 codex_manager.cmd / .ps1     — Windows 启动器
 codex_manager.sh             — Unix 启动器
 providers_template.json      — 提供商模板

@@ -9,6 +9,15 @@
 - SQLite sync fix: `INSERT OR IGNORE` + `UPDATE` in session upload handlers — prevents infinite auto-sync polling loop / Исправление SQLite: INSERT OR IGNORE + UPDATE — предотвращает бесконечный polling
 - `sandbox_policy` column now synced with sessions / Колонка sandbox_policy теперь синхронизируется
 - `conn.close()` wrapped in `finally` blocks in all DB operations / Закрытие conn обёрнуто в finally во всех DB-операциях
+- **Dynamic schema detection**: `_get_sessions_list` reads columns via `PRAGMA table_info` — works with any Codex version / Динамическое чтение схемы БД — совместимость с любой версией Codex
+- **`_upsert_session_record`**: `ON CONFLICT(id) DO UPDATE` with all current columns (`approval_mode`, `has_user_event`, `created_at`, `updated_at`, etc.) / INSERT с полным набором колонок текущей схемы
+- **`--project` filter** now uses `cwd` column instead of non-existent `project` / Фильтр `--project` использует колонку `cwd` вместо несуществующей `project`
+
+### File Sync Safety / Безопасность синхронизации файлов
+- `EXCLUDE_PATTERNS` blocks `.env`, `.env.*`, `secrets/`, `.worktrees/`, `backup_*`, temp files from sync / Блокировка `.env`, `secrets`, `.worktrees`, `backup`, временных файлов
+- `delete_files` operation with backup before removal — `deleted` status no longer ignored / Операция удаления файлов с бэкапом — статус `deleted` больше не игнорируется
+- Dashboard local API calls now include `Authorization: Bearer` header via `localAuthHeaders()` / Локальные запросы Dashboard теперь с авторизацией
+- CLI sync push reads providers directly from `providers.json` — no hardcoded `127.0.0.1:8080` / CLI push читает провайдеры напрямую, без хардкода порта
 
 ### Worktree Recreation & Project Path Mapping / Воссоздание Worktree и маппинг путей проектов
 - `POST /api/recreate-worktree` — native `git worktree add` or `git checkout -f` on receiving machine / Нативное создание/выравнивание worktree на принимающей машине
@@ -20,14 +29,16 @@
 
 ### Provider Edit Bugfixes / Исправления редактирования провайдеров
 - Provider rename now removes old `[model_providers.OldName]` section from TOML (was leaving duplicate) / Переименование теперь удаляет старую секцию из TOML (раньше оставался дубликат)
+- Provider rename auto-converts chats (`transform(old, new)`) in both CLI and GUI / При переименовании провайдера чаты автоматически конвертируются
 - `edit_provider` CLI supports `--set-name` for renaming / CLI поддерживает переименование через --set-name
+- Provider name sanitization: spaces and special chars (`/ \ : * ? " < > |`) replaced with `_` / Санитизация имени: пробелы и спецсимволы заменяются на `_`
 - GUI updates config.toml correctly when active provider is renamed (checks both old and new name) / GUI корректно обновляет config.toml при переименовании активного провайдера
 - Reasoning effort is added to config.toml even when not previously present (was silently dropped) / Reasoning добавляется в config.toml даже если его там не было
 - `_remove_provider_section()` helper for clean TOML section removal / Хелпер для удаления секции из TOML
 
 ### Tests / Тесты
-- 38 smoke tests (was 32) / 38 smoke-тестов (было 32)
-- New: case-insensitive paths, git metadata, project mappings + worktree, SQLite sync update, reasoning add-when-absent, provider rename / Новые: пути, git, маппинги, SQLite update, reasoning, rename
+- 47 smoke tests (was 32) / 47 smoke-тестов (было 32)
+- New: dynamic schema sessions, upload session with current schema, delete files, local auth, file excludes, `--project` cwd filter, CLI sync push, sanitize name, reasoning add-when-absent, provider rename / Новые: динамическая схема, upload сессий, удаление файлов, локальная авторизация, excludes, фильтр --project, CLI sync, санитизация имени
 
 ## [1.2.0] — 2026-05-24
 

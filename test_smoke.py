@@ -170,6 +170,18 @@ def test_transform_signature():
     assert "to_model" in params, "to_model param missing"
 
 
+def test_project_filter_uses_cwd_column():
+    text = Path("codex_chat_transformer.py").read_text(encoding="utf-8")
+    assert "AND cwd LIKE ?" in text, "project filtering should use current threads.cwd column"
+    assert "AND project LIKE ?" not in text, "current Codex schema has no project column"
+
+
+def test_cli_sync_push_not_hardcoded_to_8080():
+    text = Path("codex_chat_transformer.py").read_text(encoding="utf-8")
+    assert "127.0.0.1:8080/api/providers" not in text, "CLI provider push must not depend on local port 8080"
+    assert "_providers_summary" in text and "_provider_full" in text, "CLI provider push should read local providers directly"
+
+
 def test_is_codex_running():
     result = ct.is_codex_running()
     assert isinstance(result, bool)
@@ -316,6 +328,43 @@ def test_cli_syntax():
 
 # --- Sync tests ---
 
+def _create_current_threads_schema(conn):
+    """Create a threads table shaped like current Codex Desktop state_5.sqlite."""
+    conn.execute("""
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            model_provider TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            title TEXT NOT NULL,
+            sandbox_policy TEXT NOT NULL,
+            approval_mode TEXT NOT NULL,
+            tokens_used INTEGER NOT NULL DEFAULT 0,
+            has_user_event INTEGER NOT NULL DEFAULT 0,
+            archived INTEGER NOT NULL DEFAULT 0,
+            archived_at INTEGER,
+            git_sha TEXT,
+            git_branch TEXT,
+            git_origin_url TEXT,
+            cli_version TEXT NOT NULL DEFAULT '',
+            first_user_message TEXT NOT NULL DEFAULT '',
+            agent_nickname TEXT,
+            agent_role TEXT,
+            memory_mode TEXT NOT NULL DEFAULT 'enabled',
+            model TEXT,
+            reasoning_effort TEXT,
+            agent_path TEXT,
+            created_at_ms INTEGER,
+            updated_at_ms INTEGER,
+            thread_source TEXT,
+            preview TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+
 def test_sync_syntax():
     py_compile.compile(
         str(Path(__file__).parent / "codex_sync.py"), doraise=True
@@ -362,6 +411,38 @@ def test_compute_hashes():
         shutil.rmtree(tmp)
 
 
+def test_compute_hashes_excludes_sensitive_and_temp_paths():
+    import codex_sync, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        (Path(tmp) / "src").mkdir()
+        (Path(tmp) / "src" / "app.py").write_text("print(1)", encoding="utf-8")
+        (Path(tmp) / ".env").write_text("SECRET=1", encoding="utf-8")
+        (Path(tmp) / ".env.local").write_text("SECRET=2", encoding="utf-8")
+        (Path(tmp) / "secrets").mkdir()
+        (Path(tmp) / "secrets" / "prod.key").write_text("key", encoding="utf-8")
+        (Path(tmp) / ".worktrees").mkdir()
+        (Path(tmp) / ".worktrees" / "wt.txt").write_text("wt", encoding="utf-8")
+        (Path(tmp) / "codex_tmp_probe").mkdir()
+        (Path(tmp) / "codex_tmp_probe" / "out.txt").write_text("tmp", encoding="utf-8")
+        (Path(tmp) / ".codex_tmp_probe").mkdir()
+        (Path(tmp) / ".codex_tmp_probe" / "out.txt").write_text("tmp", encoding="utf-8")
+        (Path(tmp) / "__pytest_tmp_probe").mkdir()
+        (Path(tmp) / "__pytest_tmp_probe" / "out.txt").write_text("tmp", encoding="utf-8")
+
+        hashes = codex_sync.compute_local_hashes(tmp)
+        assert "src/app.py" in hashes, "normal project file should be hashed"
+        assert ".env" not in hashes, ".env should be excluded"
+        assert ".env.local" not in hashes, ".env.local should be excluded"
+        assert not any(p.startswith("secrets/") for p in hashes), "secrets dir should be excluded"
+        assert not any(p.startswith(".worktrees/") for p in hashes), ".worktrees should be excluded"
+        assert not any(p.startswith("codex_tmp_probe/") for p in hashes), "codex temp dirs should be excluded"
+        assert not any(p.startswith(".codex_tmp_probe/") for p in hashes), "dot codex temp dirs should be excluded"
+        assert not any(p.startswith("__pytest_tmp_probe/") for p in hashes), "dunder pytest temp dirs should be excluded"
+    finally:
+        shutil.rmtree(tmp)
+
+
 def test_file_diff():
     import codex_sync
     local = {"a.txt": "aaa", "b.txt": "bbb", "c.txt": "ccc"}
@@ -397,6 +478,28 @@ def test_chunked_pack_extract():
             with open(extracted, "r") as f:
                 assert f.read() == "hello chunked world"
         os.unlink(zip_path)
+
+
+def test_delete_files_backs_up_and_removes_targets():
+    import codex_sync, tempfile, os
+    with tempfile.TemporaryDirectory() as tmp:
+        keep = Path(tmp) / "keep.txt"
+        victim = Path(tmp) / "victim.txt"
+        nested = Path(tmp) / "nested" / "gone.txt"
+        keep.write_text("keep", encoding="utf-8")
+        victim.write_text("delete", encoding="utf-8")
+        nested.parent.mkdir()
+        nested.write_text("delete nested", encoding="utf-8")
+
+        result = codex_sync.delete_files(["victim.txt", "nested/gone.txt", "../blocked"], tmp, backup=True)
+        assert result["deleted"] == 2, "two files should be deleted"
+        assert result["errors"], "path traversal should be reported"
+        assert keep.exists(), "unselected file should remain"
+        assert not victim.exists(), "victim should be deleted"
+        assert not nested.exists(), "nested victim should be deleted"
+        backups = list(Path(tmp).glob(".sync_backup_*"))
+        assert backups, "deleted files should be backed up"
+        assert (backups[0] / "victim.txt").exists(), "backup should contain deleted file"
 
 
 def test_server_ping():
@@ -511,6 +614,119 @@ def test_sessions_include_cwd_and_git():
             assert "is_worktree" in s, "session should include is_worktree"
     finally:
         codex_sync.stop_server(server)
+
+
+def test_current_schema_sessions_list_handles_worktree_rows():
+    import codex_sync, sqlite3, shutil, json
+    orig_db = codex_sync.STATE_DB
+    orig_codex_dir = codex_sync.CODEX_DIR
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        db = Path(tmp_dir) / "state_5.sqlite"
+        base_repo = Path(tmp_dir) / "repo"
+        wt_dir = Path(tmp_dir) / ".codex" / "worktrees" / "abcd" / "repo"
+        rollout = Path(tmp_dir) / "rollout-thread-1.jsonl"
+        base_repo.mkdir()
+        wt_dir.mkdir(parents=True)
+        rollout.write_text("{}", encoding="utf-8")
+
+        conn = sqlite3.connect(str(db))
+        _create_current_threads_schema(conn)
+        conn.execute("""
+            INSERT INTO threads
+            (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+             sandbox_policy, approval_mode, created_at_ms, updated_at_ms, git_branch, git_sha)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "thread-1",
+            str(rollout),
+            1700000000,
+            1700000001,
+            "vscode",
+            "openai",
+            str(wt_dir),
+            "Worktree thread",
+            json.dumps({"writable_roots": [str(wt_dir), str(base_repo), str(base_repo / ".git")]}),
+            "never",
+            1700000000000,
+            1700000001000,
+            "main",
+            "a" * 40,
+        ))
+        conn.commit()
+        conn.close()
+
+        codex_sync.STATE_DB = db
+        codex_sync.CODEX_DIR = Path(tmp_dir) / ".codex"
+        sessions = codex_sync._get_sessions_list()
+        assert len(sessions) == 1, "worktree rows should not make session listing empty"
+        assert sessions[0]["is_worktree"], "session should be marked as worktree"
+        assert sessions[0]["real_cwd"] == str(base_repo), "real_cwd should resolve from sandbox policy"
+        assert sessions[0]["has_rollout"], "rollout file should be detected"
+    finally:
+        codex_sync.STATE_DB = orig_db
+        codex_sync.CODEX_DIR = orig_codex_dir
+        shutil.rmtree(tmp_dir)
+
+
+def test_upload_session_inserts_new_row_with_current_schema():
+    import codex_sync, sqlite3, shutil
+    orig_db = codex_sync.STATE_DB
+    orig_sessions_dir = codex_sync.SESSIONS_DIR
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        db = Path(tmp_dir) / "state_5.sqlite"
+        conn = sqlite3.connect(str(db))
+        _create_current_threads_schema(conn)
+        conn.commit()
+        conn.close()
+
+        codex_sync.STATE_DB = db
+        codex_sync.SESSIONS_DIR = Path(tmp_dir) / "sessions"
+        meta = {
+            "id": "thread-current",
+            "model_provider": "openai",
+            "model": "gpt-5",
+            "title": "Imported thread",
+            "created_at_ms": 1700000000000,
+            "updated_at_ms": 1700000001000,
+            "archived": False,
+            "source": "vscode",
+            "cwd": r"C:\Project",
+            "git_branch": "main",
+            "git_sha": "b" * 40,
+            "git_origin_url": "https://example.invalid/repo.git",
+            "sandbox_policy": "{}",
+            "approval_mode": "on-request",
+            "has_user_event": 1,
+        }
+
+        codex_sync.SyncHandler._do_upload_session(None, meta, "")
+
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM threads WHERE id = ?", ("thread-current",)).fetchone()
+        conn.close()
+        assert row is not None, "new session should be inserted into current Codex schema"
+        assert row["created_at"] == 1700000000, "created_at seconds should be populated"
+        assert row["updated_at"] == 1700000001, "updated_at seconds should be populated"
+        assert row["approval_mode"] == "on-request", "approval_mode should be preserved"
+        assert row["has_user_event"] == 1, "has_user_event should be preserved"
+        assert row["model"] == "gpt-5", "model should be preserved when column exists"
+    finally:
+        codex_sync.STATE_DB = orig_db
+        codex_sync.SESSIONS_DIR = orig_sessions_dir
+        shutil.rmtree(tmp_dir)
+
+
+def test_dashboard_uses_local_pin_for_protected_local_api():
+    text = Path("codex_sync.py").read_text(encoding="utf-8")
+    assert "localAuthHeaders()" in text, "dashboard should define local auth headers"
+    assert "fetch('/api/providers',{headers:localAuthHeaders()})" in text, "local providers fetch should include auth"
+    assert "fetch('/api/sessions',{headers:localAuthHeaders()})" in text, "local sessions fetch should include auth"
+    assert "fetch('/api/repo-hashes?dir='+encodeURIComponent(dir),{headers:localAuthHeaders()})" in text, "local repo scan should include auth"
+
+
 def test_sync_tray_syntax():
     """sync_tray.py compiles without syntax errors."""
     path = os.path.join(os.path.dirname(__file__), "sync_tray.py")
@@ -679,6 +895,44 @@ def test_server_unpair_endpoint():
         assert resp.status == 401, "Token should be revoked after unpair"
     finally:
         codex_sync.stop_server(server)
+
+
+def test_upload_provider_stores_auth_obfuscated():
+    import codex_sync, threading, json, shutil
+    tmp_dir = tempfile.mkdtemp()
+    orig_providers = codex_sync.PROVIDERS_FILE
+    codex_sync.PROVIDERS_FILE = Path(tmp_dir) / "providers.json"
+    server, pin, port = codex_sync.start_server(port=0)
+    actual_port = server.server_address[1]
+    codex_sync.SyncHandler.pin = pin
+    codex_sync.SyncHandler.server_port = actual_port
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        payload = {
+            "name": "SecretProvider",
+            "model_provider": "SecretProvider",
+            "model": "gpt-5",
+            "auth_mode": "apikey",
+            "provider_section": "[model_providers.SecretProvider]",
+            "auth.json": '{"OPENAI_API_KEY":"sk-secret"}',
+        }
+        conn = http.client.HTTPConnection("127.0.0.1", actual_port, timeout=5)
+        conn.request("POST", "/api/upload/provider", body=json.dumps(payload),
+                     headers={"Content-Type": "application/json",
+                              "Authorization": "Bearer " + pin})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        assert resp.status == 200, f"upload should return 200, got {resp.status}"
+        data = json.loads(codex_sync.PROVIDERS_FILE.read_text(encoding="utf-8"))
+        auth_value = data["profiles"]["SecretProvider"]["auth.json"]
+        assert auth_value.startswith("b64:"), "provider auth should be stored obfuscated"
+        assert "sk-secret" not in codex_sync.PROVIDERS_FILE.read_text(encoding="utf-8"), "raw key should not be written"
+    finally:
+        codex_sync.stop_server(server)
+        codex_sync.PROVIDERS_FILE = orig_providers
+        shutil.rmtree(tmp_dir)
 
 
 def test_case_insensitive_path_validation():
@@ -873,6 +1127,8 @@ if __name__ == "__main__":
     test("remove_provider deletes profile", test_remove_provider)
     test("_extract_provider_config", test_extract_provider_config)
     test("transform() has project/from_model/to_model params", test_transform_signature)
+    test("project filter uses cwd column", test_project_filter_uses_cwd_column)
+    test("CLI sync push does not hardcode localhost:8080", test_cli_sync_push_not_hardcoded_to_8080)
     test("is_codex_running returns bool", test_is_codex_running)
     test("_merge_config handles reasoning effort", test_merge_reasoning)
     test("_merge_config adds reasoning when absent", test_merge_add_reasoning_when_absent)
@@ -886,20 +1142,26 @@ if __name__ == "__main__":
     test("codex_sync imports", test_sync_imports)
     test("PIN format: 6 uppercase hex chars", test_pin_format)
     test("compute_local_hashes", test_compute_hashes)
+    test("compute_local_hashes excludes sensitive/temp paths", test_compute_hashes_excludes_sensitive_and_temp_paths)
     test("compute_file_diff", test_file_diff)
     test("path traversal protection", test_path_traversal)
     test("chunked pack + extract (temp file based)", test_chunked_pack_extract)
+    test("delete_files backs up and removes targets", test_delete_files_backs_up_and_removes_targets)
     test("server ping", test_server_ping)
     test("server auth required (401 without PIN, 200 with PIN)", test_server_auth_required)
     test("server CORS headers", test_server_cors)
     test("manifest includes hash", test_manifest_includes_hash)
     test("sessions include cwd and git fields", test_sessions_include_cwd_and_git)
+    test("current schema sessions list handles worktree rows", test_current_schema_sessions_list_handles_worktree_rows)
+    test("upload session inserts new row with current schema", test_upload_session_inserts_new_row_with_current_schema)
+    test("dashboard local API uses local auth", test_dashboard_uses_local_pin_for_protected_local_api)
     test("sync_tray.py syntax valid", test_sync_tray_syntax)
     test("sync_tray imports optional (graceful)", test_sync_tray_imports_optional)
     test("trusted device storage (add/check/remove)", test_trusted_device_storage)
     test("server pairing endpoint (PIN exchange)", test_server_pairing_endpoint)
     test("server local-info (no auth)", test_server_local_info)
     test("server unpair endpoint (revoke token)", test_server_unpair_endpoint)
+    test("upload provider stores auth obfuscated", test_upload_provider_stores_auth_obfuscated)
     test("case-insensitive path validation", test_case_insensitive_path_validation)
     test("get Git metadata and check dirty", test_get_git_metadata)
     test("project path mappings and worktrees", test_project_path_mappings_and_worktree)

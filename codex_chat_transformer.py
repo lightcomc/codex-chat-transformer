@@ -245,7 +245,7 @@ def transform(conn, from_provider, to_provider, dry_run=False, thread_id=None, s
         )
     elif project:
         cur.execute(
-            "SELECT id, rollout_path, title, model_provider FROM threads WHERE model_provider = ? AND project LIKE ?",
+            "SELECT id, rollout_path, title, model_provider FROM threads WHERE model_provider = ? AND cwd LIKE ?",
             (from_provider, f"%{project}%"),
         )
     else:
@@ -1610,7 +1610,11 @@ def main():
         return
 
     if args.sync_pull or args.sync_push:
-        from codex_sync import _client_get_json, _client_post_json
+        from codex_sync import (
+            _client_get_json, _client_post_json, _providers_summary, _provider_full,
+            _get_sessions_list, _get_session_jsonl,
+        )
+        import base64
         target = args.sync_pull or args.sync_push
         if ":" in target:
             host, port_str = target.rsplit(":", 1)
@@ -1645,8 +1649,8 @@ def main():
                 updated = datetime.datetime.fromtimestamp(s["updated_at_ms"] / 1000).strftime("%Y-%m-%d %H:%M") if s.get("updated_at_ms") else "?"
                 print(f"  {s['id'][:12]}... | {s['title'][:40]} | {s['model_provider']} | {updated}")
         elif choice == "3":
-            data = _client_get_json(f"http://127.0.0.1:8080/api/providers", "")
-            names = [p["name"] for p in data.get("providers", [])]
+            providers, _ = _providers_summary()
+            names = [p["name"] for p in providers]
             if not names:
                 print("  No local providers to push.")
             else:
@@ -1654,9 +1658,36 @@ def main():
                     print(f"  {n}")
                 sel = input("  Push which (comma-separated)? ").strip()
                 if sel:
-                    result = _client_post_json(f"{base_url}/api/upload/provider", pin,
-                                               {"names": [n.strip() for n in sel.split(",")]})
-                    print(f"  Result: {result}")
+                    for name in [n.strip() for n in sel.split(",") if n.strip()]:
+                        prof = _provider_full(name)
+                        if not prof:
+                            print(f"  {name}: not found")
+                            continue
+                        result = _client_post_json(f"{base_url}/api/upload/provider", pin, prof)
+                        print(f"  {name}: {result}")
+        elif choice == "4":
+            sessions = _get_sessions_list()
+            if not sessions:
+                print("  No local sessions to push.")
+            else:
+                for s in sessions[:20]:
+                    updated = datetime.datetime.fromtimestamp(s["updated_at_ms"] / 1000).strftime("%Y-%m-%d %H:%M") if s.get("updated_at_ms") else "?"
+                    print(f"  {s['id'][:12]}... | {s['title'][:40]} | {s['model_provider']} | {updated}")
+                sel = input("  Push which IDs (comma-separated)? ").strip()
+                if sel:
+                    session_map = {s["id"]: s for s in sessions}
+                    for sid in [s.strip() for s in sel.split(",") if s.strip()]:
+                        meta = session_map.get(sid)
+                        if not meta:
+                            print(f"  {sid}: not found")
+                            continue
+                        jsonl_data = _get_session_jsonl(sid)
+                        if jsonl_data is None:
+                            print(f"  {sid}: rollout not found")
+                            continue
+                        payload = {"meta": meta, "jsonl": base64.b64encode(jsonl_data).decode("ascii")}
+                        result = _client_post_json(f"{base_url}/api/upload/session", pin, payload)
+                        print(f"  {sid}: {result}")
         return
 
     conn = get_db_conn()

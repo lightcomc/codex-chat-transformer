@@ -13,6 +13,7 @@ import hashlib
 import http.client
 import io
 import json
+import fnmatch
 import ipaddress
 import os
 import secrets
@@ -45,6 +46,22 @@ EXCLUDE_DIRS = {
     ".git", "__pycache__", ".venv", "venv", "node_modules",
     ".idea", ".tox", ".mypy_cache", ".pytest_cache", ".eggs",
     ".claude", ".codex", "backup_*", "*.egg-info", ".env",
+}
+
+EXCLUDE_PATTERNS = {
+    ".env", ".env.*", "*.pyc", "*.pyo",
+    ".worktrees", ".worktrees/*",
+    ".pytest*", ".pytest*/*",
+    ".tmp*", ".tmp*/*",
+    "tmp*", "tmp*/*",
+    "codex_tmp*", "codex_tmp*/*",
+    ".codex_tmp*", ".codex_tmp*/*",
+    "codex_pytest_tmp*", "codex_pytest_tmp*/*",
+    "__codex*", "__codex*/*",
+    "__pytest*", "__pytest*/*",
+    "backup", "backup/*", "backup_*", "backup_*/*",
+    "secrets", "secrets/*",
+    ".yt_dlp_tmp", ".yt_dlp_tmp/*",
 }
 
 # Module-level flag: set to True when sync writes local data
@@ -95,6 +112,33 @@ def _validate_path(rel_path, base_dir):
     resolved = os.path.normcase(os.path.realpath(os.path.join(base_dir, rel_path)))
     base_sep = os.path.normcase(base + os.sep)
     return (resolved.startswith(base_sep) or resolved == base) and ".." not in Path(rel_path).parts
+
+
+def _norm_rel(rel_path):
+    return str(rel_path).replace("\\", "/").lstrip("/")
+
+
+def _is_excluded_path(rel_path):
+    rel = _norm_rel(rel_path)
+    parts = [p for p in rel.split("/") if p]
+    if not parts:
+        return False
+    for part in parts:
+        if part in EXCLUDE_DIRS:
+            return True
+        if fnmatch.fnmatch(part, "backup_*") or fnmatch.fnmatch(part, "*.egg-info"):
+            return True
+        if fnmatch.fnmatch(part, ".pytest*") or fnmatch.fnmatch(part, ".tmp*"):
+            return True
+        if fnmatch.fnmatch(part, "tmp*") or fnmatch.fnmatch(part, "codex_tmp*"):
+            return True
+        if fnmatch.fnmatch(part, ".codex_tmp*") or fnmatch.fnmatch(part, "__codex*"):
+            return True
+        if fnmatch.fnmatch(part, "codex_pytest_tmp*"):
+            return True
+        if fnmatch.fnmatch(part, "__pytest*"):
+            return True
+    return any(fnmatch.fnmatch(rel, pat) for pat in EXCLUDE_PATTERNS)
 
 
 def _check_rate_limit():
@@ -283,8 +327,31 @@ def _load_providers_raw():
 
 
 def _save_providers_raw(data):
+    CODEX_DIR.mkdir(parents=True, exist_ok=True)
     with open(str(PROVIDERS_FILE), "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _encode_auth_for_storage(auth_raw):
+    if not auth_raw:
+        return ""
+    if isinstance(auth_raw, str) and auth_raw.startswith("b64:"):
+        return auth_raw
+    import base64
+    if not isinstance(auth_raw, str):
+        auth_raw = json.dumps(auth_raw, ensure_ascii=False)
+    return "b64:" + base64.b64encode(auth_raw.encode("utf-8")).decode("ascii")
+
+
+def _provider_storage_record(name, data):
+    return {
+        "model_provider": data.get("model_provider", name),
+        "model": data.get("model", ""),
+        "auth_mode": data.get("auth_mode", ""),
+        "provider_section": data.get("provider_section", ""),
+        "auth.json": _encode_auth_for_storage(data.get("auth.json", "")),
+        "saved_at": data.get("saved_at") or datetime.now().isoformat(),
+    }
 
 
 def _providers_summary():
@@ -330,6 +397,122 @@ def _provider_full(name):
 # ── Sessions helpers ─────────────────────────────────────────────────────
 
 
+THREAD_SYNC_COLUMNS = [
+    "id", "rollout_path", "created_at", "updated_at", "source",
+    "model_provider", "cwd", "title", "sandbox_policy", "approval_mode",
+    "tokens_used", "has_user_event", "archived", "archived_at",
+    "git_sha", "git_branch", "git_origin_url", "cli_version",
+    "first_user_message", "agent_nickname", "agent_role", "memory_mode",
+    "model", "reasoning_effort", "agent_path", "created_at_ms",
+    "updated_at_ms", "thread_source", "preview",
+]
+
+
+def _row_get(row, key, default=None):
+    try:
+        value = row[key]
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def _table_columns(conn, table):
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _ms_from_meta(meta, ms_key, sec_key):
+    value = meta.get(ms_key)
+    if value not in (None, ""):
+        return int(value)
+    value = meta.get(sec_key)
+    if value not in (None, ""):
+        return int(value) * 1000
+    return int(time.time() * 1000)
+
+
+def _session_row_from_meta(meta, rollout_path, columns):
+    created_ms = _ms_from_meta(meta, "created_at_ms", "created_at")
+    updated_ms = _ms_from_meta(meta, "updated_at_ms", "updated_at")
+    source = meta.get("source") or meta.get("thread_source") or "vscode"
+    row = {
+        "id": meta["id"],
+        "rollout_path": rollout_path,
+        "created_at": created_ms // 1000,
+        "updated_at": updated_ms // 1000,
+        "source": source,
+        "model_provider": meta.get("model_provider", ""),
+        "cwd": meta.get("cwd", ""),
+        "title": meta.get("title") or "",
+        "sandbox_policy": meta.get("sandbox_policy") or "{}",
+        "approval_mode": meta.get("approval_mode") or "never",
+        "tokens_used": int(meta.get("tokens_used") or 0),
+        "has_user_event": int(meta.get("has_user_event") or 0),
+        "archived": int(meta.get("archived", False)),
+        "archived_at": meta.get("archived_at"),
+        "git_sha": meta.get("git_sha", ""),
+        "git_branch": meta.get("git_branch", ""),
+        "git_origin_url": meta.get("git_origin_url", ""),
+        "cli_version": meta.get("cli_version") or "",
+        "first_user_message": meta.get("first_user_message") or "",
+        "agent_nickname": meta.get("agent_nickname"),
+        "agent_role": meta.get("agent_role"),
+        "memory_mode": meta.get("memory_mode") or "enabled",
+        "model": meta.get("model"),
+        "reasoning_effort": meta.get("reasoning_effort"),
+        "agent_path": meta.get("agent_path"),
+        "created_at_ms": created_ms,
+        "updated_at_ms": updated_ms,
+        "thread_source": meta.get("thread_source"),
+        "preview": meta.get("preview") or "",
+    }
+    return {k: v for k, v in row.items() if k in columns}
+
+
+def _upsert_session_record(conn, meta, rollout_path):
+    columns = _table_columns(conn, "threads")
+    row = _session_row_from_meta(meta, rollout_path, columns)
+    insert_cols = [c for c in THREAD_SYNC_COLUMNS if c in row]
+    placeholders = ", ".join("?" for _ in insert_cols)
+    col_sql = ", ".join(insert_cols)
+    update_cols = [c for c in insert_cols if c != "id"]
+    update_sql = ", ".join(f"{c} = excluded.{c}" for c in update_cols)
+    values = [row[c] for c in insert_cols]
+    if update_cols:
+        conn.execute(
+            f"INSERT INTO threads ({col_sql}) VALUES ({placeholders}) "
+            f"ON CONFLICT(id) DO UPDATE SET {update_sql}",
+            values,
+        )
+    else:
+        conn.execute(
+            f"INSERT OR IGNORE INTO threads ({col_sql}) VALUES ({placeholders})",
+            values,
+        )
+
+
+def _store_session(meta, jsonl_b64):
+    import base64
+    created_ms = _ms_from_meta(meta, "created_at_ms", "created_at")
+    dt = datetime.fromtimestamp(created_ms / 1000)
+    date_dir = SESSIONS_DIR / f"{dt.year:04d}" / f"{dt.month:02d}" / f"{dt.day:02d}"
+    date_dir.mkdir(parents=True, exist_ok=True)
+    rollout_path = str(date_dir / f"rollout-{meta['id']}.jsonl")
+
+    jsonl_data = base64.b64decode(jsonl_b64) if jsonl_b64 else b""
+    if jsonl_data:
+        with open(rollout_path, "wb") as f:
+            f.write(jsonl_data)
+
+    conn = sqlite3.connect(str(STATE_DB), timeout=30.0)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        _upsert_session_record(conn, meta, rollout_path)
+        conn.commit()
+    finally:
+        conn.close()
+    return rollout_path
+
+
 def _get_manifest_hash():
     """Hash representing current state of sessions + providers. Used for auto-sync change detection."""
     sessions = _get_sessions_list()
@@ -346,21 +529,26 @@ def _get_sessions_list():
         conn = sqlite3.connect(str(STATE_DB), timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, rollout_path, model_provider, title,
-                   created_at_ms, updated_at_ms, archived, source, cwd,
-                   git_branch, git_sha, git_origin_url, sandbox_policy
-            FROM threads
-            ORDER BY updated_at_ms DESC
-        """)
-        rows = cur.fetchall()
+        columns = _table_columns(conn, "threads")
+        select_cols = [c for c in THREAD_SYNC_COLUMNS if c in columns]
+        if "id" not in select_cols:
+            conn.close()
+            return []
+        if "updated_at_ms" in columns:
+            order_col = "updated_at_ms"
+        elif "updated_at" in columns:
+            order_col = "updated_at"
+        else:
+            order_col = "id"
+        rows = conn.execute(
+            f"SELECT {', '.join(select_cols)} FROM threads ORDER BY {order_col} DESC"
+        ).fetchall()
         conn.close()
         
         # Build folder to cwds mapping for folder-fallback lookup
         folder_to_cwds = {}
         for r in rows:
-            cwd_val = (r["cwd"] or "").replace("\\\\?\\", "")
+            cwd_val = (_row_get(r, "cwd", "") or "").replace("\\\\?\\", "")
             if not cwd_val:
                 continue
             parts = cwd_val.replace("\\", "/").split("/")
@@ -375,10 +563,11 @@ def _get_sessions_list():
 
         result = []
         for r in rows:
-            has_rollout = bool(r["rollout_path"]) and os.path.exists(
-                r["rollout_path"].replace("\\\\?\\", "")
+            rollout_path = _row_get(r, "rollout_path", "") or ""
+            has_rollout = bool(rollout_path) and os.path.exists(
+                rollout_path.replace("\\\\?\\", "")
             )
-            cwd_val = (r["cwd"] or "").replace("\\\\?\\", "")
+            cwd_val = (_row_get(r, "cwd", "") or "").replace("\\\\?\\", "")
             parts = cwd_val.replace("\\", "/").split("/") if cwd_val else []
             is_worktree = any(
                 p == "worktrees" and i > 0 and parts[i - 1] == ".codex"
@@ -401,7 +590,7 @@ def _get_sessions_list():
                 
                 resolved_base = False
                 # 1. Parse sandbox policy
-                policy_str = r.get("sandbox_policy")
+                policy_str = _row_get(r, "sandbox_policy", "")
                 if policy_str:
                     try:
                         policy_data = json.loads(policy_str)
@@ -422,22 +611,38 @@ def _get_sessions_list():
                         real_cwd = folder_to_cwds[project_name][0]
 
             result.append({
-                "id": r["id"],
-                "title": (r["title"] or "")[:80],
+                "id": _row_get(r, "id", ""),
+                "title": (_row_get(r, "title", "") or "")[:80],
                 "cwd": cwd_val,
                 "real_cwd": real_cwd,
                 "local_worktree_path": local_worktree_path,
-                "model_provider": r["model_provider"] or "",
-                "created_at_ms": r["created_at_ms"],
-                "updated_at_ms": r["updated_at_ms"],
-                "archived": bool(r["archived"]),
-                "source": r["source"] or "",
+                "model_provider": _row_get(r, "model_provider", "") or "",
+                "model": _row_get(r, "model", "") or "",
+                "created_at": _row_get(r, "created_at"),
+                "updated_at": _row_get(r, "updated_at"),
+                "created_at_ms": _row_get(r, "created_at_ms", (_row_get(r, "created_at", 0) or 0) * 1000),
+                "updated_at_ms": _row_get(r, "updated_at_ms", (_row_get(r, "updated_at", 0) or 0) * 1000),
+                "archived": bool(_row_get(r, "archived", 0)),
+                "archived_at": _row_get(r, "archived_at"),
+                "source": _row_get(r, "source", "") or "",
+                "thread_source": _row_get(r, "thread_source", "") or "",
                 "has_rollout": has_rollout,
-                "git_branch": r["git_branch"] or "",
-                "git_sha": r["git_sha"] or "",
-                "git_origin_url": r["git_origin_url"] or "",
+                "git_branch": _row_get(r, "git_branch", "") or "",
+                "git_sha": _row_get(r, "git_sha", "") or "",
+                "git_origin_url": _row_get(r, "git_origin_url", "") or "",
                 "is_worktree": is_worktree,
-                "sandbox_policy": r["sandbox_policy"] or "",
+                "sandbox_policy": _row_get(r, "sandbox_policy", "") or "",
+                "approval_mode": _row_get(r, "approval_mode", "") or "",
+                "tokens_used": _row_get(r, "tokens_used", 0) or 0,
+                "has_user_event": _row_get(r, "has_user_event", 0) or 0,
+                "cli_version": _row_get(r, "cli_version", "") or "",
+                "first_user_message": _row_get(r, "first_user_message", "") or "",
+                "agent_nickname": _row_get(r, "agent_nickname"),
+                "agent_role": _row_get(r, "agent_role"),
+                "memory_mode": _row_get(r, "memory_mode", "") or "",
+                "reasoning_effort": _row_get(r, "reasoning_effort"),
+                "agent_path": _row_get(r, "agent_path"),
+                "preview": _row_get(r, "preview", "") or "",
             })
         return result
     except Exception:
@@ -475,10 +680,15 @@ def compute_local_hashes(project_dir):
     if not os.path.isdir(base):
         return result
     for root, dirs, files in os.walk(base):
-        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        dirs[:] = [
+            d for d in dirs
+            if not _is_excluded_path(os.path.relpath(os.path.join(root, d), base).replace("\\", "/"))
+        ]
         for fname in files:
             full = os.path.join(root, fname)
             rel = os.path.relpath(full, base).replace("\\", "/")
+            if _is_excluded_path(rel):
+                continue
             try:
                 h = hashlib.sha256()
                 with open(full, "rb") as f:
@@ -518,6 +728,8 @@ def _create_pack(file_list, base_dir):
             for rel in file_list:
                 if not _validate_path(rel, base):
                     continue
+                if _is_excluded_path(rel):
+                    continue
                 full = os.path.join(base, rel)
                 if os.path.exists(full):
                     total_size += os.path.getsize(full)
@@ -535,6 +747,44 @@ def _create_pack(file_list, base_dir):
         except Exception:
             pass
         raise
+
+
+def delete_files(file_list, target_dir, backup=True):
+    """Delete relative files from target_dir, optionally backing up removed files."""
+    global data_changed
+    target = os.path.realpath(target_dir)
+    os.makedirs(target, exist_ok=True)
+
+    bak_dir = None
+    if backup:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bak_dir = os.path.join(target, f".sync_backup_{ts}")
+
+    deleted = 0
+    errors = []
+    for rel in file_list:
+        if not _validate_path(rel, target):
+            errors.append(f"Blocked (path traversal): {rel}")
+            continue
+        if _is_excluded_path(rel):
+            errors.append(f"Blocked (excluded): {rel}")
+            continue
+        dest = os.path.join(target, rel)
+        if not os.path.exists(dest):
+            continue
+        try:
+            if backup:
+                bak_path = os.path.join(bak_dir, rel)
+                os.makedirs(os.path.dirname(bak_path), exist_ok=True)
+                shutil.copy2(dest, bak_path)
+            os.unlink(dest)
+            deleted += 1
+        except Exception as e:
+            errors.append(f"{rel}: {e}")
+
+    if deleted:
+        data_changed = True
+    return {"deleted": deleted, "errors": errors, "backup": bak_dir if deleted and backup else None}
 
 
 def extract_pack(zip_source, target_dir, backup=True):
@@ -562,6 +812,7 @@ def extract_pack(zip_source, target_dir, backup=True):
         os.makedirs(bak_dir, exist_ok=True)
 
     replaced = []
+    extracted = []
     errors = []
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
@@ -571,6 +822,9 @@ def extract_pack(zip_source, target_dir, backup=True):
                 rel = info.filename
                 if not _validate_path(rel, target):
                     errors.append(f"Blocked (path traversal): {rel}")
+                    continue
+                if _is_excluded_path(rel):
+                    errors.append(f"Blocked (excluded): {rel}")
                     continue
                 dest = os.path.join(target, rel)
                 if os.path.exists(dest) and backup:
@@ -585,7 +839,8 @@ def extract_pack(zip_source, target_dir, backup=True):
                         if not chunk:
                             break
                         dst.write(chunk)
-        file_count = len(replaced) + len(errors)
+                extracted.append(rel)
+        file_count = len(extracted)
     finally:
         if tmp_cleanup:
             try:
@@ -779,6 +1034,8 @@ class SyncHandler(BaseHTTPRequestHandler):
             self._handle_upload_session()
         elif path == "/api/upload/pack":
             self._handle_upload_pack()
+        elif path == "/api/delete-files":
+            self._handle_delete_files()
         elif path == "/api/pull/providers":
             self._handle_pull_providers()
         elif path == "/api/pull/sessions":
@@ -1110,14 +1367,7 @@ class SyncHandler(BaseHTTPRequestHandler):
         bak = _create_sync_backup()
         data = _load_providers_raw()
         profiles = data.setdefault("profiles", {})
-        profiles[name] = {
-            "model_provider": req.get("model_provider", ""),
-            "model": req.get("model", ""),
-            "auth_mode": req.get("auth_mode", ""),
-            "provider_section": req.get("provider_section", ""),
-            "auth.json": req.get("auth.json", ""),
-            "saved_at": datetime.now().isoformat(),
-        }
+        profiles[name] = _provider_storage_record(name, req)
         _save_providers_raw(data)
         data_changed = True
         self._send_json({"status": "ok", "name": name, "backup": bak})
@@ -1144,74 +1394,8 @@ class SyncHandler(BaseHTTPRequestHandler):
             return
 
         bak = _create_sync_backup()
-        created_ms = meta.get("created_at_ms", int(time.time() * 1000))
-        dt = datetime.fromtimestamp(created_ms / 1000)
-        date_dir = SESSIONS_DIR / f"{dt.year:04d}" / f"{dt.month:02d}" / f"{dt.day:02d}"
-        date_dir.mkdir(parents=True, exist_ok=True)
-        rollout_path = str(date_dir / f"rollout-{meta['id']}.jsonl")
-
-        if jsonl_data:
-            with open(rollout_path, "wb") as f:
-                f.write(jsonl_data)
-
         try:
-            conn = sqlite3.connect(str(STATE_DB), timeout=30.0)
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("""
-                    INSERT OR IGNORE INTO threads
-                    (id, rollout_path, model_provider, title,
-                     created_at_ms, updated_at_ms, archived, source, cwd,
-                     git_branch, git_sha, git_origin_url, sandbox_policy)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    meta["id"],
-                    rollout_path,
-                    meta.get("model_provider", ""),
-                    meta.get("title", ""),
-                    meta.get("created_at_ms", 0),
-                    meta.get("updated_at_ms", 0),
-                    int(meta.get("archived", False)),
-                    meta.get("source", ""),
-                    meta.get("cwd", ""),
-                    meta.get("git_branch", ""),
-                    meta.get("git_sha", ""),
-                    meta.get("git_origin_url", ""),
-                    meta.get("sandbox_policy", ""),
-                ))
-                conn.execute("""
-                    UPDATE threads SET
-                        rollout_path = ?,
-                        model_provider = ?,
-                        title = ?,
-                        created_at_ms = ?,
-                        updated_at_ms = ?,
-                        archived = ?,
-                        source = ?,
-                        cwd = ?,
-                        git_branch = ?,
-                        git_sha = ?,
-                        git_origin_url = ?,
-                        sandbox_policy = ?
-                    WHERE id = ?
-                """, (
-                    rollout_path,
-                    meta.get("model_provider", ""),
-                    meta.get("title", ""),
-                    meta.get("created_at_ms", 0),
-                    meta.get("updated_at_ms", 0),
-                    int(meta.get("archived", False)),
-                    meta.get("source", ""),
-                    meta.get("cwd", ""),
-                    meta.get("git_branch", ""),
-                    meta.get("git_sha", ""),
-                    meta.get("git_origin_url", ""),
-                    meta.get("sandbox_policy", ""),
-                    meta["id"],
-                ))
-                conn.commit()
-            finally:
-                conn.close()
+            _store_session(meta, jsonl_b64)
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
             return
@@ -1243,6 +1427,21 @@ class SyncHandler(BaseHTTPRequestHandler):
 
     # ── Proxy (server-to-server) handlers ─────────────────────────────
 
+    def _handle_delete_files(self):
+        raw = self._read_body()
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._send_json({"error": "invalid json"}, status=400)
+            return
+        base_dir = req.get("base_dir", ".")
+        files = req.get("files", [])
+        backup = bool(req.get("backup", True))
+        if not os.path.isdir(base_dir):
+            self._send_json({"error": "base_dir not found"}, status=404)
+            return
+        self._send_json(delete_files(files, base_dir, backup=backup))
+
     def _handle_pull_providers(self):
         raw = self._read_body()
         try:
@@ -1267,7 +1466,7 @@ class SyncHandler(BaseHTTPRequestHandler):
                 else:
                     prof = _client_get_provider_no_key(remote, port, rpin, name)
                 if prof:
-                    local_data.setdefault("profiles", {})[name] = prof
+                    local_data.setdefault("profiles", {})[name] = _provider_storage_record(name, prof)
                     results.append({"name": name, "status": "imported"})
                 else:
                     results.append({"name": name, "status": "not_found"})
@@ -1329,20 +1528,27 @@ class SyncHandler(BaseHTTPRequestHandler):
         port = int(req.get("remote_port", 8080))
         rpin = req.get("remote_pin", "")
         files = req.get("files", [])
+        delete_list = req.get("delete_files", [])
         base_dir = req.get("base_dir", ".")
         remote_dir = req.get("remote_dir", base_dir)
 
         try:
-            zip_path = _client_post_zip(
-                f"http://{remote}:{port}/api/download-pack",
-                rpin, {"files": files, "base_dir": remote_dir})
-            try:
-                result = extract_pack(zip_path, base_dir, backup=True)
-            finally:
+            result = {"extracted": 0, "replaced": 0, "errors": []}
+            if files:
+                zip_path = _client_post_zip(
+                    f"http://{remote}:{port}/api/download-pack",
+                    rpin, {"files": files, "base_dir": remote_dir})
                 try:
-                    os.unlink(zip_path)
-                except Exception:
-                    pass
+                    result = extract_pack(zip_path, base_dir, backup=True)
+                finally:
+                    try:
+                        os.unlink(zip_path)
+                    except Exception:
+                        pass
+            if delete_list:
+                delete_result = delete_files(delete_list, base_dir, backup=True)
+                result["deleted"] = delete_result["deleted"]
+                result.setdefault("errors", []).extend(delete_result.get("errors", []))
             self._send_json(result)
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
@@ -1424,80 +1630,38 @@ class SyncHandler(BaseHTTPRequestHandler):
         port = int(req.get("remote_port", 8080))
         rpin = req.get("remote_pin", "")
         files = req.get("files", [])
+        delete_list = req.get("delete_files", [])
         base_dir = req.get("base_dir", ".")
         remote_dir = req.get("remote_dir", base_dir)
 
         try:
-            zip_path = _create_pack(files, base_dir)
-            try:
-                _client_post_zip_raw(
-                    f"http://{remote}:{port}/api/upload/pack", rpin, zip_path, remote_dir)
-            finally:
+            pushed = 0
+            if files:
+                zip_path = _create_pack(files, base_dir)
                 try:
-                    os.unlink(zip_path)
-                except Exception:
-                    pass
-            self._send_json({"status": "ok", "pushed": len(files)})
+                    _client_post_zip_raw(
+                        f"http://{remote}:{port}/api/upload/pack", rpin, zip_path, remote_dir)
+                    pushed = len(files)
+                finally:
+                    try:
+                        os.unlink(zip_path)
+                    except Exception:
+                        pass
+            delete_result = {"deleted": 0, "errors": []}
+            if delete_list:
+                delete_result = _client_post_json(
+                    f"http://{remote}:{port}/api/delete-files",
+                    rpin,
+                    {"base_dir": remote_dir, "files": delete_list, "backup": True},
+                )
+            self._send_json({"status": "ok", "pushed": pushed,
+                             "deleted": delete_result.get("deleted", 0),
+                             "errors": delete_result.get("errors", [])})
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
 
     def _do_upload_session(self, meta, jsonl_b64):
-        import base64
-        created_ms = meta.get("created_at_ms", int(time.time() * 1000))
-        dt = datetime.fromtimestamp(created_ms / 1000)
-        date_dir = SESSIONS_DIR / f"{dt.year:04d}" / f"{dt.month:02d}" / f"{dt.day:02d}"
-        date_dir.mkdir(parents=True, exist_ok=True)
-        rollout_path = str(date_dir / f"rollout-{meta['id']}.jsonl")
-
-        jsonl_data = base64.b64decode(jsonl_b64) if jsonl_b64 else b""
-        if jsonl_data:
-            with open(rollout_path, "wb") as f:
-                f.write(jsonl_data)
-
-        conn = sqlite3.connect(str(STATE_DB), timeout=30.0)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("""
-                INSERT OR IGNORE INTO threads
-                (id, rollout_path, model_provider, title,
-                 created_at_ms, updated_at_ms, archived, source, cwd,
-                 git_branch, git_sha, git_origin_url, sandbox_policy)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                meta["id"], rollout_path, meta.get("model_provider", ""),
-                meta.get("title", ""), meta.get("created_at_ms", 0),
-                meta.get("updated_at_ms", 0), int(meta.get("archived", False)),
-                meta.get("source", ""), meta.get("cwd", ""),
-                meta.get("git_branch", ""), meta.get("git_sha", ""),
-                meta.get("git_origin_url", ""), meta.get("sandbox_policy", ""),
-            ))
-            conn.execute("""
-                UPDATE threads SET
-                    rollout_path = ?,
-                    model_provider = ?,
-                    title = ?,
-                    created_at_ms = ?,
-                    updated_at_ms = ?,
-                    archived = ?,
-                    source = ?,
-                    cwd = ?,
-                    git_branch = ?,
-                    git_sha = ?,
-                    git_origin_url = ?,
-                    sandbox_policy = ?
-                WHERE id = ?
-            """, (
-                rollout_path, meta.get("model_provider", ""),
-                meta.get("title", ""), meta.get("created_at_ms", 0),
-                meta.get("updated_at_ms", 0), int(meta.get("archived", False)),
-                meta.get("source", ""), meta.get("cwd", ""),
-                meta.get("git_branch", ""), meta.get("git_sha", ""),
-                meta.get("git_origin_url", ""), meta.get("sandbox_policy", ""),
-                meta["id"],
-            ))
-            conn.commit()
-        finally:
-            conn.close()
+        _store_session(meta, jsonl_b64)
 
 
 # ── Client-side HTTP helpers ─────────────────────────────────────────────
@@ -2052,6 +2216,12 @@ function getStoredToken(serverId){
 function removeStoredToken(serverId){
   const t=getStoredTokens();delete t[serverId];localStorage.setItem(TRUSTED_TOKENS_KEY,JSON.stringify(t))
 }
+function localAuthHeaders(){
+  return localPin?{'Authorization':'Bearer '+localPin}:{}
+}
+function jsonHeaders(){
+  const h=localAuthHeaders();h['Content-Type']='application/json';return h
+}
 
 async function init(){
   try{
@@ -2185,7 +2355,7 @@ function disconnectRemote(){
 
 async function loadProviders(){
   const [lr,rr]=await Promise.all([
-    fetch('/api/providers').then(r=>r.json()),
+    fetch('/api/providers',{headers:localAuthHeaders()}).then(r=>r.json()),
     fetch('http://'+remoteHost+':'+remotePort+'/api/providers',{headers:{'Authorization':'Bearer '+remotePinVal}}).then(r=>r.json())
   ]);
   localProviders=lr.providers||[];remoteProviders=rr.providers||[];
@@ -2223,13 +2393,13 @@ async function pullProvider(name){
   const modeEl=document.getElementById('mode_'+name);
   const mode=modeEl?modeEl.value:'with_key';
   if(mode==='skip'){showToast('Skipped '+name,'error');return}
-  try{const r=await fetch('/api/pull/providers',{method:'POST',headers:{'Content-Type':'application/json'},
+  try{const r=await fetch('/api/pull/providers',{method:'POST',headers:jsonHeaders(),
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:[name],mode:mode})});
     showResult(r);loadProviders();}catch(e){showToast(e.message,'error')}
 }
 
 async function pushProvider(name){
-  try{const r=await fetch('/api/push/providers',{method:'POST',headers:{'Content-Type':'application/json'},
+  try{const r=await fetch('/api/push/providers',{method:'POST',headers:jsonHeaders(),
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:[name],mode:'with_key'})});
     showResult(r);loadProviders();}catch(e){showToast(e.message,'error')}
 }
@@ -2240,7 +2410,7 @@ async function pullSelectedProviders(){
     const modeEl=document.getElementById('mode_'+name);
     const mode=modeEl?modeEl.value:'with_key';
     if(mode==='skip') continue;
-    try{await fetch('/api/pull/providers',{method:'POST',headers:{'Content-Type':'application/json'},
+    try{await fetch('/api/pull/providers',{method:'POST',headers:jsonHeaders(),
       body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:[name],mode:mode})});
     }catch(e){showToast(e.message,'error')}
   }
@@ -2249,14 +2419,14 @@ async function pullSelectedProviders(){
 
 async function pushSelectedProviders(){
   const names=getSelected('prov');if(!names.length){showToast('Nothing selected','error');return}
-  try{const r=await fetch('/api/push/providers',{method:'POST',headers:{'Content-Type':'application/json'},
+  try{const r=await fetch('/api/push/providers',{method:'POST',headers:jsonHeaders(),
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:names,mode:'with_key'})});
     showResult(r);loadProviders();}catch(e){showToast(e.message,'error')}
 }
 
 async function loadSessions(){
   const [lr,rr]=await Promise.all([
-    fetch('/api/sessions').then(r=>r.json()),
+    fetch('/api/sessions',{headers:localAuthHeaders()}).then(r=>r.json()),
     fetch('http://'+remoteHost+':'+remotePort+'/api/sessions',{headers:{'Authorization':'Bearer '+remotePinVal}}).then(r=>r.json())
   ]);
   localSessions=lr.sessions||[];remoteSessions=rr.sessions||[];
@@ -2286,7 +2456,7 @@ async function loadSessions(){
 }
 
 async function pullSession(id){
-  try{const r=await fetch('/api/pull/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
+  try{const r=await fetch('/api/pull/sessions',{method:'POST',headers:jsonHeaders(),
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:[id]})});
     await showResult(r);loadSessions();
     await offerProjectFileSync(id,'pull');
@@ -2294,7 +2464,7 @@ async function pullSession(id){
 }
 
 async function pushSession(id){
-  try{const r=await fetch('/api/push/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
+  try{const r=await fetch('/api/push/sessions',{method:'POST',headers:jsonHeaders(),
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:[id]})});
     await showResult(r);loadSessions();
     await offerProjectFileSync(id,'push');
@@ -2303,7 +2473,7 @@ async function pushSession(id){
 
 async function pullSelectedSessions(){
   const ids=getSelected('sess');if(!ids.length){showToast('Nothing selected','error');return}
-  try{const r=await fetch('/api/pull/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
+  try{const r=await fetch('/api/pull/sessions',{method:'POST',headers:jsonHeaders(),
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:ids})});
     await showResult(r);loadSessions();
     await offerBulkProjectFileSync(ids,'pull');
@@ -2312,7 +2482,7 @@ async function pullSelectedSessions(){
 
 async function pushSelectedSessions(){
   const ids=getSelected('sess');if(!ids.length){showToast('Nothing selected','error');return}
-  try{const r=await fetch('/api/push/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
+  try{const r=await fetch('/api/push/sessions',{method:'POST',headers:jsonHeaders(),
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:ids})});
     await showResult(r);loadSessions();
     await offerBulkProjectFileSync(ids,'push');
@@ -2323,7 +2493,7 @@ let projectMappings = {};
 
 async function loadProjectMappings() {
   try {
-    const res = await fetch('/api/project-mappings').then(r => r.json());
+    const res = await fetch('/api/project-mappings',{headers:localAuthHeaders()}).then(r => r.json());
     projectMappings = res.project_mappings || {};
   } catch (e) {
     console.error("Failed to load project mappings", e);
@@ -2349,7 +2519,7 @@ async function scanFiles(){
     projectMappings[dir] = rdir;
     await fetch('/api/project-mappings', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: jsonHeaders(),
       body: JSON.stringify({local_path: dir, remote_path: rdir})
     });
   }
@@ -2359,7 +2529,7 @@ async function scanFiles(){
 
   try{
     const [lr,rr]=await Promise.all([
-      fetch('/api/repo-hashes?dir='+encodeURIComponent(dir)).then(r=>r.json()),
+      fetch('/api/repo-hashes?dir='+encodeURIComponent(dir),{headers:localAuthHeaders()}).then(r=>r.json()),
       fetch('http://'+remoteHost+':'+remotePort+'/api/repo-hashes?dir='+encodeURIComponent(rdir),
         {headers:{'Authorization':'Bearer '+remotePinVal}}).then(r=>r.json())
     ]);
@@ -2419,16 +2589,18 @@ function renderFileDiff(){
 async function pullFile(path){
   const dir=document.getElementById('projectDir').value.trim();
   const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
-  try{const r=await fetch('/api/pull/files',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:[path],base_dir:dir,remote_dir:rdir})});
+  const split=splitFileSelection([path],'pull');
+  try{const r=await fetch('/api/pull/files',{method:'POST',headers:jsonHeaders(),
+    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir})});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
 async function pushFile(path){
   const dir=document.getElementById('projectDir').value.trim();
   const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
-  try{const r=await fetch('/api/push/files',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:[path],base_dir:dir,remote_dir:rdir})});
+  const split=splitFileSelection([path],'push');
+  try{const r=await fetch('/api/push/files',{method:'POST',headers:jsonHeaders(),
+    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir})});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
@@ -2436,8 +2608,9 @@ async function pullSelectedFiles(){
   const paths=getSelected('file');if(!paths.length){showToast('Nothing selected','error');return}
   const dir=document.getElementById('projectDir').value.trim();
   const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
-  try{const r=await fetch('/api/pull/files',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:paths,base_dir:dir,remote_dir:rdir})});
+  const split=splitFileSelection(paths,'pull');
+  try{const r=await fetch('/api/pull/files',{method:'POST',headers:jsonHeaders(),
+    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir})});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
@@ -2445,13 +2618,35 @@ async function pushSelectedFiles(){
   const paths=getSelected('file');if(!paths.length){showToast('Nothing selected','error');return}
   const dir=document.getElementById('projectDir').value.trim();
   const rdir=document.getElementById('remoteProjectDir').value.trim() || dir;
-  try{const r=await fetch('/api/push/files',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:paths,base_dir:dir,remote_dir:rdir})});
+  const split=splitFileSelection(paths,'push');
+  try{const r=await fetch('/api/push/files',{method:'POST',headers:jsonHeaders(),
+    body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,files:split.files,delete_files:split.deleteFiles,base_dir:dir,remote_dir:rdir})});
     showResult(r);scanFiles();}catch(e){showToast(e.message,'error')}
 }
 
 function getSelected(scope){
   return [...document.querySelectorAll('[data-scope="'+scope+'"]:checked')].map(c=>c.dataset.name);
+}
+
+function fileStatus(path){
+  if(!fileDiff) return 'modified';
+  if(fileDiff.new.indexOf(path)>=0) return 'new';
+  if(fileDiff.deleted.indexOf(path)>=0) return 'deleted';
+  if(fileDiff.modified.indexOf(path)>=0) return 'modified';
+  return 'unchanged';
+}
+
+function splitFileSelection(paths,direction){
+  const files=[],deleteFiles=[];
+  paths.forEach(function(path){
+    const status=fileStatus(path);
+    if(direction==='pull'){
+      if(status==='deleted') deleteFiles.push(path); else files.push(path);
+    }else{
+      if(status==='new') deleteFiles.push(path); else files.push(path);
+    }
+  });
+  return {files:files,deleteFiles:deleteFiles};
 }
 
 async function showResult(response){
@@ -2487,7 +2682,7 @@ async function offerProjectFileSync(sessionId,direction){
     try {
       const res = await fetch('/api/recreate-worktree', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: jsonHeaders(),
         body: JSON.stringify({
           session_id: session.id,
           real_cwd: realCwd,
@@ -2572,7 +2767,7 @@ async function pollRemote(){
     document.getElementById('autoSyncStatus').style.color='#f9e2af';
     var remote=await fetch('http://'+remoteHost+':'+remotePort+'/api/manifest',{
       headers:{'Authorization':'Bearer '+remotePinVal}}).then(function(r){return r.json()});
-    var local=await fetch('/api/manifest').then(function(r){return r.json()});
+    var local=await fetch('/api/manifest',{headers:localAuthHeaders()}).then(function(r){return r.json()});
     if(_lastRemoteHash!==null&&remote.hash!==_lastRemoteHash){
       _syncBusy=true;
       document.getElementById('autoSyncStatus').textContent='Syncing...';
@@ -2595,7 +2790,7 @@ async function pollRemote(){
 }
 
 async function autoPullSessions(){
-  var lr=await fetch('/api/sessions').then(function(r){return r.json()});
+  var lr=await fetch('/api/sessions',{headers:localAuthHeaders()}).then(function(r){return r.json()});
   var rr=await fetch('http://'+remoteHost+':'+remotePort+'/api/sessions',{
     headers:{'Authorization':'Bearer '+remotePinVal}}).then(function(r){return r.json()});
   var localIds={};
@@ -2605,21 +2800,21 @@ async function autoPullSessions(){
   });
   if(!toPull.length) return;
   var ids=toPull.map(function(s){return s.id});
-  await fetch('/api/pull/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
+  await fetch('/api/pull/sessions',{method:'POST',headers:jsonHeaders(),
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,session_ids:ids})});
   showToast('Auto-pulled '+ids.length+' session(s)','success');
   if(document.querySelector('[data-tab="sessions"]').classList.contains('active')) loadSessions();
 }
 
 async function autoPullProviders(){
-  var lr=await fetch('/api/providers').then(function(r){return r.json()});
+  var lr=await fetch('/api/providers',{headers:localAuthHeaders()}).then(function(r){return r.json()});
   var rr=await fetch('http://'+remoteHost+':'+remotePort+'/api/providers',{
     headers:{'Authorization':'Bearer '+remotePinVal}}).then(function(r){return r.json()});
   var localNames=new Set((lr.providers||[]).map(function(p){return p.name}));
   var toPull=(rr.providers||[]).filter(function(p){return !localNames.has(p.name)});
   if(!toPull.length) return;
   var names=toPull.map(function(p){return p.name});
-  await fetch('/api/pull/providers',{method:'POST',headers:{'Content-Type':'application/json'},
+  await fetch('/api/pull/providers',{method:'POST',headers:jsonHeaders(),
     body:JSON.stringify({remote_host:remoteHost,remote_port:remotePort,remote_pin:remotePinVal,names:names,mode:'with_key'})});
   showToast('Auto-pulled '+names.length+' provider(s)','success');
 }
@@ -2643,7 +2838,7 @@ async function scanForServers(){
   document.getElementById('scanStatus').textContent='Listening for beacons (5s)...';
   document.getElementById('discoveredList').innerHTML='';
   try{
-    const r=await fetch('/api/scan-beacons');
+    const r=await fetch('/api/scan-beacons',{headers:localAuthHeaders()});
     const d=await r.json();
     const servers=d.servers||[];
     if(servers.length===0){
@@ -2704,12 +2899,12 @@ function renderTrustedDevices(devices){
 }
 
 async function unpairDevice(idx){
-  const devices=await fetch('/api/trusted').then(r=>r.json());
+  const devices=await fetch('/api/trusted',{headers:localAuthHeaders()}).then(r=>r.json());
   const list=devices.devices||[];
   if(!list[idx]) return;
   const name=list[idx].name;
   if(!await showModal('Unpair device "'+name+'"?')) return;
-  await fetch('/api/unpair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_name:name})});
+  await fetch('/api/unpair',{method:'POST',headers:jsonHeaders(),body:JSON.stringify({device_name:name})});
   // Refresh
   const info=await fetch('/api/local-info').then(r=>r.json());
   renderTrustedDevices(info.trusted||[]);
@@ -2720,7 +2915,7 @@ async function saveServerName(){
   const name=document.getElementById('settingServerName').value.trim();
   if(!name) return;
   try{
-    await fetch('/api/server-name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})});
+    await fetch('/api/server-name',{method:'POST',headers:jsonHeaders(),body:JSON.stringify({name:name})});
     showToast('Server name updated','success');
   }catch(e){showToast('Error: '+e.message,'error')}
 }
