@@ -1025,6 +1025,53 @@ def test_droid_add_neurogate_preserves_base_selection_defaults():
         assert "custom:NeuroGate-GPT-5.5-1" in ctx["settings"]["modelFavorites"]
 
 
+def test_droid_add_neurogate_preserves_base_model_when_local_models_empty():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        (home / "settings.json").write_text(
+            json.dumps(
+                {
+                    "model": "custom:base-existing",
+                    "reasoningEffort": "low",
+                    "modelFavorites": ["custom:base-existing"],
+                    "sessionDefaultSettings": {
+                        "model": "custom:base-existing",
+                        "reasoningEffort": "low",
+                    },
+                    "customModels": [
+                        {
+                            "id": "custom:base-existing",
+                            "model": "base-existing",
+                            "displayName": "Base Existing",
+                            "baseUrl": "https://base.invalid/v1",
+                            "provider": "openai",
+                            "apiKey": "${BASE_KEY}",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (home / "settings.local.json").write_text(
+            json.dumps({"customModels": [], "modelFavorites": []}),
+            encoding="utf-8",
+        )
+
+        summary = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
+        ctx = droid.load_factory_context(home)
+        ids = [model["id"] for model in ctx["models"]]
+
+        assert summary["added"] == 3
+        assert ctx["settings"]["model"] == "custom:base-existing"
+        assert ctx["settings"]["reasoningEffort"] == "low"
+        assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:base-existing"
+        assert ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "low"
+        assert "custom:base-existing" in ids, "base model should be copied into local before adding NeuroGate"
+        assert "custom:NeuroGate-GPT-5.5-1" in ids
+        assert "custom:base-existing" in ctx["settings"]["modelFavorites"]
+        assert "custom:NeuroGate-GPT-5.5-1" in ctx["settings"]["modelFavorites"]
+
+
 def test_droid_use_model_updates_top_level_and_session_defaults():
     with tempfile.TemporaryDirectory() as td:
         home = Path(td)
@@ -2289,6 +2336,7 @@ if __name__ == "__main__":
     test("droid add_neurogate is idempotent and uses env key", test_droid_add_neurogate_is_idempotent_and_uses_env_key)
     test("droid add_neurogate preserves existing selection defaults", test_droid_add_neurogate_preserves_existing_selection_defaults)
     test("droid add_neurogate preserves base selection defaults", test_droid_add_neurogate_preserves_base_selection_defaults)
+    test("droid add_neurogate preserves base model when local models empty", test_droid_add_neurogate_preserves_base_model_when_local_models_empty)
     test("droid use_model updates top-level and session defaults", test_droid_use_model_updates_top_level_and_session_defaults)
     test("droid remove_model only removes local managed model", test_droid_remove_model_only_removes_local_managed_model)
     test("droid remove_model repoints effective base selection", test_droid_remove_model_repoints_effective_base_selection)

@@ -273,14 +273,26 @@ def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api
     ctx = load_factory_context(home)
     _, local_settings = _local_settings(home)
     local_settings = copy.deepcopy(local_settings or {})
-    if "customModels" in local_settings:
-        custom_models = copy.deepcopy(local_settings.get("customModels") or [])
-    else:
-        custom_models = copy.deepcopy(ctx["settings"].get("customModels") or [])
-    if "modelFavorites" in local_settings:
-        favorites = list(local_settings.get("modelFavorites") or [])
-    else:
-        favorites = list(ctx["settings"].get("modelFavorites") or [])
+    custom_models = []
+    for source_model in copy.deepcopy(ctx["base_settings"].get("customModels") or []):
+        if isinstance(source_model, dict):
+            custom_models.append(source_model)
+    for source_model in copy.deepcopy(local_settings.get("customModels") or []):
+        if not isinstance(source_model, dict):
+            continue
+        index = _model_index(custom_models, source_model.get("id"))
+        if index == -1:
+            custom_models.append(source_model)
+        else:
+            custom_models[index] = source_model
+
+    favorites = []
+    for favorite in (ctx["base_settings"].get("modelFavorites") or []):
+        if favorite not in favorites:
+            favorites.append(favorite)
+    for favorite in (local_settings.get("modelFavorites") or []):
+        if favorite not in favorites:
+            favorites.append(favorite)
     managed_models = neurogate_models(api_key_env=api_key_env, api_key=api_key)
     added = 0
     updated = 0
@@ -301,10 +313,7 @@ def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api
 
     local_settings["customModels"] = custom_models
     local_settings["modelFavorites"] = favorites
-    if "sessionDefaultSettings" in local_settings:
-        session_defaults = copy.deepcopy(local_settings.get("sessionDefaultSettings") or {})
-    else:
-        session_defaults = copy.deepcopy(ctx["settings"].get("sessionDefaultSettings") or {})
+    session_defaults = copy.deepcopy(ctx["settings"].get("sessionDefaultSettings") or {})
 
     if not ctx["settings"].get("model"):
         local_settings["model"] = model_ids[0]

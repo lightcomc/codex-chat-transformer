@@ -290,7 +290,7 @@ def test_droid_add_neurogate_is_idempotent_and_uses_env_key():
         assert ctx["settings"]["model"] == "custom:NeuroGate-GPT-5.5-1"
         raw = (home / "settings.local.json").read_text(encoding="utf-8")
         assert "${NEUROGATE_API_KEY}" in raw
-        assert list(home.glob("settings.local.json.bak-*")), "write should create a backup"
+        assert list(home.glob("settings.local.json.*.bak")), "write should create a backup"
 
 
 def test_droid_use_model_updates_top_level_and_session_defaults():
@@ -419,8 +419,17 @@ def neurogate_models(api_key_env="NEUROGATE_API_KEY", api_key=None):
 
 def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api_key=None):
     home = Path(factory_home) if factory_home else FACTORY_DIR
+    ctx = load_factory_context(home)
     local = _local_settings(home)
-    models = list(local.get("customModels", []) or [])
+    models = []
+    for item in (ctx["base_settings"].get("customModels", []) or []):
+        models.append(copy.deepcopy(item))
+    for item in (local.get("customModels", []) or []):
+        idx = _model_index(models, item.get("id"))
+        if idx is None:
+            models.append(copy.deepcopy(item))
+        else:
+            models[idx] = copy.deepcopy(item)
     added = 0
     updated = 0
     for model in neurogate_models(api_key_env=api_key_env, api_key=api_key):
@@ -432,11 +441,18 @@ def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api
             models[idx] = model
             updated += 1
     local["customModels"] = models
-    local.setdefault("modelFavorites", [])
+    existing_favorites = list(local.get("modelFavorites", []) or [])
+    local["modelFavorites"] = []
+    for fav in (ctx["base_settings"].get("modelFavorites", []) or []):
+        if fav not in local["modelFavorites"]:
+            local["modelFavorites"].append(fav)
+    for fav in existing_favorites:
+        if fav not in local["modelFavorites"]:
+            local["modelFavorites"].append(fav)
     for fav in ("custom:NeuroGate-GPT-5.5-1", "custom:NeuroGate-GPT-5.4-2", "custom:NeuroGate-GPT-5.4-Mini-3"):
         if fav not in local["modelFavorites"]:
             local["modelFavorites"].append(fav)
-    effective = load_factory_context(home)["settings"]
+    effective = ctx["settings"]
     if not effective.get("model"):
         local["model"] = "custom:NeuroGate-GPT-5.5-1"
     if not effective.get("reasoningEffort"):
