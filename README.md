@@ -134,6 +134,21 @@ Auto-detect:
 python codex_chat_transformer.py --detect-provider
 ```
 
+### Factory Droid Models
+
+The tool can also manage Factory Droid custom models/endpoints without rewriting the commented `~/.factory/settings.json` or touching Factory auth files.
+
+```bash
+python codex_chat_transformer.py --droid-models
+python codex_chat_transformer.py --droid-doctor
+python codex_chat_transformer.py --droid-add-neurogate
+python codex_chat_transformer.py --droid-use custom:NeuroGate-GPT-5.5-1 --set-reasoning medium
+python codex_chat_transformer.py --droid-import-provider OpenRouter --droid-api-key-env OPENROUTER_API_KEY
+python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
+```
+
+Droid writes go to `~/.factory/settings.local.json`. Existing `settings.json`, legacy `config.json`, and Factory auth files remain untouched. By default API keys are written as environment variable references such as `${NEUROGATE_API_KEY}`; direct key writes require `--droid-with-key --api-key ...`.
+
 ### Pin Chats
 
 Makes chats visible regardless of the active provider. Pinned chats always appear in the sidebar. Used for reactivating chats when transitioning between providers.

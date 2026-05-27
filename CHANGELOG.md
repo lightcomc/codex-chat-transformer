@@ -15,8 +15,14 @@
 - Added `.codex/operation_history.jsonl`, `--history`, and `--history-limit`; API keys, PINs, and auth payloads are redacted.
 - `--doctor` now reports provider profile health and treats `openai` + `chatgpt` auth as valid without an API key.
 
+### Factory Droid provider management
+- Added `--droid-models`, `--droid-doctor`, `--droid-add-neurogate`, `--droid-import-provider`, `--droid-use`, and `--droid-remove-model`.
+- Droid writes go to `settings.local.json`; existing `settings.json`, legacy `config.json`, and Factory auth files are left untouched.
+- API keys default to environment variable references such as `${NEUROGATE_API_KEY}`; direct key writes require `--droid-with-key --api-key ...`.
+- Droid doctor reports legacy `config.json` model count without failing healthy current `customModels` because legacy BYOK configs can still work.
+
 ### Tests
-- 65 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, and provider health checks.
+- 89 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, provider health checks, and Droid provider management.
 
 ## [1.3.0] — 2026-05-25
 

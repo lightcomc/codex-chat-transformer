@@ -851,6 +851,10 @@ def test_droid_loads_jsonc_empty_returns_empty_dict():
     assert droid.loads_jsonc("   \n\t") == {}
 
 
+def test_droid_loads_jsonc_accepts_utf8_bom():
+    assert droid.loads_jsonc('\ufeff{"model": "custom:with-bom"}')["model"] == "custom:with-bom"
+
+
 def test_droid_load_jsonc_file_missing_returns_empty_dict():
     with tempfile.TemporaryDirectory() as td:
         missing = Path(td) / "missing.json"
@@ -2521,6 +2525,7 @@ if __name__ == "__main__":
     test("droid JSONC parser respects strings", test_droid_jsonc_parser_respects_strings)
     test("droid JSONC parser discards unterminated block comments", test_droid_strip_jsonc_comments_discards_unterminated_block_comment)
     test("droid loads_jsonc empty returns empty dict", test_droid_loads_jsonc_empty_returns_empty_dict)
+    test("droid loads_jsonc accepts UTF-8 BOM", test_droid_loads_jsonc_accepts_utf8_bom)
     test("droid load_jsonc_file missing returns empty dict", test_droid_load_jsonc_file_missing_returns_empty_dict)
     test("droid merge_settings recursively merges and deep-copies", test_droid_merge_settings_recursively_merges_nested_dicts_and_deep_copies)
     test("droid normalize_current_model supports aliases and rejects invalid rows", test_droid_normalize_current_model_supports_alias_fields_and_invalid_rows)

@@ -75,7 +75,7 @@ def strip_jsonc_comments(text):
 
 
 def loads_jsonc(text):
-    stripped = strip_jsonc_comments(text)
+    stripped = strip_jsonc_comments(text.lstrip("\ufeff") if text else text)
     if not stripped.strip():
         return {}
     return json.loads(stripped)
@@ -85,7 +85,7 @@ def load_jsonc_file(path):
     path = Path(path)
     if not path.exists():
         return {}
-    return loads_jsonc(path.read_text(encoding="utf-8"))
+    return loads_jsonc(path.read_text(encoding="utf-8-sig"))
 
 
 def backup_file(path):

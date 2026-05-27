@@ -134,6 +134,21 @@ python codex_chat_transformer.py --providers
 python codex_chat_transformer.py --detect-provider
 ```
 
+### Модели Factory Droid
+
+Инструмент умеет управлять custom models/endpoints Factory Droid без перезаписи комментированного `%USERPROFILE%\.factory\settings.json` и без изменения Factory auth-файлов.
+
+```bash
+python codex_chat_transformer.py --droid-models
+python codex_chat_transformer.py --droid-doctor
+python codex_chat_transformer.py --droid-add-neurogate
+python codex_chat_transformer.py --droid-use custom:NeuroGate-GPT-5.5-1 --set-reasoning medium
+python codex_chat_transformer.py --droid-import-provider OpenRouter --droid-api-key-env OPENROUTER_API_KEY
+python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
+```
+
+Все записи Droid идут в `%USERPROFILE%\.factory\settings.local.json`. Существующие `settings.json`, legacy `config.json` и Factory auth-файлы не трогаются. По умолчанию API-ключи пишутся как ссылки на переменные окружения, например `${NEUROGATE_API_KEY}`; прямую запись ключа нужно явно включить через `--droid-with-key --api-key ...`.
+
 ### Закрепление чатов
 
 Делает чаты видимыми при **любом** подключении. Pinned-чаты показываются всегда, независимо от провайдера. Используется для реактивации чатов при переходе между провайдерами.

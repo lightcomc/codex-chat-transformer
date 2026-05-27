@@ -489,7 +489,7 @@ def record_history(action, status="ok", source="cli", **fields):
         path.parent.mkdir(parents=True, exist_ok=True)
         _rotate_history_if_needed(path)
         record = {
-            "ts": datetime.datetime.utcnow().isoformat() + "Z",
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
             "source": source,
             "action": action,
             "status": status,

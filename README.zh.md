@@ -134,6 +134,21 @@ python codex_chat_transformer.py --providers
 python codex_chat_transformer.py --detect-provider
 ```
 
+### Factory Droid 模型
+
+本工具也可以管理 Factory Droid custom models/endpoints，不会重写带注释的 `%USERPROFILE%\.factory\settings.json`，也不会修改 Factory auth 文件。
+
+```bash
+python codex_chat_transformer.py --droid-models
+python codex_chat_transformer.py --droid-doctor
+python codex_chat_transformer.py --droid-add-neurogate
+python codex_chat_transformer.py --droid-use custom:NeuroGate-GPT-5.5-1 --set-reasoning medium
+python codex_chat_transformer.py --droid-import-provider OpenRouter --droid-api-key-env OPENROUTER_API_KEY
+python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
+```
+
+Droid 写入目标是 `%USERPROFILE%\.factory\settings.local.json`。现有 `settings.json`、legacy `config.json` 和 Factory auth 文件保持不变。默认情况下 API key 会写成环境变量引用，例如 `${NEUROGATE_API_KEY}`；直接写入 key 需要显式使用 `--droid-with-key --api-key ...`。
+
 ### 固定聊天
 
 使聊天在任何活跃提供商下都可见。固定的聊天始终显示在侧边栏中。用于在提供商之间切换时重新激活聊天。
