@@ -857,11 +857,16 @@ def test_droid_effective_settings_merges_local_over_base():
 def test_droid_load_factory_context_reports_missing_optional_sources_and_reads_legacy_config():
     with tempfile.TemporaryDirectory() as td:
         home = Path(td)
+        ctx_empty = droid.load_factory_context(home)
+        assert ctx_empty["sources"]["settings"] == ""
+        assert ctx_empty["settings"] == {}
+
         (home / "settings.json").write_text(
             json.dumps({"model": "base"}),
             encoding="utf-8",
         )
         ctx_without_optional = droid.load_factory_context(home)
+        assert ctx_without_optional["sources"]["settings"].endswith("settings.json")
         assert ctx_without_optional["sources"]["settings_local"] == ""
         assert ctx_without_optional["sources"]["legacy_config"] == ""
         assert ctx_without_optional["local_settings"] == {}

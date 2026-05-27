@@ -183,7 +183,7 @@ def load_factory_context(factory_home=None, settings_path=None):
         "models": models,
         "legacy_models": legacy_models,
         "sources": {
-            "settings": str(settings_file),
+            "settings": str(settings_file) if settings_file.exists() else "",
             "settings_local": str(local_file) if local_file.exists() else "",
             "legacy_config": str(legacy_file) if legacy_file.exists() else "",
         },
