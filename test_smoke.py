@@ -1268,6 +1268,66 @@ def test_droid_remove_model_repoints_effective_base_selection():
         assert ctx["local_settings"]["sessionDefaultSettings"]["model"] == "custom:managed-two"
 
 
+def test_droid_import_codex_provider_defaults_to_env_key():
+    profile = {
+        "model_provider": "My Provider",
+        "model": "gpt-5.5",
+        "model_reasoning_effort": "medium",
+        "provider_section": '[model_providers.My_Provider]\nname = "My Provider"\nbase_url = "https://api.example.invalid/v1"\nwire_api = "responses"',
+        "auth.json": ct._encode_secret(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-hidden"})),
+    }
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        summary = droid.import_codex_provider(home, "My Provider", profile, api_key_env="MY_PROVIDER_API_KEY")
+        raw = (home / "settings.local.json").read_text(encoding="utf-8")
+        ctx = droid.load_factory_context(home)
+        model = ctx["models"][0]
+
+        assert summary["model_id"] == "custom:My_Provider"
+        assert summary["added"] == 1
+        assert summary["updated"] == 0
+        assert model["displayName"] == "My Provider"
+        assert model["baseUrl"] == "https://api.example.invalid/v1"
+        assert model["model"] == "gpt-5.5"
+        assert model["reasoningEffort"] == "medium"
+        assert "${MY_PROVIDER_API_KEY}" in raw
+        assert "sk-hidden" not in raw
+
+
+def test_droid_import_codex_provider_can_write_key_when_allowed():
+    profile = {
+        "model_provider": "KeyProv",
+        "model": "gpt-5",
+        "provider_section": '[model_providers.KeyProv]\nname = "KeyProv"\nbase_url = "https://key.invalid/v1"',
+        "auth.json": ct._encode_secret(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-real"})),
+    }
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        summary = droid.import_codex_provider(home, "KeyProv", profile, with_key=True)
+        raw = (home / "settings.local.json").read_text(encoding="utf-8")
+        ctx = droid.load_factory_context(home)
+
+        assert summary["model_id"] == "custom:KeyProv"
+        assert summary["added"] == 1
+        assert summary["updated"] == 0
+        assert ctx["models"][0]["apiKey"] == "sk-real"
+        assert "sk-real" in raw
+
+
+def test_droid_codex_profile_to_model_requires_base_url():
+    profile = {
+        "model_provider": "Broken",
+        "model": "gpt-5",
+        "provider_section": '[model_providers.Broken]\nname = "Broken"',
+    }
+    try:
+        droid.codex_profile_to_model("Broken", profile)
+    except ValueError as exc:
+        assert "base_url" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for provider without base_url")
+
+
 def test_doctor_report_accepts_chatgpt_auth_without_api_key():
     original, tmp_dir = setup_temp_codex_home()
     old_running = ct.is_codex_running
@@ -2340,6 +2400,9 @@ if __name__ == "__main__":
     test("droid use_model updates top-level and session defaults", test_droid_use_model_updates_top_level_and_session_defaults)
     test("droid remove_model only removes local managed model", test_droid_remove_model_only_removes_local_managed_model)
     test("droid remove_model repoints effective base selection", test_droid_remove_model_repoints_effective_base_selection)
+    test("droid import Codex provider defaults to env key", test_droid_import_codex_provider_defaults_to_env_key)
+    test("droid import Codex provider can write key when allowed", test_droid_import_codex_provider_can_write_key_when_allowed)
+    test("droid Codex profile mapping requires base_url", test_droid_codex_profile_to_model_requires_base_url)
     test("doctor accepts chatgpt auth without API key", test_doctor_report_accepts_chatgpt_auth_without_api_key)
     test("doctor flags provider health issues", test_doctor_report_flags_provider_health_issues)
 

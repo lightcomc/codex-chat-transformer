@@ -5,8 +5,10 @@ import copy
 import datetime
 import json
 import os
+import re
 import shutil
 import tempfile
+from base64 import b64decode
 from pathlib import Path
 
 FACTORY_DIR = Path(os.environ.get("FACTORY_HOME") or (Path.home() / ".factory"))
@@ -204,6 +206,65 @@ def _model_index(models, model_id):
     return -1
 
 
+def _safe_id(name):
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", (name or "").strip()).strip("_")
+    return safe or "Provider"
+
+
+def extract_toml_value(section, key):
+    pattern = re.compile(rf"^{re.escape(key)}\s*=\s*(.+)$")
+    for raw_line in (section or "").splitlines():
+        line = raw_line.strip()
+        match = pattern.match(line)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            return value[1:-1]
+        return value
+    return ""
+
+
+def extract_openai_key(profile):
+    raw = (profile or {}).get("auth.json", "")
+    if not isinstance(raw, str) or not raw:
+        return ""
+    try:
+        decoded = b64decode(raw[4:].encode("ascii")).decode("utf-8") if raw.startswith("b64:") else raw
+        payload = json.loads(decoded)
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    key = payload.get("OPENAI_API_KEY") or payload.get("api_key") or ""
+    return key if isinstance(key, str) else ""
+
+
+def codex_profile_to_model(name, profile, api_key_env=None, with_key=False):
+    profile = profile or {}
+    display_name = name or profile.get("model_provider") or profile.get("name") or "Provider"
+    safe_name = _safe_id(display_name)
+    base_url = extract_toml_value(profile.get("provider_section", ""), "base_url")
+    if not base_url:
+        raise ValueError(f"Codex provider '{display_name}' has no base_url")
+
+    key_value = extract_openai_key(profile)
+    env_name = api_key_env or f"{safe_name.upper().replace('-', '_').replace('.', '_')}_API_KEY"
+    model = {
+        "id": f"custom:{safe_name}",
+        "model": profile.get("model") or "gpt-5",
+        "displayName": display_name,
+        "baseUrl": base_url,
+        "reasoningEffort": profile.get("model_reasoning_effort") or "medium",
+        "provider": "openai",
+        "apiKey": f"${{{env_name}}}",
+        "managedBy": MANAGED_BY,
+    }
+    if with_key and key_value:
+        model["apiKey"] = key_value
+    return model
+
+
 def neurogate_models(api_key_env="NEUROGATE_API_KEY", api_key=None):
     api_key_value = api_key if api_key is not None else f"${{{api_key_env}}}"
     models = [
@@ -331,6 +392,49 @@ def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api
         "added": added,
         "updated": updated,
         "models": model_ids,
+        "path": result["path"],
+        "backup_path": result["backup_path"],
+    }
+
+
+def import_codex_provider(factory_home, name, profile, api_key_env=None, with_key=False):
+    home = Path(factory_home).expanduser().resolve() if factory_home is not None else FACTORY_DIR
+    ctx = load_factory_context(home)
+    _, local_settings = _local_settings(home)
+    local_settings = copy.deepcopy(local_settings or {})
+
+    custom_models = []
+    for source_model in copy.deepcopy(ctx["base_settings"].get("customModels") or []):
+        if isinstance(source_model, dict):
+            custom_models.append(source_model)
+    for source_model in copy.deepcopy(local_settings.get("customModels") or []):
+        if not isinstance(source_model, dict):
+            continue
+        index = _model_index(custom_models, source_model.get("id"))
+        if index == -1:
+            custom_models.append(source_model)
+        else:
+            custom_models[index] = source_model
+
+    model = codex_profile_to_model(name, profile, api_key_env=api_key_env, with_key=with_key)
+    index = _model_index(custom_models, model["id"])
+    added = 0
+    updated = 0
+    if index == -1:
+        custom_models.append(copy.deepcopy(model))
+        added = 1
+    elif custom_models[index] != model:
+        custom_models[index] = copy.deepcopy(model)
+        updated = 1
+
+    local_settings["customModels"] = custom_models
+
+    result = write_local_settings(home, local_settings)
+    return {
+        "added": added,
+        "updated": updated,
+        "model_id": model["id"],
+        "displayName": model["displayName"],
         "path": result["path"],
         "backup_path": result["backup_path"],
     }
