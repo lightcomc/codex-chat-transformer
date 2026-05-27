@@ -436,9 +436,15 @@ def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api
     for fav in ("custom:NeuroGate-GPT-5.5-1", "custom:NeuroGate-GPT-5.4-2", "custom:NeuroGate-GPT-5.4-Mini-3"):
         if fav not in local["modelFavorites"]:
             local["modelFavorites"].append(fav)
-    local["model"] = "custom:NeuroGate-GPT-5.5-1"
-    local["reasoningEffort"] = "medium"
-    local["sessionDefaultSettings"] = {"model": "custom:NeuroGate-GPT-5.5-1", "reasoningEffort": "medium"}
+    effective = load_factory_context(home)["settings"]
+    if not effective.get("model"):
+        local["model"] = "custom:NeuroGate-GPT-5.5-1"
+    if not effective.get("reasoningEffort"):
+        local["reasoningEffort"] = "medium"
+    defaults = dict(effective.get("sessionDefaultSettings", {}) or {})
+    defaults.setdefault("model", "custom:NeuroGate-GPT-5.5-1")
+    defaults.setdefault("reasoningEffort", "medium")
+    local["sessionDefaultSettings"] = defaults
     write = write_local_settings(home, local)
     return {"added": added, "updated": updated, "models": [m["id"] for m in neurogate_models()], **write}
 
@@ -929,4 +935,3 @@ git commit -m "docs: document Droid provider management"
 - No step writes Factory auth files or legacy `config.json`.
 - Direct API key writes are gated by `--droid-with-key`.
 - The smoke suite remains the source of truth for regression testing.
-

@@ -72,7 +72,7 @@ NeuroGate bootstrap creates:
 - `custom:NeuroGate-GPT-5.4-2`
 - `custom:NeuroGate-GPT-5.4-Mini-3`
 
-The bootstrap sets base URL to `https://api.neurogate.space/v1`, provider to `openai`, and active model to GPT-5.5 unless the user chooses a different model with `--droid-use`.
+The bootstrap sets base URL to `https://api.neurogate.space/v1` and provider to `openai`. If Droid has no active model yet, it initializes the active/default model to GPT-5.5 with medium reasoning. If Droid already has an active model in `settings.json` or `settings.local.json`, bootstrap preserves that selection and only adds the NeuroGate models/favorites.
 
 `--droid-use` writes both top-level `model` and `sessionDefaultSettings.model` to the selected model ID. It also writes top-level `reasoningEffort` and `sessionDefaultSettings.reasoningEffort` when a reasoning value is available. This keeps the local file compatible with both the current local settings shape and the NeuroGate template provided by the user.
 

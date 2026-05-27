@@ -270,10 +270,17 @@ def load_factory_context(factory_home=None, settings_path=None):
 
 def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api_key=None):
     home = Path(factory_home).expanduser().resolve() if factory_home is not None else FACTORY_DIR
+    ctx = load_factory_context(home)
     _, local_settings = _local_settings(home)
     local_settings = copy.deepcopy(local_settings or {})
-    custom_models = copy.deepcopy(local_settings.get("customModels") or [])
-    favorites = list(local_settings.get("modelFavorites") or [])
+    if "customModels" in local_settings:
+        custom_models = copy.deepcopy(local_settings.get("customModels") or [])
+    else:
+        custom_models = copy.deepcopy(ctx["settings"].get("customModels") or [])
+    if "modelFavorites" in local_settings:
+        favorites = list(local_settings.get("modelFavorites") or [])
+    else:
+        favorites = list(ctx["settings"].get("modelFavorites") or [])
     managed_models = neurogate_models(api_key_env=api_key_env, api_key=api_key)
     added = 0
     updated = 0
@@ -294,17 +301,21 @@ def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api
 
     local_settings["customModels"] = custom_models
     local_settings["modelFavorites"] = favorites
-    session_defaults = copy.deepcopy(local_settings.get("sessionDefaultSettings") or {})
+    if "sessionDefaultSettings" in local_settings:
+        session_defaults = copy.deepcopy(local_settings.get("sessionDefaultSettings") or {})
+    else:
+        session_defaults = copy.deepcopy(ctx["settings"].get("sessionDefaultSettings") or {})
 
-    if "model" not in local_settings:
+    if not ctx["settings"].get("model"):
         local_settings["model"] = model_ids[0]
-    if "reasoningEffort" not in local_settings:
+    if not ctx["settings"].get("reasoningEffort"):
         local_settings["reasoningEffort"] = "medium"
-    if "model" not in session_defaults:
+    if not session_defaults.get("model"):
         session_defaults["model"] = model_ids[0]
-    if "reasoningEffort" not in session_defaults:
+    if not session_defaults.get("reasoningEffort"):
         session_defaults["reasoningEffort"] = "medium"
-    local_settings["sessionDefaultSettings"] = session_defaults
+    if session_defaults:
+        local_settings["sessionDefaultSettings"] = session_defaults
 
     result = write_local_settings(home, local_settings)
     return {

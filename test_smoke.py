@@ -917,15 +917,24 @@ def test_droid_add_neurogate_is_idempotent_and_uses_env_key():
             "custom:NeuroGate-GPT-5.4-2",
             "custom:NeuroGate-GPT-5.4-Mini-3",
         ], f"expected the managed NeuroGate models in order: {ids}"
-        assert models[0]["model"] == "gpt-5.5"
-        assert models[0]["displayName"] == "NeuroGate GPT-5.5"
-        assert models[0]["raw"]["index"] == 1
-        assert models[1]["model"] == "gpt-5.4"
-        assert models[1]["displayName"] == "NeuroGate GPT-5.4"
-        assert models[1]["raw"]["index"] == 2
-        assert models[2]["model"] == "gpt-5.4-mini"
-        assert models[2]["displayName"] == "NeuroGate GPT-5.4 Mini"
-        assert models[2]["raw"]["index"] == 3
+        expected_payloads = [
+            ("gpt-5.5", "NeuroGate GPT-5.5", 1),
+            ("gpt-5.4", "NeuroGate GPT-5.4", 2),
+            ("gpt-5.4-mini", "NeuroGate GPT-5.4 Mini", 3),
+        ]
+        for model, expected in zip(models, expected_payloads):
+            model_name, display_name, index = expected
+            assert model["model"] == model_name
+            assert model["displayName"] == display_name
+            assert model["baseUrl"] == "https://api.neurogate.space/v1"
+            assert model["provider"] == "openai"
+            assert model["apiKey"] == "${NEUROGATE_API_KEY}"
+            assert model["reasoningEffort"] == "medium"
+            assert model["managed"]
+            assert model["raw"]["index"] == index
+            assert model["raw"]["maxOutputTokens"] == 128000
+            assert model["raw"]["noImageSupport"] is False
+            assert model["raw"]["managedBy"] == droid.MANAGED_BY
         assert ctx["settings"]["model"] == "custom:NeuroGate-GPT-5.5-1"
         assert ctx["settings"]["reasoningEffort"] == "medium"
         assert ctx["settings"]["modelFavorites"] == ids
@@ -972,6 +981,47 @@ def test_droid_add_neurogate_preserves_existing_selection_defaults():
         assert ctx["settings"]["reasoningEffort"] == "low"
         assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:keep-me"
         assert ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "low"
+        assert "custom:NeuroGate-GPT-5.5-1" in ctx["settings"]["modelFavorites"]
+
+
+def test_droid_add_neurogate_preserves_base_selection_defaults():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        (home / "settings.json").write_text(
+            json.dumps(
+                {
+                    "model": "custom:base-existing",
+                    "reasoningEffort": "low",
+                    "sessionDefaultSettings": {
+                        "model": "custom:base-existing",
+                        "reasoningEffort": "low",
+                    },
+                    "customModels": [
+                        {
+                            "id": "custom:base-existing",
+                            "model": "base-existing",
+                            "displayName": "Base Existing",
+                            "baseUrl": "https://base.invalid/v1",
+                            "provider": "openai",
+                            "apiKey": "${BASE_KEY}",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        summary = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
+        ctx = droid.load_factory_context(home)
+        ids = [model["id"] for model in ctx["models"]]
+
+        assert summary["added"] == 3
+        assert ctx["settings"]["model"] == "custom:base-existing"
+        assert ctx["settings"]["reasoningEffort"] == "low"
+        assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:base-existing"
+        assert ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "low"
+        assert "custom:base-existing" in ids, "base custom model should remain effective after local add"
+        assert "custom:NeuroGate-GPT-5.5-1" in ids
         assert "custom:NeuroGate-GPT-5.5-1" in ctx["settings"]["modelFavorites"]
 
 
@@ -2238,6 +2288,7 @@ if __name__ == "__main__":
     test("droid load_factory_context reports missing optional sources and reads legacy config", test_droid_load_factory_context_reports_missing_optional_sources_and_reads_legacy_config)
     test("droid add_neurogate is idempotent and uses env key", test_droid_add_neurogate_is_idempotent_and_uses_env_key)
     test("droid add_neurogate preserves existing selection defaults", test_droid_add_neurogate_preserves_existing_selection_defaults)
+    test("droid add_neurogate preserves base selection defaults", test_droid_add_neurogate_preserves_base_selection_defaults)
     test("droid use_model updates top-level and session defaults", test_droid_use_model_updates_top_level_and_session_defaults)
     test("droid remove_model only removes local managed model", test_droid_remove_model_only_removes_local_managed_model)
     test("droid remove_model repoints effective base selection", test_droid_remove_model_repoints_effective_base_selection)
