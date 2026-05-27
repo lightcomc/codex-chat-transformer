@@ -1328,6 +1328,48 @@ def test_droid_codex_profile_to_model_requires_base_url():
         raise AssertionError("expected ValueError for provider without base_url")
 
 
+def test_droid_extract_toml_value_ignores_inline_comments_outside_quotes():
+    section = '\n'.join([
+        '[model_providers.Commented]',
+        'base_url = "https://api.example.invalid/v1#inside" # trailing comment',
+        'wire_api = responses # another comment',
+    ])
+    assert droid.extract_toml_value(section, "base_url") == "https://api.example.invalid/v1#inside"
+    assert droid.extract_toml_value(section, "wire_api") == "responses"
+
+
+def test_droid_extract_openai_key_returns_empty_for_malformed_auth_payloads():
+    assert droid.extract_openai_key({"auth.json": "b64:not-valid-base64"}) == ""
+    assert droid.extract_openai_key({"auth.json": "b64:bm90LWpzb24="}) == ""
+
+
+def test_droid_import_codex_provider_avoids_sanitized_id_collisions():
+    first_profile = {
+        "model_provider": "A/B",
+        "model": "gpt-5",
+        "provider_section": '[model_providers.A_B]\nname = "A/B"\nbase_url = "https://first.invalid/v1"',
+    }
+    second_profile = {
+        "model_provider": "A B",
+        "model": "gpt-5.5",
+        "provider_section": '[model_providers.A_B]\nname = "A B"\nbase_url = "https://second.invalid/v1"',
+    }
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        first = droid.import_codex_provider(home, "A/B", first_profile)
+        second = droid.import_codex_provider(home, "A B", second_profile)
+        ctx = droid.load_factory_context(home)
+        ids = [model["id"] for model in ctx["models"]]
+        names = [model["displayName"] for model in ctx["models"]]
+
+        assert first["model_id"] == "custom:A_B"
+        assert second["model_id"] == "custom:A_B-2"
+        assert ids == ["custom:A_B", "custom:A_B-2"], ids
+        assert names == ["A/B", "A B"], names
+        assert ctx["models"][0]["baseUrl"] == "https://first.invalid/v1"
+        assert ctx["models"][1]["baseUrl"] == "https://second.invalid/v1"
+
+
 def test_doctor_report_accepts_chatgpt_auth_without_api_key():
     original, tmp_dir = setup_temp_codex_home()
     old_running = ct.is_codex_running
@@ -2403,6 +2445,9 @@ if __name__ == "__main__":
     test("droid import Codex provider defaults to env key", test_droid_import_codex_provider_defaults_to_env_key)
     test("droid import Codex provider can write key when allowed", test_droid_import_codex_provider_can_write_key_when_allowed)
     test("droid Codex profile mapping requires base_url", test_droid_codex_profile_to_model_requires_base_url)
+    test("droid extract_toml_value ignores inline comments outside quotes", test_droid_extract_toml_value_ignores_inline_comments_outside_quotes)
+    test("droid extract_openai_key returns empty for malformed auth payloads", test_droid_extract_openai_key_returns_empty_for_malformed_auth_payloads)
+    test("droid import Codex provider avoids sanitized id collisions", test_droid_import_codex_provider_avoids_sanitized_id_collisions)
     test("doctor accepts chatgpt auth without API key", test_doctor_report_accepts_chatgpt_auth_without_api_key)
     test("doctor flags provider health issues", test_doctor_report_flags_provider_health_issues)
 

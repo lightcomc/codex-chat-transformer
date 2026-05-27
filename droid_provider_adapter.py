@@ -211,6 +211,30 @@ def _safe_id(name):
     return safe or "Provider"
 
 
+def _strip_toml_inline_comment(value):
+    chars = []
+    quote = ""
+    escaped = False
+    for char in value:
+        if quote:
+            chars.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in ('"', "'"):
+            quote = char
+            chars.append(char)
+            continue
+        if char == "#":
+            break
+        chars.append(char)
+    return "".join(chars).strip()
+
+
 def extract_toml_value(section, key):
     pattern = re.compile(rf"^{re.escape(key)}\s*=\s*(.+)$")
     for raw_line in (section or "").splitlines():
@@ -218,7 +242,7 @@ def extract_toml_value(section, key):
         match = pattern.match(line)
         if not match:
             continue
-        value = match.group(1).strip()
+        value = _strip_toml_inline_comment(match.group(1).strip())
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
             return value[1:-1]
         return value
@@ -263,6 +287,34 @@ def codex_profile_to_model(name, profile, api_key_env=None, with_key=False):
     if with_key and key_value:
         model["apiKey"] = key_value
     return model
+
+
+def _same_managed_import_target(model, display_name):
+    return (
+        isinstance(model, dict)
+        and model.get("managedBy") == MANAGED_BY
+        and model.get("displayName") == display_name
+    )
+
+
+def _next_available_model_id(models, base_model_id, display_name):
+    existing_ids = {
+        model.get("id")
+        for model in (models or [])
+        if isinstance(model, dict) and model.get("id")
+    }
+    for model in models or []:
+        if _same_managed_import_target(model, display_name):
+            return model.get("id") or base_model_id
+    if base_model_id not in existing_ids:
+        return base_model_id
+
+    suffix = 2
+    while True:
+        candidate = f"{base_model_id}-{suffix}"
+        if candidate not in existing_ids:
+            return candidate
+        suffix += 1
 
 
 def neurogate_models(api_key_env="NEUROGATE_API_KEY", api_key=None):
@@ -417,6 +469,7 @@ def import_codex_provider(factory_home, name, profile, api_key_env=None, with_ke
             custom_models[index] = source_model
 
     model = codex_profile_to_model(name, profile, api_key_env=api_key_env, with_key=with_key)
+    model["id"] = _next_available_model_id(custom_models, model["id"], model["displayName"])
     index = _model_index(custom_models, model["id"])
     added = 0
     updated = 0
