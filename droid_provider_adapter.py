@@ -6,6 +6,7 @@ import datetime
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 FACTORY_DIR = Path(os.environ.get("FACTORY_HOME") or (Path.home() / ".factory"))
@@ -87,9 +88,16 @@ def load_jsonc_file(path):
 
 def backup_file(path):
     path = Path(path)
-    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
-    backup_path = path.with_name(f"{path.name}.{timestamp}.bak")
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    backup_dir = path.parent
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    suffix = 0
+    while True:
+        name = f"{path.name}.{timestamp}.bak" if suffix == 0 else f"{path.name}.{timestamp}.{suffix}.bak"
+        backup_path = backup_dir / name
+        if not backup_path.exists():
+            break
+        suffix += 1
     if path.exists():
         shutil.copy2(path, backup_path)
     else:
@@ -114,7 +122,16 @@ def write_local_settings(home, data):
     home.mkdir(parents=True, exist_ok=True)
     path = home / LOCAL_SETTINGS_NAME
     backup_path = backup_file(path)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    rendered = json.dumps(data, indent=2, ensure_ascii=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{LOCAL_SETTINGS_NAME}.", suffix=".tmp", dir=str(home))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(rendered)
+        Path(tmp_name).replace(path)
+    finally:
+        tmp_path = Path(tmp_name)
+        if tmp_path.exists():
+            tmp_path.unlink()
     return {"path": path, "backup_path": backup_path}
 
 
@@ -189,30 +206,26 @@ def _model_index(models, model_id):
 
 def neurogate_models(api_key_env="NEUROGATE_API_KEY", api_key=None):
     api_key_value = api_key if api_key is not None else f"${{{api_key_env}}}"
-    base_url = "https://api.neurogate.space/v1"
-    provider = "openai"
-    max_output_tokens = 128000
-    reasoning_effort = "medium"
-    no_image_support = False
     models = [
-        ("custom:NeuroGate-GPT-5.5-1", "NeuroGate-GPT-5.5-1"),
-        ("custom:NeuroGate-GPT-5.4-2", "NeuroGate-GPT-5.4-2"),
-        ("custom:NeuroGate-GPT-5.4-Mini-3", "NeuroGate-GPT-5.4-Mini-3"),
+        ("custom:NeuroGate-GPT-5.5-1", "gpt-5.5", "NeuroGate GPT-5.5", 1),
+        ("custom:NeuroGate-GPT-5.4-2", "gpt-5.4", "NeuroGate GPT-5.4", 2),
+        ("custom:NeuroGate-GPT-5.4-Mini-3", "gpt-5.4-mini", "NeuroGate GPT-5.4 Mini", 3),
     ]
     return [
         {
             "id": model_id,
             "model": model_name,
-            "displayName": model_name,
-            "baseUrl": base_url,
-            "provider": provider,
+            "displayName": display_name,
+            "index": index,
+            "baseUrl": "https://api.neurogate.space/v1",
+            "provider": "openai",
             "apiKey": api_key_value,
-            "maxOutputTokens": max_output_tokens,
-            "reasoningEffort": reasoning_effort,
-            "noImageSupport": no_image_support,
+            "maxOutputTokens": 128000,
+            "reasoningEffort": "medium",
+            "noImageSupport": False,
             "managedBy": MANAGED_BY,
         }
-        for model_id, model_name in models
+        for model_id, model_name, display_name, index in models
     ]
 
 
@@ -257,7 +270,7 @@ def load_factory_context(factory_home=None, settings_path=None):
 
 def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api_key=None):
     home = Path(factory_home).expanduser().resolve() if factory_home is not None else FACTORY_DIR
-    path, local_settings = _local_settings(home)
+    _, local_settings = _local_settings(home)
     local_settings = copy.deepcopy(local_settings or {})
     custom_models = copy.deepcopy(local_settings.get("customModels") or [])
     favorites = list(local_settings.get("modelFavorites") or [])
@@ -281,11 +294,16 @@ def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api
 
     local_settings["customModels"] = custom_models
     local_settings["modelFavorites"] = favorites
-    local_settings["model"] = model_ids[0]
-    local_settings["reasoningEffort"] = "medium"
     session_defaults = copy.deepcopy(local_settings.get("sessionDefaultSettings") or {})
-    session_defaults["model"] = model_ids[0]
-    session_defaults["reasoningEffort"] = "medium"
+
+    if "model" not in local_settings:
+        local_settings["model"] = model_ids[0]
+    if "reasoningEffort" not in local_settings:
+        local_settings["reasoningEffort"] = "medium"
+    if "model" not in session_defaults:
+        session_defaults["model"] = model_ids[0]
+    if "reasoningEffort" not in session_defaults:
+        session_defaults["reasoningEffort"] = "medium"
     local_settings["sessionDefaultSettings"] = session_defaults
 
     result = write_local_settings(home, local_settings)
@@ -340,18 +358,20 @@ def remove_model(factory_home, model_id):
 
     del custom_models[index]
     local_settings["customModels"] = custom_models
+    replacement_model_id = custom_models[0]["id"] if custom_models else ""
 
     favorites = [favorite for favorite in (local_settings.get("modelFavorites") or []) if favorite != model_id]
     if favorites or "modelFavorites" in local_settings:
         local_settings["modelFavorites"] = favorites
 
-    if local_settings.get("model") == model_id:
-        local_settings["model"] = ""
+    if ctx["settings"].get("model") == model_id:
+        local_settings["model"] = replacement_model_id
 
     session_defaults = copy.deepcopy(local_settings.get("sessionDefaultSettings") or {})
-    if session_defaults.get("model") == model_id:
-        session_defaults["model"] = ""
-    if session_defaults or "sessionDefaultSettings" in local_settings:
+    effective_session_defaults = copy.deepcopy(ctx["settings"].get("sessionDefaultSettings") or {})
+    if effective_session_defaults.get("model") == model_id:
+        session_defaults["model"] = replacement_model_id
+    if session_defaults or "sessionDefaultSettings" in local_settings or effective_session_defaults.get("model") == model_id:
         local_settings["sessionDefaultSettings"] = session_defaults
 
     result = write_local_settings(home, local_settings)

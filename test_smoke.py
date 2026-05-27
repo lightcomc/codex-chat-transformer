@@ -905,7 +905,8 @@ def test_droid_add_neurogate_is_idempotent_and_uses_env_key():
         summary1 = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
         summary2 = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
         ctx = droid.load_factory_context(home)
-        ids = [model["id"] for model in ctx["models"]]
+        models = ctx["models"]
+        ids = [model["id"] for model in models]
 
         assert summary1["added"] == 3, f"first add should create three models: {summary1}"
         assert summary1["updated"] == 0, f"first add should not count updates for new file: {summary1}"
@@ -916,6 +917,15 @@ def test_droid_add_neurogate_is_idempotent_and_uses_env_key():
             "custom:NeuroGate-GPT-5.4-2",
             "custom:NeuroGate-GPT-5.4-Mini-3",
         ], f"expected the managed NeuroGate models in order: {ids}"
+        assert models[0]["model"] == "gpt-5.5"
+        assert models[0]["displayName"] == "NeuroGate GPT-5.5"
+        assert models[0]["raw"]["index"] == 1
+        assert models[1]["model"] == "gpt-5.4"
+        assert models[1]["displayName"] == "NeuroGate GPT-5.4"
+        assert models[1]["raw"]["index"] == 2
+        assert models[2]["model"] == "gpt-5.4-mini"
+        assert models[2]["displayName"] == "NeuroGate GPT-5.4 Mini"
+        assert models[2]["raw"]["index"] == 3
         assert ctx["settings"]["model"] == "custom:NeuroGate-GPT-5.5-1"
         assert ctx["settings"]["reasoningEffort"] == "medium"
         assert ctx["settings"]["modelFavorites"] == ids
@@ -926,6 +936,43 @@ def test_droid_add_neurogate_is_idempotent_and_uses_env_key():
         assert "${NEUROGATE_API_KEY}" in raw, "expected env var reference in local settings"
         assert summary1["backup_path"].exists(), f"backup should be created on first write: {summary1}"
         assert summary2["backup_path"].exists(), f"backup should be created on repeated write: {summary2}"
+        assert summary1["backup_path"] != summary2["backup_path"], "rapid writes should get unique backups"
+
+
+def test_droid_add_neurogate_preserves_existing_selection_defaults():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        droid.write_local_settings(
+            home,
+            {
+                "model": "custom:keep-me",
+                "reasoningEffort": "low",
+                "sessionDefaultSettings": {
+                    "model": "custom:keep-me",
+                    "reasoningEffort": "low",
+                },
+                "customModels": [
+                    {
+                        "id": "custom:keep-me",
+                        "model": "keep-me",
+                        "displayName": "Keep Me",
+                        "baseUrl": "https://keep.invalid/v1",
+                        "provider": "openai",
+                        "apiKey": "${KEEP_KEY}",
+                    }
+                ],
+            },
+        )
+
+        summary = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
+        ctx = droid.load_factory_context(home)
+
+        assert summary["added"] == 3
+        assert ctx["settings"]["model"] == "custom:keep-me"
+        assert ctx["settings"]["reasoningEffort"] == "low"
+        assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:keep-me"
+        assert ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "low"
+        assert "custom:NeuroGate-GPT-5.5-1" in ctx["settings"]["modelFavorites"]
 
 
 def test_droid_use_model_updates_top_level_and_session_defaults():
@@ -1055,10 +1102,10 @@ def test_droid_remove_model_only_removes_local_managed_model():
 
         assert summary["model_id"] == "custom:managed-one"
         assert ids == ["custom:managed-two", "custom:foreign"], f"only the targeted local model should be removed: {ids}"
-        assert ctx["local_settings"]["model"] == "", "selected local model should be cleared when removed"
-        assert ctx["local_settings"]["sessionDefaultSettings"]["model"] == "", "session default should be cleared when removed"
-        assert ctx["settings"]["model"] == "", "effective selected model should be cleared instead of falling back silently"
-        assert ctx["settings"]["sessionDefaultSettings"]["model"] == ""
+        assert ctx["local_settings"]["model"] == "custom:managed-two", "selected local model should repoint to a remaining local model"
+        assert ctx["local_settings"]["sessionDefaultSettings"]["model"] == "custom:managed-two", "session default should repoint to a remaining local model"
+        assert ctx["settings"]["model"] == "custom:managed-two"
+        assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:managed-two"
         assert ctx["settings"]["modelFavorites"] == ["custom:managed-two", "custom:foreign", "custom:base-only"]
         assert summary["backup_path"].exists(), f"removal should create a backup: {summary}"
 
@@ -1075,6 +1122,53 @@ def test_droid_remove_model_only_removes_local_managed_model():
             assert "managed" in str(exc)
         else:
             raise AssertionError("expected ValueError when removing an unmanaged local model")
+
+
+def test_droid_remove_model_repoints_effective_base_selection():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        (home / "settings.json").write_text(
+            json.dumps(
+                {
+                    "model": "custom:managed-one",
+                    "sessionDefaultSettings": {"model": "custom:managed-one"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        droid.write_local_settings(
+            home,
+            {
+                "customModels": [
+                    {
+                        "id": "custom:managed-one",
+                        "model": "managed-one",
+                        "displayName": "Managed One",
+                        "baseUrl": "https://managed-one.invalid/v1",
+                        "provider": "openai",
+                        "apiKey": "${ONE_KEY}",
+                        "managedBy": droid.MANAGED_BY,
+                    },
+                    {
+                        "id": "custom:managed-two",
+                        "model": "managed-two",
+                        "displayName": "Managed Two",
+                        "baseUrl": "https://managed-two.invalid/v1",
+                        "provider": "openai",
+                        "apiKey": "${TWO_KEY}",
+                        "managedBy": droid.MANAGED_BY,
+                    },
+                ]
+            },
+        )
+
+        droid.remove_model(home, "custom:managed-one")
+        ctx = droid.load_factory_context(home)
+
+        assert ctx["settings"]["model"] == "custom:managed-two"
+        assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:managed-two"
+        assert ctx["local_settings"]["model"] == "custom:managed-two"
+        assert ctx["local_settings"]["sessionDefaultSettings"]["model"] == "custom:managed-two"
 
 
 def test_doctor_report_accepts_chatgpt_auth_without_api_key():
@@ -2143,8 +2237,10 @@ if __name__ == "__main__":
     test("droid effective settings merges local over base", test_droid_effective_settings_merges_local_over_base)
     test("droid load_factory_context reports missing optional sources and reads legacy config", test_droid_load_factory_context_reports_missing_optional_sources_and_reads_legacy_config)
     test("droid add_neurogate is idempotent and uses env key", test_droid_add_neurogate_is_idempotent_and_uses_env_key)
+    test("droid add_neurogate preserves existing selection defaults", test_droid_add_neurogate_preserves_existing_selection_defaults)
     test("droid use_model updates top-level and session defaults", test_droid_use_model_updates_top_level_and_session_defaults)
     test("droid remove_model only removes local managed model", test_droid_remove_model_only_removes_local_managed_model)
+    test("droid remove_model repoints effective base selection", test_droid_remove_model_repoints_effective_base_selection)
     test("doctor accepts chatgpt auth without API key", test_doctor_report_accepts_chatgpt_auth_without_api_key)
     test("doctor flags provider health issues", test_doctor_report_flags_provider_health_issues)
 
