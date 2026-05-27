@@ -797,6 +797,32 @@ def test_droid_history_redacts_key():
         restore_temp_codex_home(original, tmp_dir)
 
 
+def test_droid_doctor_ignores_legacy_model_issues():
+    ctx = {
+        "home": Path(tempfile.gettempdir()),
+        "settings": {"model": "custom:good"},
+        "models": [
+            {
+                "id": "custom:good",
+                "baseUrl": "https://good.invalid/v1",
+                "apiKey": "${GOOD_KEY}",
+            }
+        ],
+        "legacy_models": [
+            {
+                "id": "custom:legacy-broken",
+                "baseUrl": "",
+                "apiKey": "",
+            }
+        ],
+    }
+    report = ct._droid_doctor_report(ctx)
+    assert report["ok"] is True, f"legacy-only issues should not fail Droid doctor: {report}"
+    assert report["issues"] == []
+    assert report["model_count"] == 1
+    assert report["legacy_count"] == 1
+
+
 def test_droid_jsonc_parser_respects_strings():
     text = """
     // top comment
@@ -2491,6 +2517,7 @@ if __name__ == "__main__":
     test("provider action emits history without secret", test_provider_action_emits_history_without_secret)
     test("droid CLI flags are registered", test_droid_cli_flags_registered)
     test("droid history redacts keys", test_droid_history_redacts_key)
+    test("droid doctor ignores legacy model issues", test_droid_doctor_ignores_legacy_model_issues)
     test("droid JSONC parser respects strings", test_droid_jsonc_parser_respects_strings)
     test("droid JSONC parser discards unterminated block comments", test_droid_strip_jsonc_comments_discards_unterminated_block_comment)
     test("droid loads_jsonc empty returns empty dict", test_droid_loads_jsonc_empty_returns_empty_dict)

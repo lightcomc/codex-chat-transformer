@@ -2184,9 +2184,8 @@ def _droid_doctor_report(ctx):
     issues = []
     seen_ids = {}
     current_models = ctx.get("models") or []
-    legacy_models = ctx.get("legacy_models") or []
 
-    for model in current_models + legacy_models:
+    for model in current_models:
         model_id = model.get("id") or "?"
         seen_ids[model_id] = seen_ids.get(model_id, 0) + 1
         if not model.get("baseUrl"):
@@ -2202,7 +2201,7 @@ def _droid_doctor_report(ctx):
         "ok": not issues,
         "issues": issues,
         "model_count": len(current_models),
-        "legacy_count": len(legacy_models),
+        "legacy_count": len(ctx.get("legacy_models") or []),
         "home": str(ctx.get("home") or ""),
         "active_model": ctx.get("settings", {}).get("model") or "",
     }
