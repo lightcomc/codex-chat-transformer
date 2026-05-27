@@ -59,6 +59,8 @@ def strip_jsonc_comments(text):
                 index += 1
             if index + 1 < len(text):
                 index += 2
+            else:
+                index = len(text)
             continue
 
         chars.append(char)
@@ -82,9 +84,14 @@ def load_jsonc_file(path):
 
 
 def merge_settings(base, local):
-    merged = copy.deepcopy(base or {})
-    for key, value in (local or {}).items():
-        merged[key] = copy.deepcopy(value)
+    base = base or {}
+    local = local or {}
+    merged = copy.deepcopy(base)
+    for key, value in local.items():
+        if isinstance(merged.get(key), dict) and isinstance(value, dict):
+            merged[key] = merge_settings(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
     return merged
 
 
@@ -93,17 +100,17 @@ def normalize_current_model(raw, source):
         return None
 
     model_id = raw.get("id") or raw.get("model")
-    model_name = raw.get("model") or raw.get("id")
+    model_name = raw.get("model")
     if not model_id or not model_name:
         return None
 
     normalized = {
         "id": str(model_id),
         "model": str(model_name),
-        "displayName": raw.get("displayName") or str(model_id),
-        "baseUrl": raw.get("baseUrl") or "",
+        "displayName": raw.get("displayName") or raw.get("model_display_name") or str(model_id),
+        "baseUrl": raw.get("baseUrl") or raw.get("base_url") or "",
         "provider": raw.get("provider") or "",
-        "apiKey": raw.get("apiKey") or "",
+        "apiKey": raw.get("apiKey") or raw.get("api_key") or "",
         "reasoningEffort": raw.get("reasoningEffort") or "",
         "source": source,
         "managed": raw.get("managedBy") == MANAGED_BY,
@@ -177,7 +184,7 @@ def load_factory_context(factory_home=None, settings_path=None):
         "legacy_models": legacy_models,
         "sources": {
             "settings": str(settings_file),
-            "settings_local": str(local_file),
-            "legacy_config": str(legacy_file),
+            "settings_local": str(local_file) if local_file.exists() else "",
+            "legacy_config": str(legacy_file) if legacy_file.exists() else "",
         },
     }

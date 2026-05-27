@@ -753,22 +753,145 @@ def test_droid_jsonc_parser_respects_strings():
     assert data["customModels"][0]["id"] == "custom:a"
 
 
+def test_droid_strip_jsonc_comments_discards_unterminated_block_comment():
+    stripped = droid.strip_jsonc_comments('{"a": 1} /* unterminated comment')
+    assert stripped == '{"a": 1} ', f"unterminated block comment should be discarded to EOF: {stripped!r}"
+
+
+def test_droid_loads_jsonc_empty_returns_empty_dict():
+    assert droid.loads_jsonc("") == {}
+    assert droid.loads_jsonc("   \n\t") == {}
+
+
+def test_droid_load_jsonc_file_missing_returns_empty_dict():
+    with tempfile.TemporaryDirectory() as td:
+        missing = Path(td) / "missing.json"
+        assert droid.load_jsonc_file(missing) == {}
+
+
+def test_droid_merge_settings_recursively_merges_nested_dicts_and_deep_copies():
+    base = {
+        "model": "base",
+        "nested": {
+            "keep": 1,
+            "replace": {"base_only": True},
+            "list_value": [1, 2],
+        },
+    }
+    local = {
+        "nested": {
+            "replace": {"local_only": True},
+            "list_value": ["local"],
+            "added": 2,
+        }
+    }
+    merged = droid.merge_settings(base, local)
+    assert merged == {
+        "model": "base",
+        "nested": {
+            "keep": 1,
+            "replace": {"base_only": True, "local_only": True},
+            "list_value": ["local"],
+            "added": 2,
+        },
+    }
+    merged["nested"]["replace"]["local_only"] = False
+    merged["nested"]["list_value"].append("x")
+    assert local["nested"]["replace"]["local_only"] is True, "merged settings must deep-copy local nested dicts"
+    assert local["nested"]["list_value"] == ["local"], "merged settings must deep-copy local lists"
+    assert base["nested"]["replace"] == {"base_only": True}, "merged settings must not mutate base nested dicts"
+
+
+def test_droid_normalize_current_model_supports_alias_fields_and_invalid_rows():
+    model = droid.normalize_current_model(
+        {
+            "id": "custom:alias",
+            "model": "gpt-5",
+            "model_display_name": "Alias Name",
+            "base_url": "https://example.invalid/v1",
+            "api_key": "${ALIAS_KEY}",
+        },
+        "settings.json",
+    )
+    assert model["displayName"] == "Alias Name"
+    assert model["baseUrl"] == "https://example.invalid/v1"
+    assert model["apiKey"] == "${ALIAS_KEY}"
+    assert droid.normalize_current_model(None, "settings.json") is None
+    assert droid.normalize_current_model([], "settings.json") is None
+    assert droid.normalize_current_model({}, "settings.json") is None
+    assert droid.normalize_current_model({"id": "custom:missing-model"}, "settings.json") is None
+    assert droid.normalize_current_model({"model": "gpt-5"}, "settings.json") is not None
+
+
 def test_droid_effective_settings_merges_local_over_base():
     with tempfile.TemporaryDirectory() as td:
         home = Path(td)
         (home / "settings.json").write_text(
-            '{"model": "base", "customModels": [{"id": "custom:base", "model": "base"}]}',
+            json.dumps(
+                {
+                    "model": "base",
+                    "nested": {"keep": 1, "replace": {"base_only": True}},
+                    "customModels": [{"id": "custom:base", "model": "base"}],
+                }
+            ),
             encoding="utf-8",
         )
         (home / "settings.local.json").write_text(
-            '{"model": "local", "customModels": [{"id": "custom:local", "model": "local"}]}',
+            json.dumps(
+                {
+                    "model": "local",
+                    "nested": {"replace": {"local_only": True}},
+                    "customModels": [{"id": "custom:local", "model": "local"}],
+                }
+            ),
             encoding="utf-8",
         )
         ctx = droid.load_factory_context(home)
         assert ctx["settings"]["model"] == "local"
+        assert ctx["settings"]["nested"] == {"keep": 1, "replace": {"base_only": True, "local_only": True}}
         ids = [model["id"] for model in ctx["models"]]
         assert ids == ["custom:local"], f"local customModels should override base: {ids}"
         assert ctx["sources"]["settings_local"].endswith("settings.local.json")
+
+
+def test_droid_load_factory_context_reports_missing_optional_sources_and_reads_legacy_config():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        (home / "settings.json").write_text(
+            json.dumps({"model": "base"}),
+            encoding="utf-8",
+        )
+        ctx_without_optional = droid.load_factory_context(home)
+        assert ctx_without_optional["sources"]["settings_local"] == ""
+        assert ctx_without_optional["sources"]["legacy_config"] == ""
+        assert ctx_without_optional["local_settings"] == {}
+        assert ctx_without_optional["legacy_models"] == []
+
+        (home / "config.json").write_text(
+            json.dumps(
+                {
+                    "custom_models": [
+                        {
+                            "model": "legacy-model",
+                            "model_display_name": "Legacy Display",
+                            "base_url": "https://legacy.invalid/v1",
+                            "api_key": "${LEGACY_KEY}",
+                        },
+                        {"id": "broken-only"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        ctx_with_legacy = droid.load_factory_context(home)
+        assert len(ctx_with_legacy["legacy_models"]) == 1
+        legacy = ctx_with_legacy["legacy_models"][0]
+        assert legacy["id"] == "custom:legacy-model"
+        assert legacy["displayName"] == "Legacy Display"
+        assert legacy["baseUrl"] == "https://legacy.invalid/v1"
+        assert legacy["apiKey"] == "${LEGACY_KEY}"
+        assert legacy["source"] == "config.json"
+        assert ctx_with_legacy["sources"]["legacy_config"].endswith("config.json")
 
 
 def test_doctor_report_accepts_chatgpt_auth_without_api_key():
@@ -1829,7 +1952,13 @@ if __name__ == "__main__":
     test("operation history redacts and loads newest first", test_operation_history_redacts_and_loads_newest)
     test("provider action emits history without secret", test_provider_action_emits_history_without_secret)
     test("droid JSONC parser respects strings", test_droid_jsonc_parser_respects_strings)
+    test("droid JSONC parser discards unterminated block comments", test_droid_strip_jsonc_comments_discards_unterminated_block_comment)
+    test("droid loads_jsonc empty returns empty dict", test_droid_loads_jsonc_empty_returns_empty_dict)
+    test("droid load_jsonc_file missing returns empty dict", test_droid_load_jsonc_file_missing_returns_empty_dict)
+    test("droid merge_settings recursively merges and deep-copies", test_droid_merge_settings_recursively_merges_nested_dicts_and_deep_copies)
+    test("droid normalize_current_model supports aliases and rejects invalid rows", test_droid_normalize_current_model_supports_alias_fields_and_invalid_rows)
     test("droid effective settings merges local over base", test_droid_effective_settings_merges_local_over_base)
+    test("droid load_factory_context reports missing optional sources and reads legacy config", test_droid_load_factory_context_reports_missing_optional_sources_and_reads_legacy_config)
     test("doctor accepts chatgpt auth without API key", test_doctor_report_accepts_chatgpt_auth_without_api_key)
     test("doctor flags provider health issues", test_doctor_report_flags_provider_health_issues)
 
