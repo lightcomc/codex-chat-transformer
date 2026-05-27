@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 import codex_chat_transformer as ct
+import droid_provider_adapter as droid
 import py_compile
 
 PASSED = 0
@@ -732,6 +733,42 @@ def test_provider_action_emits_history_without_secret():
         assert "sk-history" not in raw, "history must not record provider API keys"
     finally:
         restore_temp_codex_home(original, tmp_dir)
+
+
+def test_droid_jsonc_parser_respects_strings():
+    text = """
+    // top comment
+    {
+      "url": "https://example.invalid//not-comment",
+      "pattern": "/* not a block */",
+      "escaped": "\\"//still-string\\"",
+      /* block comment */
+      "customModels": [{"id": "custom:a", "model": "gpt-5"}]
+    }
+    """
+    data = droid.loads_jsonc(text)
+    assert data["url"].endswith("//not-comment")
+    assert data["pattern"] == "/* not a block */"
+    assert data["escaped"] == '"//still-string"'
+    assert data["customModels"][0]["id"] == "custom:a"
+
+
+def test_droid_effective_settings_merges_local_over_base():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        (home / "settings.json").write_text(
+            '{"model": "base", "customModels": [{"id": "custom:base", "model": "base"}]}',
+            encoding="utf-8",
+        )
+        (home / "settings.local.json").write_text(
+            '{"model": "local", "customModels": [{"id": "custom:local", "model": "local"}]}',
+            encoding="utf-8",
+        )
+        ctx = droid.load_factory_context(home)
+        assert ctx["settings"]["model"] == "local"
+        ids = [model["id"] for model in ctx["models"]]
+        assert ids == ["custom:local"], f"local customModels should override base: {ids}"
+        assert ctx["sources"]["settings_local"].endswith("settings.local.json")
 
 
 def test_doctor_report_accepts_chatgpt_auth_without_api_key():
@@ -1791,6 +1828,8 @@ if __name__ == "__main__":
     test("session search project filter", test_search_sessions_project_filter)
     test("operation history redacts and loads newest first", test_operation_history_redacts_and_loads_newest)
     test("provider action emits history without secret", test_provider_action_emits_history_without_secret)
+    test("droid JSONC parser respects strings", test_droid_jsonc_parser_respects_strings)
+    test("droid effective settings merges local over base", test_droid_effective_settings_merges_local_over_base)
     test("doctor accepts chatgpt auth without API key", test_doctor_report_accepts_chatgpt_auth_without_api_key)
     test("doctor flags provider health issues", test_doctor_report_flags_provider_health_issues)
 
