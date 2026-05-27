@@ -2,8 +2,10 @@
 """Factory Droid provider settings helpers."""
 
 import copy
+import datetime
 import json
 import os
+import shutil
 from pathlib import Path
 
 FACTORY_DIR = Path(os.environ.get("FACTORY_HOME") or (Path.home() / ".factory"))
@@ -83,6 +85,18 @@ def load_jsonc_file(path):
     return loads_jsonc(path.read_text(encoding="utf-8"))
 
 
+def backup_file(path):
+    path = Path(path)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+    backup_path = path.with_name(f"{path.name}.{timestamp}.bak")
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        shutil.copy2(path, backup_path)
+    else:
+        backup_path.write_text("", encoding="utf-8")
+    return backup_path
+
+
 def merge_settings(base, local):
     base = base or {}
     local = local or {}
@@ -93,6 +107,15 @@ def merge_settings(base, local):
         else:
             merged[key] = copy.deepcopy(value)
     return merged
+
+
+def write_local_settings(home, data):
+    home = Path(home).expanduser().resolve()
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / LOCAL_SETTINGS_NAME
+    backup_path = backup_file(path)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    return {"path": path, "backup_path": backup_path}
 
 
 def normalize_current_model(raw, source):
@@ -151,6 +174,48 @@ def _normalize_model_list(rows, source, normalizer):
     return models
 
 
+def _local_settings(home):
+    home = Path(home).expanduser().resolve()
+    path = home / LOCAL_SETTINGS_NAME
+    return path, load_jsonc_file(path)
+
+
+def _model_index(models, model_id):
+    for index, model in enumerate(models or []):
+        if isinstance(model, dict) and model.get("id") == model_id:
+            return index
+    return -1
+
+
+def neurogate_models(api_key_env="NEUROGATE_API_KEY", api_key=None):
+    api_key_value = api_key if api_key is not None else f"${{{api_key_env}}}"
+    base_url = "https://api.neurogate.space/v1"
+    provider = "openai"
+    max_output_tokens = 128000
+    reasoning_effort = "medium"
+    no_image_support = False
+    models = [
+        ("custom:NeuroGate-GPT-5.5-1", "NeuroGate-GPT-5.5-1"),
+        ("custom:NeuroGate-GPT-5.4-2", "NeuroGate-GPT-5.4-2"),
+        ("custom:NeuroGate-GPT-5.4-Mini-3", "NeuroGate-GPT-5.4-Mini-3"),
+    ]
+    return [
+        {
+            "id": model_id,
+            "model": model_name,
+            "displayName": model_name,
+            "baseUrl": base_url,
+            "provider": provider,
+            "apiKey": api_key_value,
+            "maxOutputTokens": max_output_tokens,
+            "reasoningEffort": reasoning_effort,
+            "noImageSupport": no_image_support,
+            "managedBy": MANAGED_BY,
+        }
+        for model_id, model_name in models
+    ]
+
+
 def load_factory_context(factory_home=None, settings_path=None):
     home = Path(factory_home).expanduser().resolve() if factory_home is not None else factory_home_from_settings(settings_path)
     settings_file = Path(settings_path).expanduser().resolve() if settings_path is not None else (home / SETTINGS_NAME)
@@ -187,4 +252,111 @@ def load_factory_context(factory_home=None, settings_path=None):
             "settings_local": str(local_file) if local_file.exists() else "",
             "legacy_config": str(legacy_file) if legacy_file.exists() else "",
         },
+    }
+
+
+def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api_key=None):
+    home = Path(factory_home).expanduser().resolve() if factory_home is not None else FACTORY_DIR
+    path, local_settings = _local_settings(home)
+    local_settings = copy.deepcopy(local_settings or {})
+    custom_models = copy.deepcopy(local_settings.get("customModels") or [])
+    favorites = list(local_settings.get("modelFavorites") or [])
+    managed_models = neurogate_models(api_key_env=api_key_env, api_key=api_key)
+    added = 0
+    updated = 0
+
+    for model in managed_models:
+        index = _model_index(custom_models, model["id"])
+        if index == -1:
+            custom_models.append(copy.deepcopy(model))
+            added += 1
+        elif custom_models[index] != model:
+            custom_models[index] = copy.deepcopy(model)
+            updated += 1
+
+    model_ids = [model["id"] for model in managed_models]
+    for model_id in model_ids:
+        if model_id not in favorites:
+            favorites.append(model_id)
+
+    local_settings["customModels"] = custom_models
+    local_settings["modelFavorites"] = favorites
+    local_settings["model"] = model_ids[0]
+    local_settings["reasoningEffort"] = "medium"
+    session_defaults = copy.deepcopy(local_settings.get("sessionDefaultSettings") or {})
+    session_defaults["model"] = model_ids[0]
+    session_defaults["reasoningEffort"] = "medium"
+    local_settings["sessionDefaultSettings"] = session_defaults
+
+    result = write_local_settings(home, local_settings)
+    return {
+        "added": added,
+        "updated": updated,
+        "models": model_ids,
+        "path": result["path"],
+        "backup_path": result["backup_path"],
+    }
+
+
+def use_model(factory_home, model_id, reasoning=None):
+    home = Path(factory_home).expanduser().resolve()
+    ctx = load_factory_context(home)
+    available_ids = {model["id"] for model in ctx["models"] + ctx["legacy_models"]}
+    if model_id not in available_ids:
+        raise ValueError(f"Unknown Droid model: {model_id}")
+
+    _, local_settings = _local_settings(home)
+    local_settings = copy.deepcopy(local_settings or {})
+    local_settings["model"] = model_id
+    session_defaults = copy.deepcopy(local_settings.get("sessionDefaultSettings") or {})
+    session_defaults["model"] = model_id
+    if reasoning is not None:
+        local_settings["reasoningEffort"] = reasoning
+        session_defaults["reasoningEffort"] = reasoning
+    local_settings["sessionDefaultSettings"] = session_defaults
+
+    result = write_local_settings(home, local_settings)
+    summary = {
+        "model_id": model_id,
+        "path": result["path"],
+        "backup_path": result["backup_path"],
+    }
+    if reasoning is not None:
+        summary["reasoning"] = reasoning
+    return summary
+
+
+def remove_model(factory_home, model_id):
+    home = Path(factory_home).expanduser().resolve()
+    ctx = load_factory_context(home)
+    local_settings = copy.deepcopy(ctx["local_settings"] or {})
+    custom_models = copy.deepcopy(local_settings.get("customModels") or [])
+    index = _model_index(custom_models, model_id)
+
+    if index == -1:
+        raise ValueError(f"Model {model_id} is not present in settings.local.json")
+    if custom_models[index].get("managedBy") != MANAGED_BY:
+        raise ValueError(f"Model {model_id} is not managed by {MANAGED_BY}")
+
+    del custom_models[index]
+    local_settings["customModels"] = custom_models
+
+    favorites = [favorite for favorite in (local_settings.get("modelFavorites") or []) if favorite != model_id]
+    if favorites or "modelFavorites" in local_settings:
+        local_settings["modelFavorites"] = favorites
+
+    if local_settings.get("model") == model_id:
+        local_settings["model"] = ""
+
+    session_defaults = copy.deepcopy(local_settings.get("sessionDefaultSettings") or {})
+    if session_defaults.get("model") == model_id:
+        session_defaults["model"] = ""
+    if session_defaults or "sessionDefaultSettings" in local_settings:
+        local_settings["sessionDefaultSettings"] = session_defaults
+
+    result = write_local_settings(home, local_settings)
+    return {
+        "model_id": model_id,
+        "path": result["path"],
+        "backup_path": result["backup_path"],
     }

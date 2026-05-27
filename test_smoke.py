@@ -899,6 +899,184 @@ def test_droid_load_factory_context_reports_missing_optional_sources_and_reads_l
         assert ctx_with_legacy["sources"]["legacy_config"].endswith("config.json")
 
 
+def test_droid_add_neurogate_is_idempotent_and_uses_env_key():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        summary1 = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
+        summary2 = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
+        ctx = droid.load_factory_context(home)
+        ids = [model["id"] for model in ctx["models"]]
+
+        assert summary1["added"] == 3, f"first add should create three models: {summary1}"
+        assert summary1["updated"] == 0, f"first add should not count updates for new file: {summary1}"
+        assert summary2["added"] == 0, f"second add should be idempotent: {summary2}"
+        assert summary2["updated"] == 0, f"second add should not rewrite identical models: {summary2}"
+        assert ids == [
+            "custom:NeuroGate-GPT-5.5-1",
+            "custom:NeuroGate-GPT-5.4-2",
+            "custom:NeuroGate-GPT-5.4-Mini-3",
+        ], f"expected the managed NeuroGate models in order: {ids}"
+        assert ctx["settings"]["model"] == "custom:NeuroGate-GPT-5.5-1"
+        assert ctx["settings"]["reasoningEffort"] == "medium"
+        assert ctx["settings"]["modelFavorites"] == ids
+        assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:NeuroGate-GPT-5.5-1"
+        assert ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "medium"
+
+        raw = (home / "settings.local.json").read_text(encoding="utf-8")
+        assert "${NEUROGATE_API_KEY}" in raw, "expected env var reference in local settings"
+        assert summary1["backup_path"].exists(), f"backup should be created on first write: {summary1}"
+        assert summary2["backup_path"].exists(), f"backup should be created on repeated write: {summary2}"
+
+
+def test_droid_use_model_updates_top_level_and_session_defaults():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        droid.write_local_settings(
+            home,
+            {
+                "customModels": [
+                    {
+                        "id": "custom:local-model",
+                        "model": "local-model",
+                        "displayName": "Local Model",
+                        "baseUrl": "https://local.invalid/v1",
+                        "provider": "openai",
+                        "apiKey": "${LOCAL_KEY}",
+                    }
+                ],
+                "sessionDefaultSettings": {"model": "custom:stale", "reasoningEffort": "low"},
+            },
+        )
+        (home / "config.json").write_text(
+            json.dumps(
+                {
+                    "custom_models": [
+                        {
+                            "model": "legacy-model",
+                            "model_display_name": "Legacy Model",
+                            "base_url": "https://legacy.invalid/v1",
+                            "api_key": "${LEGACY_KEY}",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        local_summary = droid.use_model(home, "custom:local-model", reasoning="high")
+        local_ctx = droid.load_factory_context(home)
+        assert local_summary["model_id"] == "custom:local-model"
+        assert local_summary["reasoning"] == "high"
+        assert local_ctx["settings"]["model"] == "custom:local-model"
+        assert local_ctx["settings"]["reasoningEffort"] == "high"
+        assert local_ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:local-model"
+        assert local_ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "high"
+
+        legacy_summary = droid.use_model(home, "custom:legacy-model")
+        legacy_ctx = droid.load_factory_context(home)
+        assert legacy_summary["model_id"] == "custom:legacy-model"
+        assert "reasoning" not in legacy_summary
+        assert legacy_ctx["settings"]["model"] == "custom:legacy-model"
+        assert legacy_ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:legacy-model"
+        assert legacy_ctx["settings"]["reasoningEffort"] == "high", "reasoning should stay unchanged when omitted"
+        assert legacy_ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "high"
+
+
+def test_droid_remove_model_only_removes_local_managed_model():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        droid.write_local_settings(
+            home,
+            {
+                "model": "custom:managed-one",
+                "customModels": [
+                    {
+                        "id": "custom:managed-one",
+                        "model": "managed-one",
+                        "displayName": "Managed One",
+                        "baseUrl": "https://managed-one.invalid/v1",
+                        "provider": "openai",
+                        "apiKey": "${ONE_KEY}",
+                        "managedBy": droid.MANAGED_BY,
+                    },
+                    {
+                        "id": "custom:managed-two",
+                        "model": "managed-two",
+                        "displayName": "Managed Two",
+                        "baseUrl": "https://managed-two.invalid/v1",
+                        "provider": "openai",
+                        "apiKey": "${TWO_KEY}",
+                        "managedBy": droid.MANAGED_BY,
+                    },
+                    {
+                        "id": "custom:foreign",
+                        "model": "foreign-model",
+                        "displayName": "Foreign Model",
+                        "baseUrl": "https://foreign.invalid/v1",
+                        "provider": "openai",
+                        "apiKey": "${FOREIGN_KEY}",
+                    },
+                ],
+                "modelFavorites": [
+                    "custom:managed-one",
+                    "custom:managed-two",
+                    "custom:foreign",
+                    "custom:base-only",
+                ],
+                "sessionDefaultSettings": {
+                    "model": "custom:managed-one",
+                    "reasoningEffort": "medium",
+                },
+                "reasoningEffort": "medium",
+            },
+        )
+        (home / "settings.json").write_text(
+            json.dumps(
+                {
+                    "model": "custom:base-only",
+                    "customModels": [
+                        {
+                            "id": "custom:base-only",
+                            "model": "base-only",
+                            "displayName": "Base Only",
+                            "baseUrl": "https://base.invalid/v1",
+                            "provider": "openai",
+                            "apiKey": "${BASE_KEY}",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        summary = droid.remove_model(home, "custom:managed-one")
+        ctx = droid.load_factory_context(home)
+        ids = [model["id"] for model in ctx["models"]]
+
+        assert summary["model_id"] == "custom:managed-one"
+        assert ids == ["custom:managed-two", "custom:foreign"], f"only the targeted local model should be removed: {ids}"
+        assert ctx["local_settings"]["model"] == "", "selected local model should be cleared when removed"
+        assert ctx["local_settings"]["sessionDefaultSettings"]["model"] == "", "session default should be cleared when removed"
+        assert ctx["settings"]["model"] == "", "effective selected model should be cleared instead of falling back silently"
+        assert ctx["settings"]["sessionDefaultSettings"]["model"] == ""
+        assert ctx["settings"]["modelFavorites"] == ["custom:managed-two", "custom:foreign", "custom:base-only"]
+        assert summary["backup_path"].exists(), f"removal should create a backup: {summary}"
+
+        try:
+            droid.remove_model(home, "custom:base-only")
+        except ValueError as exc:
+            assert "settings.local.json" in str(exc) or "managed" in str(exc)
+        else:
+            raise AssertionError("expected ValueError when removing a base-only model")
+
+        try:
+            droid.remove_model(home, "custom:foreign")
+        except ValueError as exc:
+            assert "managed" in str(exc)
+        else:
+            raise AssertionError("expected ValueError when removing an unmanaged local model")
+
+
 def test_doctor_report_accepts_chatgpt_auth_without_api_key():
     original, tmp_dir = setup_temp_codex_home()
     old_running = ct.is_codex_running
@@ -1964,6 +2142,9 @@ if __name__ == "__main__":
     test("droid normalize_current_model supports aliases and rejects invalid rows", test_droid_normalize_current_model_supports_alias_fields_and_invalid_rows)
     test("droid effective settings merges local over base", test_droid_effective_settings_merges_local_over_base)
     test("droid load_factory_context reports missing optional sources and reads legacy config", test_droid_load_factory_context_reports_missing_optional_sources_and_reads_legacy_config)
+    test("droid add_neurogate is idempotent and uses env key", test_droid_add_neurogate_is_idempotent_and_uses_env_key)
+    test("droid use_model updates top-level and session defaults", test_droid_use_model_updates_top_level_and_session_defaults)
+    test("droid remove_model only removes local managed model", test_droid_remove_model_only_removes_local_managed_model)
     test("doctor accepts chatgpt auth without API key", test_doctor_report_accepts_chatgpt_auth_without_api_key)
     test("doctor flags provider health issues", test_doctor_report_flags_provider_health_issues)
 
