@@ -290,7 +290,7 @@ def test_droid_add_neurogate_is_idempotent_and_uses_env_key():
         assert ctx["settings"]["model"] == "custom:NeuroGate-GPT-5.5-1"
         raw = (home / "settings.local.json").read_text(encoding="utf-8")
         assert "${NEUROGATE_API_KEY}" in raw
-        assert list(home.glob("settings.local.json.*.bak")), "write should create a backup"
+        assert summary1["backup_path"].exists(), "write should create a backup"
 
 
 def test_droid_use_model_updates_top_level_and_session_defaults():
