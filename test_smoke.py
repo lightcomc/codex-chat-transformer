@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Smoke tests for Codex Chat Transformer."""
 
+import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -731,6 +734,65 @@ def test_provider_action_emits_history_without_secret():
         assert records[0]["action"] == "add_provider", f"expected add_provider history, got {records}"
         assert records[0]["provider"] == "HistoryProv", f"provider name should be recorded: {records}"
         assert "sk-history" not in raw, "history must not record provider API keys"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_droid_cli_flags_registered():
+    parser = ct.build_parser()
+    args = parser.parse_args([
+        "--droid-models",
+        "--droid-doctor",
+        "--droid-add-neurogate",
+        "--droid-import-provider", "SavedProv",
+        "--droid-use", "custom:model-one",
+        "--droid-remove-model", "custom:model-two",
+        "--droid-settings", "C:\\Temp\\factory\\settings.json",
+        "--droid-with-key",
+        "--droid-api-key-env", "DROID_KEY_ENV",
+    ])
+    assert args.droid_models is True
+    assert args.droid_doctor is True
+    assert args.droid_add_neurogate is True
+    assert args.droid_import_provider == "SavedProv"
+    assert args.droid_use == "custom:model-one"
+    assert args.droid_remove_model == "custom:model-two"
+    assert args.droid_settings == "C:\\Temp\\factory\\settings.json"
+    assert args.droid_with_key is True
+    assert args.droid_api_key_env == "DROID_KEY_ENV"
+
+
+def test_droid_history_redacts_key():
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            factory_home = Path(td)
+            args = argparse.Namespace(
+                droid_models=False,
+                droid_doctor=False,
+                droid_add_neurogate=True,
+                droid_import_provider=None,
+                droid_use=None,
+                droid_remove_model=None,
+                droid_settings=str(factory_home / "settings.json"),
+                droid_with_key=True,
+                droid_api_key_env="ALT_NEURO_KEY",
+                api_key="sk-droid-secret",
+                set_reasoning=None,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                handled = ct.handle_droid_command(args)
+
+            history_path = tmp_dir / "operation_history.jsonl"
+            settings_raw = (factory_home / "settings.local.json").read_text(encoding="utf-8")
+            history_raw = history_path.read_text(encoding="utf-8")
+
+            assert handled is True, "Droid command should short-circuit main flow"
+            assert "sk-droid-secret" not in stdout.getvalue(), "CLI output should not print raw keys"
+            assert "sk-droid-secret" not in history_raw, "history must not record Droid secrets"
+            assert "droid_model_added" in history_raw, "expected Droid history action"
+            assert "sk-droid-secret" in settings_raw, "with-key path should write the requested key to temp settings"
     finally:
         restore_temp_codex_home(original, tmp_dir)
 
@@ -2427,6 +2489,8 @@ if __name__ == "__main__":
     test("session search project filter", test_search_sessions_project_filter)
     test("operation history redacts and loads newest first", test_operation_history_redacts_and_loads_newest)
     test("provider action emits history without secret", test_provider_action_emits_history_without_secret)
+    test("droid CLI flags are registered", test_droid_cli_flags_registered)
+    test("droid history redacts keys", test_droid_history_redacts_key)
     test("droid JSONC parser respects strings", test_droid_jsonc_parser_respects_strings)
     test("droid JSONC parser discards unterminated block comments", test_droid_strip_jsonc_comments_discards_unterminated_block_comment)
     test("droid loads_jsonc empty returns empty dict", test_droid_loads_jsonc_empty_returns_empty_dict)

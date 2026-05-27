@@ -2134,7 +2134,205 @@ def set_model(model_name):
     print(f"Model changed to: {model_name}")
 
 
-def main():
+def _build_droid_model_line(model, source_label):
+    return (
+        f"  - {model.get('id', '?')} | model={model.get('model', '?')} | "
+        f"name={model.get('displayName', '?')} | baseUrl={model.get('baseUrl') or '-'} | "
+        f"key={'yes' if model.get('apiKey') else 'no'} | source={source_label}"
+    )
+
+
+def _args_have_droid_command(args):
+    return any([
+        getattr(args, "droid_models", False),
+        getattr(args, "droid_doctor", False),
+        getattr(args, "droid_add_neurogate", False),
+        bool(getattr(args, "droid_import_provider", None)),
+        bool(getattr(args, "droid_use", None)),
+        bool(getattr(args, "droid_remove_model", None)),
+    ])
+
+
+def _droid_home_from_args(args):
+    import droid_provider_adapter as droid
+
+    return droid.factory_home_from_settings(getattr(args, "droid_settings", None))
+
+
+def _load_droid_context(args):
+    import droid_provider_adapter as droid
+
+    home = _droid_home_from_args(args)
+    return droid.load_factory_context(factory_home=home, settings_path=getattr(args, "droid_settings", None))
+
+
+def _print_droid_models(ctx):
+    favorites = ctx["settings"].get("modelFavorites") or []
+    print("\n=== Droid Models ===")
+    print(f"Factory home: {ctx['home']}")
+    print(f"Active model: {ctx['settings'].get('model') or '-'}")
+    print(f"Favorites: {', '.join(favorites) if favorites else '-'}")
+    print(f"Current customModels: {len(ctx['models'])}")
+    for model in ctx["models"]:
+        print(_build_droid_model_line(model, model.get("source") or "settings"))
+    print(f"Legacy config models: {len(ctx['legacy_models'])}")
+    for model in ctx["legacy_models"]:
+        print(_build_droid_model_line(model, model.get("source") or "config.json"))
+
+
+def _droid_doctor_report(ctx):
+    issues = []
+    seen_ids = {}
+    current_models = ctx.get("models") or []
+    legacy_models = ctx.get("legacy_models") or []
+
+    for model in current_models + legacy_models:
+        model_id = model.get("id") or "?"
+        seen_ids[model_id] = seen_ids.get(model_id, 0) + 1
+        if not model.get("baseUrl"):
+            issues.append(f"{model_id}: missing baseUrl")
+        if not model.get("apiKey"):
+            issues.append(f"{model_id}: missing apiKey")
+
+    for model_id, count in sorted(seen_ids.items()):
+        if count > 1:
+            issues.append(f"{model_id}: duplicate id ({count})")
+
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "model_count": len(current_models),
+        "legacy_count": len(legacy_models),
+        "home": str(ctx.get("home") or ""),
+        "active_model": ctx.get("settings", {}).get("model") or "",
+    }
+
+
+def _print_droid_doctor(report):
+    print("\n=== Droid Doctor ===")
+    print(f"Factory home: {report.get('home') or '-'}")
+    print(f"Active model: {report.get('active_model') or '-'}")
+    print(f"Current models: {report['model_count']}")
+    print(f"Legacy models: {report['legacy_count']}")
+    print(f"Status: {'OK' if report['ok'] else 'ISSUES'}")
+    if report["issues"]:
+        print("Issues:")
+        for issue in report["issues"]:
+            print(f"  - {issue}")
+    else:
+        print("Issues: none")
+
+
+def handle_droid_command(args):
+    if not _args_have_droid_command(args):
+        return False
+
+    try:
+        import droid_provider_adapter as droid
+
+        home = _droid_home_from_args(args)
+
+        if args.droid_models:
+            _print_droid_models(_load_droid_context(args))
+            return True
+
+        if args.droid_doctor:
+            report = _droid_doctor_report(_load_droid_context(args))
+            _print_droid_doctor(report)
+            record_history(
+                "droid_doctor_checked",
+                details={
+                    "ok": report["ok"],
+                    "model_count": report["model_count"],
+                    "legacy_count": report["legacy_count"],
+                },
+            )
+            return True
+
+        if args.droid_add_neurogate:
+            summary = droid.add_neurogate_models(
+                home,
+                api_key_env=args.droid_api_key_env or "NEUROGATE_API_KEY",
+                api_key=args.api_key if args.droid_with_key else None,
+            )
+            print("Droid NeuroGate models updated.")
+            print(f"  Added: {summary['added']}")
+            print(f"  Updated: {summary['updated']}")
+            print(f"  Path: {summary['path']}")
+            record_history(
+                "droid_model_added",
+                details={
+                    "kind": "neurogate",
+                    "added": summary["added"],
+                    "updated": summary["updated"],
+                    "models": summary["models"],
+                    "path": str(summary["path"]),
+                },
+            )
+            return True
+
+        if args.droid_import_provider:
+            data = _load_providers()
+            profiles = data.get("profiles", {})
+            profile = profiles.get(args.droid_import_provider)
+            if not profile:
+                raise ValueError(f"Saved provider '{args.droid_import_provider}' not found")
+            summary = droid.import_codex_provider(
+                home,
+                args.droid_import_provider,
+                profile,
+                api_key_env=args.droid_api_key_env,
+                with_key=args.droid_with_key,
+            )
+            print(f"Droid provider imported: {args.droid_import_provider}")
+            print(f"  Model ID: {summary['model_id']}")
+            print(f"  Path: {summary['path']}")
+            record_history(
+                "droid_provider_imported",
+                provider=args.droid_import_provider,
+                details={
+                    "model_id": summary["model_id"],
+                    "added": summary["added"],
+                    "updated": summary["updated"],
+                    "path": str(summary["path"]),
+                },
+            )
+            return True
+
+        if args.droid_use:
+            summary = droid.use_model(home, args.droid_use, reasoning=args.set_reasoning)
+            print(f"Droid active model set to: {summary['model_id']}")
+            print(f"  Path: {summary['path']}")
+            record_history(
+                "droid_model_selected",
+                details={
+                    "model_id": summary["model_id"],
+                    "reasoning": summary.get("reasoning", ""),
+                    "path": str(summary["path"]),
+                },
+            )
+            return True
+
+        if args.droid_remove_model:
+            summary = droid.remove_model(home, args.droid_remove_model)
+            print(f"Droid model removed: {summary['model_id']}")
+            print(f"  Path: {summary['path']}")
+            record_history(
+                "droid_model_removed",
+                details={
+                    "model_id": summary["model_id"],
+                    "path": str(summary["path"]),
+                },
+            )
+            return True
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        return True
+
+    return False
+
+
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Transform Codex chats between model_provider types"
     )
@@ -2179,6 +2377,15 @@ def main():
     parser.add_argument("--set-wire-api", metavar="API", help="Set wire_api for --edit-provider")
     parser.add_argument("--set-reasoning", metavar="LEVEL", help="Set reasoning effort (low/medium/high/xhigh) for --edit-provider")
     parser.add_argument("--set-name", metavar="NAME", help="Rename provider (with --edit-provider)")
+    parser.add_argument("--droid-models", action="store_true", help="List Droid Factory models without printing secrets")
+    parser.add_argument("--droid-doctor", action="store_true", help="Read-only health check of Droid Factory models")
+    parser.add_argument("--droid-add-neurogate", action="store_true", help="Add or update managed NeuroGate models in Droid Factory")
+    parser.add_argument("--droid-import-provider", metavar="NAME", help="Import a saved Codex provider into Droid Factory")
+    parser.add_argument("--droid-use", metavar="MODEL_ID", help="Set the active Droid Factory model")
+    parser.add_argument("--droid-remove-model", metavar="MODEL_ID", help="Remove a managed model from Droid Factory local settings")
+    parser.add_argument("--droid-settings", metavar="PATH", help="Path to Droid Factory settings.json")
+    parser.add_argument("--droid-with-key", action="store_true", help="Copy the resolved key into Droid Factory settings when supported")
+    parser.add_argument("--droid-api-key-env", metavar="VAR", help="Environment variable name to reference for Droid API keys")
 
     # Sync arguments
     parser.add_argument("--sync-host", action="store_true", help="Start P2P sync server + Dashboard")
@@ -2186,8 +2393,14 @@ def main():
     parser.add_argument("--sync-pull", metavar="HOST[:PORT]", help="Connect to sync host and pull data")
     parser.add_argument("--sync-push", metavar="HOST[:PORT]", help="Connect to sync host and push data")
     parser.add_argument("--sync-pin", metavar="PIN", help="PIN for sync authentication (prompts if omitted)")
+    return parser
 
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
+    if handle_droid_command(args):
+        return
     provider_filter = None
     session_filter = None
     if args.providers not in (None, PROVIDERS_LIST_SENTINEL):
