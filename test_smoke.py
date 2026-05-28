@@ -1237,6 +1237,50 @@ def test_chat_bridge_codex_to_droid_preserves_droid_index_timestamps():
     assert discovered["createdTimeMs"] == expected_created_ms, f"discovery created time should preserve source created_at: {discovered}"
 
 
+def test_chat_bridge_codex_to_droid_writes_droid_valid_tool_inputs_and_parent_chain():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-tools", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {
+            "bridge_id": "codex-codex-tools",
+            "title": "Tool Chat",
+            "created_at": "2026-05-28T10:00:00Z",
+            "updated_at": "2026-05-28T10:00:03Z",
+            "provider": "openai",
+            "model": "gpt-5",
+        },
+        "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {"id": "m-user", "role": "user", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "text", "text": "run command"}]},
+            {
+                "id": "m-assistant",
+                "role": "assistant",
+                "created_at": "2026-05-28T10:00:02Z",
+                "parts": [
+                    {"type": "text", "text": "running"},
+                    {"type": "tool_call", "id": "call-1", "name": "shell", "input": "{\"cmd\":\"echo ok\"}"},
+                ],
+            },
+            {"id": "m-tool", "role": "tool", "created_at": "2026-05-28T10:00:03Z", "parts": [{"type": "tool_result", "tool_call_id": "call-1", "content": "ok"}]},
+        ],
+        "extras": {},
+        "raw_event_refs": [],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True)
+        events = [json.loads(line) for line in Path(summary["droid_jsonl_path"]).read_text(encoding="utf-8").splitlines()]
+
+    messages = [event for event in events if event.get("type") == "message"]
+    tool_use = messages[1]["message"]["content"][1]
+    assert tool_use["input"] == {"cmd": "echo ok"}, f"Droid tool_use input must be an object, not a JSON string: {tool_use}"
+    assert "parentId" not in messages[0], f"first Droid message should start the chain: {messages[0]}"
+    assert messages[1]["parentId"] == messages[0]["id"], f"second message should point at previous message: {messages}"
+    assert messages[2]["parentId"] == messages[1]["id"], f"tool result should point at assistant tool call message: {messages}"
+
+
 def test_chat_bridge_codex_to_droid_can_skip_system_messages():
     import chat_bridge
 
@@ -3159,6 +3203,7 @@ if __name__ == "__main__":
     test("chat bridge Codex to Droid preserves project context", test_chat_bridge_codex_to_droid_preserves_project_context)
     test("chat bridge Codex to Droid normalizes extended Windows cwd", test_chat_bridge_codex_to_droid_normalizes_extended_windows_cwd)
     test("chat bridge Codex to Droid preserves Droid index timestamps", test_chat_bridge_codex_to_droid_preserves_droid_index_timestamps)
+    test("chat bridge Codex to Droid writes valid tool inputs and parent chain", test_chat_bridge_codex_to_droid_writes_droid_valid_tool_inputs_and_parent_chain)
     test("chat bridge Codex to Droid can skip system messages", test_chat_bridge_codex_to_droid_can_skip_system_messages)
     test("operation history redacts and loads newest first", test_operation_history_redacts_and_loads_newest)
     test("provider action emits history without secret", test_provider_action_emits_history_without_secret)

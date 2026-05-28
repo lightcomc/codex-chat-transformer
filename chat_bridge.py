@@ -832,10 +832,26 @@ def _droid_content_part(part):
     if part_type == "text":
         return {"type": "text", "text": str(part.get("text") or "")}
     if part_type == "tool_call":
-        return {"type": "tool_use", "id": part.get("id") or "", "name": part.get("name") or "", "input": part.get("input")}
+        return {"type": "tool_use", "id": part.get("id") or "", "name": part.get("name") or "", "input": _droid_tool_input(part.get("input"))}
     if part_type == "tool_result":
         return {"type": "tool_result", "tool_use_id": part.get("tool_call_id") or "", "content": part.get("content")}
     return {"type": "text", "text": f"[unsupported bridge part: {part_type}]"}
+
+
+def _droid_tool_input(value):
+    if isinstance(value, dict):
+        return value
+    if value is None or value == "":
+        return {}
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {"raw": value}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+    return {"value": value}
 
 
 def _droid_project_dir_name(cwd):
@@ -1044,21 +1060,27 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True):
                 session_start["hostId"] = host_id
         events = [session_start]
 
+        parent_id = ""
         for index, message in enumerate(bridge.get("messages", [])):
             role = message.get("role") if message.get("role") in ("user", "assistant") else "user"
             if preserve_timestamps:
                 timestamp = message.get("created_at") or session.get("created_at") or _iso(now)
             else:
                 timestamp = _iso(now + datetime.timedelta(milliseconds=index))
-            events.append({
+            event_id = message.get("id") or f"message-{index}"
+            event = {
                 "type": "message",
-                "id": message.get("id") or f"message-{index}",
+                "id": event_id,
                 "timestamp": timestamp,
                 "message": {
                     "role": role,
                     "content": [_droid_content_part(part) for part in message.get("parts", [])],
                 },
-            })
+            }
+            if parent_id:
+                event["parentId"] = parent_id
+            events.append(event)
+            parent_id = event_id
 
         jsonl_fd, jsonl_tmp_name = tempfile.mkstemp(prefix=f"{droid_id}.", suffix=".jsonl.tmp", dir=str(sessions_dir))
         jsonl_tmp = Path(jsonl_tmp_name)
