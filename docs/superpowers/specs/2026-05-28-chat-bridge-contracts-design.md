@@ -278,6 +278,33 @@ Map:
 - bridge `work_context.current.git_origin_url` -> `threads.git_origin_url`;
 - bridge messages -> a compatible rollout JSONL.
 
+Codex import has a stricter consistency requirement than Droid import because
+the session exists in two places: the SQLite `threads` row and the rollout file
+referenced by `threads.rollout_path`. The importer must treat these as one
+logical record:
+
+1. allocate a new Codex session id and final rollout path under
+   `.codex/sessions/YYYY/MM/DD/`;
+2. render the rollout JSONL first into a temporary file in the same directory;
+3. validate that the temporary rollout is readable JSONL, contains a
+   `session_meta` event with the same session id, and has at least the expected
+   message count;
+4. atomically move the temporary rollout into the final path;
+5. insert or upsert the `threads` row inside a SQLite transaction, with
+   `rollout_path` pointing at the final path and timestamp fields matching the
+   normalized bridge session;
+6. commit the SQLite transaction only after the row values pass an
+   in-transaction sanity check;
+7. re-open SQLite and the rollout path after commit to verify that the DB row
+   and file agree on id, path, provider, model, and latest timestamps.
+
+If any step fails before the final verification, the importer must leave no
+half-created visible session: remove the temporary or final rollout, roll back
+the SQLite transaction when one is open, and report the session as failed. If
+the failure happens after the SQLite commit but before verification completes,
+the importer must report a repairable partial import with exact paths rather
+than silently continuing.
+
 The full bridge metadata should be preserved in a sidecar under `.codex` or as
 an ignored rollout metadata event that Codex can safely skip. The importer must
 not modify pinned state, active provider config, auth files, or existing
@@ -439,6 +466,12 @@ Cover:
 - branch snapshot from Codex `threads.git_branch/git_sha`;
 - branch snapshot from Codex `session_meta.payload.git` when present;
 - incomplete timeline marked as `timeline_complete=false`;
+- Droid to Codex import creates both the rollout JSONL and matching
+  `threads.rollout_path`;
+- Droid to Codex import rejects or rolls back a session when generated rollout
+  validation fails;
+- post-import verification catches mismatched session id, provider, model, path,
+  or timestamps between SQLite and rollout JSONL;
 - bridge import does not mutate auth, active provider, pinned state, or existing
   unrelated sessions;
 - preview writes no files;
