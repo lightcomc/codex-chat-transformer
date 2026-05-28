@@ -158,6 +158,7 @@ python codex_chat_transformer.py --droid-sessions
 python codex_chat_transformer.py --codex-sessions --project C:\Research\my_project
 python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-pin-old
 python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID
+python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID --chat-skip-system
 python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-fresh-timestamps
 ```
 

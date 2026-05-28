@@ -269,7 +269,7 @@ def _git_from_payload(payload):
     }
 
 
-def codex_session_to_bridge(row, rollout_path):
+def codex_session_to_bridge(row, rollout_path, include_system=True):
     row = dict(row or {})
     rollout_path = Path(str(rollout_path or row.get("rollout_path") or ""))
     events = _read_jsonl(rollout_path)
@@ -308,6 +308,8 @@ def codex_session_to_bridge(row, rollout_path):
             role = payload.get("role")
             if not role:
                 role = "user" if payload_type == "user_message" else "assistant" if payload_type == "agent_message" else "unknown"
+            if role == "system" and not include_system:
+                continue
             content = payload.get("content")
             parts = []
             if isinstance(content, list):

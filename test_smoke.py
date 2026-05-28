@@ -1082,6 +1082,44 @@ def test_chat_bridge_codex_to_droid_import_writes_session_and_mapping():
         restore_temp_codex_home(original, tmp_dir)
 
 
+def test_chat_bridge_codex_to_droid_can_skip_system_messages():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        jsonl_text = "\n".join([
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "repeated codex system prompt"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:01Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "real user prompt"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:02Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "real assistant reply"}]},
+            }),
+        ]) + "\n"
+        store_temp_session("codex-system", "Codex System", r"C:\Projects\Bridge", jsonl_text=jsonl_text)
+        row = ct._fetch_session_rows(session_ids=["codex-system"])[0]
+
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"], include_system=False)
+        assert [m["role"] for m in bridge["messages"]] == ["user", "assistant"], "system messages should be skipped"
+
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp_dir / "factory")
+        text = Path(summary["droid_jsonl_path"]).read_text(encoding="utf-8")
+        assert "repeated codex system prompt" not in text, "skipped system prompt should not be written to Droid"
+        assert "real user prompt" in text, "user content should still be transferred"
+        assert "real assistant reply" in text, "assistant content should still be transferred"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
 def test_operation_history_redacts_and_loads_newest():
     original, tmp_dir = setup_temp_codex_home()
     try:
@@ -1153,6 +1191,7 @@ def test_chat_bridge_cli_flags_registered():
         "--chat-preserve-timestamps",
         "--chat-fresh-timestamps",
         "--chat-pin-old",
+        "--chat-skip-system",
     ])
     assert args.droid_to_codex is True
     assert args.codex_to_droid is True
@@ -1162,6 +1201,7 @@ def test_chat_bridge_cli_flags_registered():
     assert args.chat_preserve_timestamps is True
     assert args.chat_fresh_timestamps is True
     assert args.chat_pin_old is True
+    assert args.chat_skip_system is True
 
 
 def test_chat_bridge_cli_missing_droid_session_does_not_backup():
@@ -2960,6 +3000,7 @@ if __name__ == "__main__":
     test("chat bridge mapping keeps duplicate import pairs", test_chat_bridge_mapping_keeps_duplicate_import_pairs)
     test("chat bridge Droid to Codex import rolls back invalid rollout", test_chat_bridge_droid_to_codex_import_rolls_back_invalid_rollout)
     test("chat bridge Codex to Droid import writes session and mapping", test_chat_bridge_codex_to_droid_import_writes_session_and_mapping)
+    test("chat bridge Codex to Droid can skip system messages", test_chat_bridge_codex_to_droid_can_skip_system_messages)
     test("operation history redacts and loads newest first", test_operation_history_redacts_and_loads_newest)
     test("provider action emits history without secret", test_provider_action_emits_history_without_secret)
     test("droid CLI flags are registered", test_droid_cli_flags_registered)

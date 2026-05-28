@@ -158,10 +158,11 @@ python codex_chat_transformer.py --droid-sessions
 python codex_chat_transformer.py --codex-sessions --project C:\Research\my_project
 python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-pin-old
 python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID
+python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID --chat-skip-system
 python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-fresh-timestamps
 ```
 
-Timestamp preservation is the default. `--chat-fresh-timestamps` makes the imported chat look new. Droid -> Codex creates a full Codex backup first, then writes the Codex rollout JSONL and `threads` row as a verified pair.
+Timestamp preservation is the default. `--chat-fresh-timestamps` makes the imported chat look new. `--chat-skip-system` omits Codex system messages when exporting to Droid. Droid -> Codex creates a full Codex backup first, then writes the Codex rollout JSONL and `threads` row as a verified pair.
 
 ### Pin Chats
 

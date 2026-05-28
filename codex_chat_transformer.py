@@ -2406,6 +2406,7 @@ def handle_chat_bridge_command(args):
             print("ERROR: --chat-session is required for chat transfer commands.")
             return True
         preserve_timestamps = not bool(args.chat_fresh_timestamps)
+        include_system = not bool(getattr(args, "chat_skip_system", False))
 
         if args.droid_to_codex:
             pending = []
@@ -2458,7 +2459,7 @@ def handle_chat_bridge_command(args):
                 if not rollout_path or not os.path.exists(rollout_path):
                     print(f"  {session_id}: rollout not found")
                     continue
-                bridge = chat_bridge.codex_session_to_bridge(row, rollout_path)
+                bridge = chat_bridge.codex_session_to_bridge(row, rollout_path, include_system=include_system)
                 summary = chat_bridge.import_bridge_to_droid(
                     bridge,
                     factory_home=factory_home,
@@ -2468,7 +2469,7 @@ def handle_chat_bridge_command(args):
                 print(f"  {session_id} -> {summary['droid_session_id']}")
             record_history(
                 "chat_bridge_codex_to_droid",
-                details={"sessions": len(imported), "preserve_timestamps": preserve_timestamps, "factory_home": str(factory_home)},
+                details={"sessions": len(imported), "preserve_timestamps": preserve_timestamps, "factory_home": str(factory_home), "include_system": include_system},
             )
             return True
     except ValueError as e:
@@ -2541,6 +2542,7 @@ def build_parser():
     parser.add_argument("--chat-fresh-timestamps", action="store_true", help="Use fresh timestamps during chat transfer")
     parser.add_argument("--chat-pin-old", action="store_true", help="Pin old Droid chats when importing them into Codex")
     parser.add_argument("--chat-old-days", type=int, default=180, metavar="N", help="Age threshold for --chat-pin-old")
+    parser.add_argument("--chat-skip-system", action="store_true", help="Skip Codex system messages when exporting chats to Droid")
 
     # Sync arguments
     parser.add_argument("--sync-host", action="store_true", help="Start P2P sync server + Dashboard")
