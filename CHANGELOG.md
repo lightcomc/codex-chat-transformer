@@ -26,9 +26,12 @@
 - GUI now exposes a Chat Bridge panel for refreshing Droid/Codex session lists and launching Droid -> Codex or Codex -> Droid transfers with confirmation.
 - Droid -> Codex imports create a verified `threads` row + rollout JSONL pair and create a full `.codex` backup before writing.
 - Chat transfers preserve source timestamps by default, can import as fresh, can omit Codex system messages for Droid export, and record session pairs in `chat_bridge_mappings.json` for future mirror sync.
+- Codex -> Droid now preserves project `cwd` in Droid project folders and `session-discovery-index.json`; Droid session lookup scans nested project folders for reverse imports.
+- Codex -> Droid timestamp preservation now updates Droid index/file mtimes from the source session instead of making preserved imports look freshly modified.
+- Windows extended path prefixes such as `\\?\C:\...` are normalized before writing Droid project `cwd` values.
 
 ### Tests
-- 103 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, provider health checks, Droid provider management, GUI wiring, and Chat Bridge transfer.
+- 107 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, provider health checks, Droid provider management, GUI wiring, and Chat Bridge transfer.
 
 ## [1.3.0] — 2026-05-25
 

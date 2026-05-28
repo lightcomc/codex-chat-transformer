@@ -152,6 +152,7 @@ python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
 ### Chat Bridge: сессии Codex <-> Droid
 
 Первый срез переноса чатов создаёт новые сессии в целевой системе и записывает пары в `chat_bridge_mappings.json` для будущей синхронизации. Auth-файлы и API-ключи не копируются.
+Если у Codex-сессии есть проектный `cwd`, Codex -> Droid пишет JSONL/settings в соответствующую проектную папку внутри `%USERPROFILE%\.factory\sessions\`, записывает `cwd` в индексы Droid, а `--droid-sessions` сканирует такие вложенные проектные папки.
 
 ```bash
 python codex_chat_transformer.py --droid-sessions
@@ -162,7 +163,7 @@ python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_I
 python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-fresh-timestamps
 ```
 
-По умолчанию сохраняются даты создания и последнего сообщения. `--chat-fresh-timestamps` переносит чат как свежий. Droid -> Codex сначала делает полный бэкап `.codex`, затем создаёт rollout JSONL и строку `threads` как проверенную пару.
+По умолчанию сохраняются даты создания и последнего сообщения, включая Droid index/file mtime при импорте Codex -> Droid. `--chat-fresh-timestamps` переносит чат как свежий. Droid -> Codex сначала делает полный бэкап `.codex`, затем создаёт rollout JSONL и строку `threads` как проверенную пару.
 
 ### Закрепление чатов
 

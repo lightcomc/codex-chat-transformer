@@ -584,10 +584,11 @@ def list_droid_sessions(factory_home):
     sessions = []
     if not sessions_dir.exists():
         return sessions
-    for jsonl_path in sorted(sessions_dir.glob("*.jsonl")):
+    for jsonl_path in sorted(sessions_dir.rglob("*.jsonl")):
         session_id = jsonl_path.stem
         title = session_id
         message_count = 0
+        cwd = ""
         try:
             with jsonl_path.open("r", encoding="utf-8") as handle:
                 for line_index, raw_line in enumerate(handle):
@@ -596,7 +597,9 @@ def list_droid_sessions(factory_home):
                     event = json.loads(raw_line)
                     if line_index == 0 and event.get("type") == "session_start":
                         title = event.get("title") or title
+                        title = event.get("sessionTitle") or title
                         session_id = event.get("id") or session_id
+                        cwd = event.get("cwd") or ""
                     if event.get("type") == "message":
                         message_count += 1
         except Exception:
@@ -608,10 +611,40 @@ def list_droid_sessions(factory_home):
             "message_count": idx.get("messagesCount") if idx.get("messagesCount") is not None else message_count,
             "mtime": idx.get("mtime") or jsonl_path.stat().st_mtime,
             "jsonl_path": str(jsonl_path),
-            "settings_path": str(sessions_dir / f"{session_id}.settings.json"),
+            "settings_path": str(jsonl_path.with_suffix(".settings.json")),
+            "cwd": idx.get("cwd") or cwd,
         })
     sessions.sort(key=lambda item: item.get("mtime") or 0, reverse=True)
     return sessions
+
+
+def find_droid_session_paths(factory_home, session_id):
+    factory_home = Path(factory_home)
+    sessions_dir = factory_home / "sessions"
+    session_id = str(session_id or "")
+    if not session_id or not sessions_dir.exists():
+        return None, None
+
+    direct_path = sessions_dir / f"{session_id}.jsonl"
+    if direct_path.exists():
+        return direct_path, direct_path.with_suffix(".settings.json")
+
+    for jsonl_path in sessions_dir.rglob(f"{session_id}.jsonl"):
+        return jsonl_path, jsonl_path.with_suffix(".settings.json")
+
+    for jsonl_path in sessions_dir.rglob("*.jsonl"):
+        try:
+            with jsonl_path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    if not raw_line.strip():
+                        continue
+                    event = json.loads(raw_line)
+                    if event.get("type") == "session_start" and str(event.get("id") or "") == session_id:
+                        return jsonl_path, jsonl_path.with_suffix(".settings.json")
+                    break
+        except Exception:
+            continue
+    return None, None
 
 
 def _upsert_mapping(root, pair):
@@ -805,7 +838,125 @@ def _droid_content_part(part):
     return {"type": "text", "text": f"[unsupported bridge part: {part_type}]"}
 
 
-def _update_droid_index(factory_home, session_id, title, jsonl_path, settings_path, message_count):
+def _droid_project_dir_name(cwd):
+    text = _normalize_droid_cwd(cwd)
+    if not text:
+        return ""
+    is_drive_path = len(text) >= 2 and text[1] == ":"
+    if is_drive_path:
+        text = text[0] + text[2:]
+    chars = []
+    for char in text:
+        if char.isalnum() or char in ("_", ".", "-"):
+            chars.append(char)
+        elif char in (":", "\\", "/"):
+            chars.append("-")
+        else:
+            chars.append("-")
+    name = "-".join(part for part in "".join(chars).split("-") if part)
+    if is_drive_path or str(cwd).startswith(("\\", "/")):
+        name = f"-{name}"
+    return name or ""
+
+
+def _normalize_droid_cwd(cwd):
+    text = str(cwd or "").strip()
+    if text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + text[len("\\\\?\\UNC\\"):]
+    if text.startswith("\\\\?\\"):
+        return text[len("\\\\?\\"):]
+    return text
+
+
+def _droid_session_dir(factory_home, cwd):
+    sessions_dir = Path(factory_home) / "sessions"
+    project_name = _droid_project_dir_name(cwd)
+    return sessions_dir / project_name if project_name else sessions_dir
+
+
+def _droid_host_id(factory_home):
+    data = _read_json_file(Path(factory_home) / "host.json")
+    return str(data.get("hostId") or "")
+
+
+def _file_mtime_ms(path):
+    return int(Path(path).stat().st_mtime * 1000)
+
+
+def _update_droid_discovery_index(
+    factory_home,
+    session_id,
+    title,
+    jsonl_path,
+    settings_path,
+    message_count,
+    cwd="",
+    created_ms=None,
+    modified_ms=None,
+):
+    factory_home = Path(factory_home)
+    cache_dir = factory_home / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    index_path = cache_dir / "session-discovery-index.json"
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
+    except Exception:
+        data = {}
+    data["version"] = int(data.get("version") or 1)
+    data["sessionsDir"] = str(factory_home / "sessions")
+    data["updatedAt"] = int(_utc_now().timestamp() * 1000)
+    if not isinstance(data.get("projectDirectories"), list):
+        data["projectDirectories"] = []
+    if not isinstance(data.get("directories"), dict):
+        data["directories"] = {}
+    entries = data.get("entries") if isinstance(data.get("entries"), dict) else {}
+    jsonl_path = Path(jsonl_path)
+    settings_path = Path(settings_path)
+    mtime_ms = int(modified_ms) if modified_ms is not None else _file_mtime_ms(jsonl_path)
+    created_time_ms = int(created_ms) if created_ms is not None else mtime_ms
+    settings_mtime_ms = _file_mtime_ms(settings_path)
+    entry = {
+        "id": session_id,
+        "sessionPath": str(jsonl_path),
+        "directoryPath": str(jsonl_path.parent),
+        "title": title,
+        "sessionTitle": title,
+        "owner": "codex-provider-manager",
+        "messageCount": message_count,
+        "modifiedTimeMs": mtime_ms,
+        "createdTimeMs": created_time_ms,
+        "isExec": False,
+        "isBtwFork": False,
+        "sessionFingerprint": {
+            "mtimeMs": mtime_ms,
+            "size": jsonl_path.stat().st_size,
+        },
+        "settingsFingerprint": {
+            "mtimeMs": settings_mtime_ms,
+            "size": settings_path.stat().st_size,
+        },
+    }
+    if cwd:
+        entry["cwd"] = str(cwd)
+    entries[session_id] = entry
+    data["entries"] = entries
+    if not isinstance(data.get("favorites"), dict):
+        data["favorites"] = {"exists": False, "sessionIds": []}
+    index_path.write_text(json.dumps(data, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def _update_droid_index(
+    factory_home,
+    session_id,
+    title,
+    jsonl_path,
+    settings_path,
+    message_count,
+    cwd="",
+    host_id="",
+    created_ms=None,
+    modified_ms=None,
+):
     index_path = Path(factory_home) / "sessions-index.json"
     try:
         data = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
@@ -814,13 +965,18 @@ def _update_droid_index(factory_home, session_id, title, jsonl_path, settings_pa
     data["version"] = int(data.get("version") or 1)
     entries = data.get("entries") if isinstance(data.get("entries"), list) else []
     entries = [entry for entry in entries if entry.get("sessionId") != session_id]
-    entries.append({
+    entry = {
         "sessionId": session_id,
-        "mtime": jsonl_path.stat().st_mtime,
-        "settingsMtime": settings_path.stat().st_mtime,
+        "mtime": int(modified_ms) if modified_ms is not None else _file_mtime_ms(jsonl_path),
+        "settingsMtime": _file_mtime_ms(settings_path),
         "title": title,
         "messagesCount": message_count,
-    })
+    }
+    if cwd:
+        entry["cwd"] = str(cwd)
+    if host_id:
+        entry["hostId"] = str(host_id)
+    entries.append(entry)
     data["entries"] = entries
     if index_path.exists():
         backup_path = index_path.with_name(f"{index_path.name}.{int(_utc_now().timestamp())}.bak")
@@ -829,12 +985,27 @@ def _update_droid_index(factory_home, session_id, title, jsonl_path, settings_pa
         except OSError:
             pass
     index_path.write_text(json.dumps(data, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    _update_droid_discovery_index(
+        factory_home,
+        session_id,
+        title,
+        jsonl_path,
+        settings_path,
+        message_count,
+        cwd,
+        created_ms=created_ms,
+        modified_ms=modified_ms,
+    )
 
 
 def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True):
     validate_bridge(bridge)
     factory_home = Path(factory_home)
-    sessions_dir = factory_home / "sessions"
+    work = bridge.get("work_context") if isinstance(bridge.get("work_context"), dict) else {}
+    current = work.get("current") if isinstance(work.get("current"), dict) else {}
+    cwd = _normalize_droid_cwd(work.get("primary_cwd") or current.get("cwd") or "")
+    host_id = _droid_host_id(factory_home) if cwd else ""
+    sessions_dir = _droid_session_dir(factory_home, cwd)
     sessions_dir.mkdir(parents=True, exist_ok=True)
     source = bridge["source"]
     session = bridge["session"]
@@ -844,8 +1015,34 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True):
     jsonl_tmp = None
     settings_tmp = None
     now = _utc_now()
+    now_ms = int(now.timestamp() * 1000)
+    source_created_ms = _ms(session.get("created_at"), default=now_ms)
+    source_updated_ms = _ms(session.get("updated_at"), default=source_created_ms)
+    if preserve_timestamps:
+        created_ms = source_created_ms
+        updated_ms = source_updated_ms
+    else:
+        created_ms = now_ms
+        updated_ms = created_ms + max(len(bridge.get("messages", [])), 0)
     try:
-        events = [{"type": "session_start", "id": droid_id, "title": session.get("title") or droid_id, "owner": "codex-provider-manager"}]
+        title = session.get("title") or droid_id
+        session_start = {
+            "type": "session_start",
+            "id": droid_id,
+            "title": title,
+            "sessionTitle": title,
+            "owner": "codex-provider-manager",
+        }
+        if cwd:
+            session_start.update({
+                "version": 2,
+                "cwd": cwd,
+                "isSessionTitleManuallySet": False,
+                "sessionTitleAutoStage": "first_message",
+            })
+            if host_id:
+                session_start["hostId"] = host_id
+        events = [session_start]
 
         for index, message in enumerate(bridge.get("messages", [])):
             role = message.get("role") if message.get("role") in ("user", "assistant") else "user"
@@ -879,7 +1076,20 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True):
             handle.write(json.dumps(settings, indent=2, ensure_ascii=True) + "\n")
         jsonl_tmp.replace(jsonl_path)
         settings_tmp.replace(settings_path)
-        _update_droid_index(factory_home, droid_id, session.get("title") or droid_id, jsonl_path, settings_path, len(bridge.get("messages", [])))
+        os.utime(jsonl_path, (updated_ms / 1000.0, updated_ms / 1000.0))
+        os.utime(settings_path, (updated_ms / 1000.0, updated_ms / 1000.0))
+        _update_droid_index(
+            factory_home,
+            droid_id,
+            title,
+            jsonl_path,
+            settings_path,
+            len(bridge.get("messages", [])),
+            cwd=cwd,
+            host_id=host_id,
+            created_ms=created_ms,
+            modified_ms=updated_ms,
+        )
         warnings = []
         try:
             mapping_path = _upsert_mapping(factory_home, {

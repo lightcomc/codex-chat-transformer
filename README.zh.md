@@ -152,6 +152,7 @@ Droid 写入目标是 `%USERPROFILE%\.factory\settings.local.json`。现有 `set
 ### Chat Bridge: Codex <-> Droid Sessions
 
 The first chat-transfer slice creates new destination sessions and records pairs in `chat_bridge_mappings.json` for later sync work. It does not copy auth files or API keys.
+When a Codex session has a project `cwd`, Codex -> Droid writes the Droid JSONL/settings pair under the matching project folder in `%USERPROFILE%\.factory\sessions\`, records `cwd` in Droid indexes, and `--droid-sessions` scans those nested project folders.
 
 ```bash
 python codex_chat_transformer.py --droid-sessions
@@ -162,7 +163,7 @@ python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_I
 python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-fresh-timestamps
 ```
 
-Timestamps are preserved by default. `--chat-fresh-timestamps` imports the chat as fresh. Droid -> Codex creates a full Codex backup first, then writes the rollout JSONL and `threads` row as a verified pair.
+Timestamps are preserved by default, including Droid index/file mtimes for Codex -> Droid imports. `--chat-fresh-timestamps` imports the chat as fresh. Droid -> Codex creates a full Codex backup first, then writes the rollout JSONL and `threads` row as a verified pair.
 
 ### 固定聊天
 

@@ -831,6 +831,31 @@ def test_chat_bridge_droid_session_to_bridge_preserves_messages_and_tools():
     assert "todo_state" in part_types, f"todo_state should be preserved as metadata: {part_types}"
 
 
+def test_chat_bridge_droid_session_lookup_finds_project_nested_files():
+    import chat_bridge
+
+    with tempfile.TemporaryDirectory() as tmp:
+        project_dir = Path(tmp) / "sessions" / "-C-Research-nothing"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_path = project_dir / "droid-project.jsonl"
+        settings_path = project_dir / "droid-project.settings.json"
+        jsonl_path.write_text(
+            json.dumps({
+                "type": "session_start",
+                "id": "droid-project",
+                "title": "Project Droid",
+                "cwd": r"C:\Research\nothing",
+            }) + "\n",
+            encoding="utf-8",
+        )
+        settings_path.write_text("{}", encoding="utf-8")
+
+        found_jsonl, found_settings = chat_bridge.find_droid_session_paths(tmp, "droid-project")
+
+        assert found_jsonl == jsonl_path, f"project Droid session should be found recursively: {found_jsonl}"
+        assert found_settings == settings_path, f"project Droid settings should follow JSONL path: {found_settings}"
+
+
 def test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_old():
     import chat_bridge
     import sqlite3
@@ -1080,6 +1105,136 @@ def test_chat_bridge_codex_to_droid_import_writes_session_and_mapping():
         assert mapping["pairs"][0]["droid_session_id"] == summary["droid_session_id"], f"mapping should remember Droid id: {mapping}"
     finally:
         restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_preserves_project_context():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        factory_home.mkdir(parents=True, exist_ok=True)
+        (factory_home / "host.json").write_text(
+            json.dumps({"schemaVersion": 1, "hostId": "host-project-1"}),
+            encoding="utf-8",
+        )
+        jsonl_text = "\n".join([
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "codex-project",
+                    "timestamp": "2026-05-28T10:00:00Z",
+                    "cwd": r"C:\Research\nothing",
+                    "model_provider": "openai",
+                    "model": "gpt-5",
+                },
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:01Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "project prompt"}]},
+            }),
+        ]) + "\n"
+        store_temp_session("codex-project", "Project Chat", r"C:\Research\nothing", jsonl_text=jsonl_text)
+        row = ct._fetch_session_rows(session_ids=["codex-project"])[0]
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"])
+
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=factory_home)
+        jsonl_path = Path(summary["droid_jsonl_path"])
+        assert jsonl_path.parent.name == "-C-Research-nothing", f"Droid project sessions should be nested by cwd: {jsonl_path}"
+        first_event = json.loads(jsonl_path.read_text(encoding="utf-8").splitlines()[0])
+        assert first_event["cwd"] == r"C:\Research\nothing", f"session_start should preserve cwd: {first_event}"
+        assert first_event["hostId"] == "host-project-1", f"session_start should preserve hostId: {first_event}"
+
+        session_index = json.loads((factory_home / "sessions-index.json").read_text(encoding="utf-8"))
+        entry = next(e for e in session_index["entries"] if e["sessionId"] == summary["droid_session_id"])
+        assert entry["cwd"] == r"C:\Research\nothing", f"sessions-index should preserve cwd: {entry}"
+        assert entry["hostId"] == "host-project-1", f"sessions-index should preserve hostId: {entry}"
+
+        discovery = json.loads((factory_home / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
+        discovered = discovery["entries"][summary["droid_session_id"]]
+        assert discovered["cwd"] == r"C:\Research\nothing", f"discovery index should preserve cwd: {discovered}"
+        assert discovered["directoryPath"].endswith(r"sessions\-C-Research-nothing"), f"discovery directory should point at project folder: {discovered}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_normalizes_extended_windows_cwd():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-extended", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {
+            "bridge_id": "codex-codex-extended",
+            "title": "Extended Path",
+            "created_at": "2026-05-28T10:00:00Z",
+            "updated_at": "2026-05-28T10:00:01Z",
+            "provider": "openai",
+            "model": "gpt-5",
+        },
+        "work_context": {
+            "primary_cwd": r"\\?\C:\Research\nothing",
+            "current": {"cwd": r"\\?\C:\Research\nothing", "confidence": "observed"},
+            "timeline_complete": False,
+            "snapshots": [],
+        },
+        "messages": [
+            {"id": "m1", "role": "user", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "text", "text": "hello"}]},
+        ],
+        "extras": {},
+        "raw_event_refs": [],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True)
+        jsonl_path = Path(summary["droid_jsonl_path"])
+        first_event = json.loads(jsonl_path.read_text(encoding="utf-8").splitlines()[0])
+        discovery = json.loads((Path(tmp) / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
+        discovered = discovery["entries"][summary["droid_session_id"]]
+
+    assert jsonl_path.parent.name == "-C-Research-nothing", f"extended cwd should use Droid's normal project folder slug: {jsonl_path}"
+    assert first_event["cwd"] == r"C:\Research\nothing", f"Droid cwd should not keep Windows extended prefix: {first_event}"
+    assert discovered["cwd"] == r"C:\Research\nothing", f"discovery cwd should not keep Windows extended prefix: {discovered}"
+
+
+def test_chat_bridge_codex_to_droid_preserves_droid_index_timestamps():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-time", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {
+            "bridge_id": "codex-codex-time",
+            "title": "Timed Chat",
+            "created_at": "2025-01-02T03:04:05Z",
+            "updated_at": "2025-01-02T03:04:07Z",
+            "provider": "openai",
+            "model": "gpt-5",
+        },
+        "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {"id": "m1", "role": "user", "created_at": "2025-01-02T03:04:05Z", "parts": [{"type": "text", "text": "hello"}]},
+            {"id": "m2", "role": "assistant", "created_at": "2025-01-02T03:04:07Z", "parts": [{"type": "text", "text": "reply"}]},
+        ],
+        "extras": {},
+        "raw_event_refs": [],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True)
+        session_index = json.loads((Path(tmp) / "sessions-index.json").read_text(encoding="utf-8"))
+        entry = next(e for e in session_index["entries"] if e["sessionId"] == summary["droid_session_id"])
+        discovery = json.loads((Path(tmp) / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
+        discovered = discovery["entries"][summary["droid_session_id"]]
+
+    expected_updated_ms = 1735787047000
+    expected_created_ms = 1735787045000
+    assert abs(entry["mtime"] - expected_updated_ms) < 1500, f"Droid mtime should preserve source updated_at: {entry}"
+    assert abs(discovered["modifiedTimeMs"] - expected_updated_ms) < 1500, f"discovery modified time should preserve source updated_at: {discovered}"
+    assert discovered["createdTimeMs"] == expected_created_ms, f"discovery created time should preserve source created_at: {discovered}"
 
 
 def test_chat_bridge_codex_to_droid_can_skip_system_messages():
@@ -2994,12 +3149,16 @@ if __name__ == "__main__":
     test("session search JSONL fallback hit", test_search_sessions_jsonl_fallback_hit)
     test("session search project filter", test_search_sessions_project_filter)
     test("chat bridge Droid session normalizes messages and tools", test_chat_bridge_droid_session_to_bridge_preserves_messages_and_tools)
+    test("chat bridge Droid session lookup finds project nested files", test_chat_bridge_droid_session_lookup_finds_project_nested_files)
     test("chat bridge Droid to Codex import creates consistent rollout and pins old", test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_old)
     test("chat bridge Droid to Codex import can use fresh timestamps", test_chat_bridge_droid_to_codex_import_can_use_fresh_timestamps)
     test("chat bridge Droid to Codex mapping failure reports warning after commit", test_chat_bridge_droid_to_codex_mapping_failure_reports_warning_after_commit)
     test("chat bridge mapping keeps duplicate import pairs", test_chat_bridge_mapping_keeps_duplicate_import_pairs)
     test("chat bridge Droid to Codex import rolls back invalid rollout", test_chat_bridge_droid_to_codex_import_rolls_back_invalid_rollout)
     test("chat bridge Codex to Droid import writes session and mapping", test_chat_bridge_codex_to_droid_import_writes_session_and_mapping)
+    test("chat bridge Codex to Droid preserves project context", test_chat_bridge_codex_to_droid_preserves_project_context)
+    test("chat bridge Codex to Droid normalizes extended Windows cwd", test_chat_bridge_codex_to_droid_normalizes_extended_windows_cwd)
+    test("chat bridge Codex to Droid preserves Droid index timestamps", test_chat_bridge_codex_to_droid_preserves_droid_index_timestamps)
     test("chat bridge Codex to Droid can skip system messages", test_chat_bridge_codex_to_droid_can_skip_system_messages)
     test("operation history redacts and loads newest first", test_operation_history_redacts_and_loads_newest)
     test("provider action emits history without secret", test_provider_action_emits_history_without_secret)

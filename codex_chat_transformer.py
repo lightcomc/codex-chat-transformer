@@ -2381,7 +2381,8 @@ def _print_droid_chat_sessions(sessions, factory_home):
             if updated > 100000000000:
                 updated = updated / 1000
             updated_text = datetime.datetime.fromtimestamp(updated).strftime("%Y-%m-%d %H:%M")
-        print(f"  {session.get('id', '')} | {_display_session_text(session.get('title'))} | messages={session.get('message_count', 0)} | {updated_text}")
+        cwd_text = f" | cwd={_display_session_text(session.get('cwd'), 36)}" if session.get("cwd") else ""
+        print(f"  {session.get('id', '')} | {_display_session_text(session.get('title'))} | messages={session.get('message_count', 0)} | {updated_text}{cwd_text}")
 
 
 def handle_chat_bridge_command(args):
@@ -2415,12 +2416,11 @@ def handle_chat_bridge_command(args):
                 old_before = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.chat_old_days)
                 old_before_ms = int(old_before.timestamp() * 1000)
             for session_id in ids:
-                jsonl_path = factory_home / "sessions" / f"{session_id}.jsonl"
-                settings_path = factory_home / "sessions" / f"{session_id}.settings.json"
-                if not jsonl_path.exists():
+                jsonl_path, settings_path = chat_bridge.find_droid_session_paths(factory_home, session_id)
+                if not jsonl_path or not jsonl_path.exists():
                     print(f"  {session_id}: Droid session JSONL not found")
                     continue
-                pending.append((session_id, chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)))
+                pending.append((session_id, chat_bridge.droid_session_to_bridge(jsonl_path, settings_path if settings_path and settings_path.exists() else None)))
             if not pending:
                 print("No valid Droid sessions to import.")
                 return True

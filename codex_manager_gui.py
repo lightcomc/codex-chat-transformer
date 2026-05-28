@@ -731,12 +731,15 @@ class CodexManagerApp:
             return "-"
 
     def _droid_session_display(self, session):
-        return " | ".join([
+        parts = [
             self._short_chat_text(session.get("id"), 28),
             self._short_chat_text(session.get("title"), 36),
             f"msg={session.get('message_count', 0)}",
             self._chat_time_text(session.get("mtime")),
-        ])
+        ]
+        if session.get("cwd"):
+            parts.append(self._short_chat_text(session.get("cwd"), 42))
+        return " | ".join(parts)
 
     def _codex_session_display(self, row):
         updated = row.get("updated_at_ms") or ((row.get("updated_at") or 0) * 1000)
