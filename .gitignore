@@ -7,6 +7,7 @@
 !README.md
 !codex_manager_gui.py
 !codex_chat_transformer.py
+!chat_bridge.py
 !codex_sync.py
 !codex_manager.cmd
 !codex_manager.ps1

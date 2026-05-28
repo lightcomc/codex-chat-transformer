@@ -702,6 +702,330 @@ def test_search_sessions_project_filter():
         restore_temp_codex_home(original, tmp_dir)
 
 
+def write_temp_droid_session(home, session_id="droid-old", title="Droid Old Chat"):
+    sessions_dir = Path(home) / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = sessions_dir / f"{session_id}.jsonl"
+    settings_path = sessions_dir / f"{session_id}.settings.json"
+    events = [
+        {"type": "session_start", "id": session_id, "title": title, "owner": "user"},
+        {
+            "type": "message",
+            "id": "msg-user-1",
+            "timestamp": "2025-01-02T03:04:05.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "hello from droid"}]},
+        },
+        {
+            "type": "message",
+            "id": "msg-assistant-1",
+            "timestamp": "2025-01-02T03:04:07.000Z",
+            "parentId": "msg-user-1",
+            "message": {
+                "id": "assistant-inner-1",
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "droid reply"},
+                    {"type": "tool_use", "id": "tool-1", "name": "shell", "input": {"cmd": "echo ok"}},
+                ],
+            },
+        },
+        {
+            "type": "message",
+            "id": "msg-tool-1",
+            "timestamp": "2025-01-02T03:04:08.000Z",
+            "parentId": "msg-assistant-1",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}],
+            },
+        },
+        {"type": "todo_state", "id": "todo-1", "timestamp": "2025-01-02T03:04:09.000Z", "todos": []},
+    ]
+    jsonl_path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+    settings_path.write_text(
+        json.dumps({
+            "providerLock": "custom:NeuroGate-GPT-5.5-1",
+            "providerLockTimestamp": "2025-01-02T03:04:05.000Z",
+            "tokenUsage": {"total": 123},
+        }),
+        encoding="utf-8",
+    )
+    return jsonl_path, settings_path
+
+
+def test_chat_bridge_droid_session_to_bridge_preserves_messages_and_tools():
+    import chat_bridge
+
+    with tempfile.TemporaryDirectory() as tmp:
+        jsonl_path, settings_path = write_temp_droid_session(tmp)
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+
+    assert bridge["format"] == "codex-droid-chat-bridge", f"unexpected bridge format: {bridge}"
+    assert bridge["source"]["app"] == "droid", f"unexpected source app: {bridge['source']}"
+    assert bridge["source"]["session_id"] == "droid-old", f"source id should come from session_start: {bridge['source']}"
+    assert bridge["session"]["title"] == "Droid Old Chat", "title should come from session_start"
+    assert bridge["session"]["model"] == "custom:NeuroGate-GPT-5.5-1", "providerLock should become bridge model"
+    assert bridge["work_context"]["current"]["confidence"] == "unknown", "Droid git context should be unknown in v1"
+    assert bridge["work_context"]["timeline_complete"] is False, "Droid timeline should be explicitly incomplete"
+    assert [m["role"] for m in bridge["messages"][:3]] == ["user", "assistant", "tool"], f"unexpected roles: {bridge['messages']}"
+    part_types = [p["type"] for m in bridge["messages"] for p in m["parts"]]
+    assert "text" in part_types, f"text parts should be preserved: {part_types}"
+    assert "tool_call" in part_types, f"tool_use should become tool_call: {part_types}"
+    assert "tool_result" in part_types, f"tool_result should be preserved: {part_types}"
+    assert "todo_state" in part_types, f"todo_state should be preserved as metadata: {part_types}"
+
+
+def test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_old():
+    import chat_bridge
+    import sqlite3
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        jsonl_path, settings_path = write_temp_droid_session(factory_home)
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+
+        summary = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=ct.CODEX_DIR,
+            state_db=ct.STATE_DB,
+            sessions_dir=ct.SESSIONS_DIR,
+            global_state_path=ct.GLOBAL_STATE,
+            preserve_timestamps=True,
+            pin_old=True,
+            old_before_ms=1767225600000,
+        )
+
+        conn = sqlite3.connect(str(ct.STATE_DB))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM threads WHERE id = ?", (summary["codex_session_id"],)).fetchone()
+        conn.close()
+
+        assert row is not None, "Droid import should insert a Codex threads row"
+        rollout_path = Path(row["rollout_path"])
+        assert rollout_path.exists(), "threads.rollout_path should point at a real rollout file"
+        lines = [json.loads(line) for line in rollout_path.read_text(encoding="utf-8").splitlines()]
+        meta = lines[0]
+        assert meta["type"] == "session_meta", "rollout should start with session_meta"
+        assert meta["payload"]["id"] == row["id"], "rollout session id should match DB id"
+        assert meta["payload"]["model_provider"] == row["model_provider"], "provider should match DB"
+        assert meta["payload"]["model"] == row["model"], "model should match DB"
+        assert row["created_at_ms"] == 1735787045000, f"created timestamp should be preserved, got {row['created_at_ms']}"
+        assert row["updated_at_ms"] == 1735787049000, f"updated timestamp should be preserved, got {row['updated_at_ms']}"
+
+        pinned = json.loads(ct.GLOBAL_STATE.read_text(encoding="utf-8"))["pinned-thread-ids"]
+        assert summary["codex_session_id"] in pinned, "old imported Droid session should be pinned when requested"
+        mapping = json.loads((ct.CODEX_DIR / "chat_bridge_mappings.json").read_text(encoding="utf-8"))
+        assert mapping["pairs"][0]["droid_session_id"] == "droid-old", f"mapping should remember Droid id: {mapping}"
+        assert mapping["pairs"][0]["codex_session_id"] == summary["codex_session_id"], f"mapping should remember Codex id: {mapping}"
+
+        reread_bridge = chat_bridge.codex_session_to_bridge(dict(row), row["rollout_path"])
+        reread_part_types = [p["type"] for m in reread_bridge["messages"] for p in m["parts"]]
+        assert "tool_call" in reread_part_types, f"Codex reread should preserve Droid tool calls: {reread_part_types}"
+        assert "tool_result" in reread_part_types, f"Codex reread should preserve Droid tool results: {reread_part_types}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_droid_to_codex_import_can_use_fresh_timestamps():
+    import chat_bridge
+    import sqlite3
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        jsonl_path, settings_path = write_temp_droid_session(factory_home, session_id="droid-fresh")
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+
+        summary = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=ct.CODEX_DIR,
+            state_db=ct.STATE_DB,
+            sessions_dir=ct.SESSIONS_DIR,
+            global_state_path=ct.GLOBAL_STATE,
+            preserve_timestamps=False,
+        )
+
+        conn = sqlite3.connect(str(ct.STATE_DB))
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT rollout_path, created_at_ms, updated_at_ms FROM threads WHERE id = ?", (summary["codex_session_id"],)).fetchone()
+        conn.close()
+
+        assert row["created_at_ms"] > 1767225600000, f"fresh import should use current-ish created time: {dict(row)}"
+        assert row["updated_at_ms"] >= row["created_at_ms"], f"fresh updated time should not go backwards: {dict(row)}"
+        rollout_events = [json.loads(line) for line in Path(row["rollout_path"]).read_text(encoding="utf-8").splitlines()]
+        event_times = [chat_bridge._ms(event["timestamp"]) for event in rollout_events]
+        assert min(event_times) >= row["created_at_ms"], f"fresh rollout timestamps should not keep old source dates: {event_times}"
+        assert max(event_times) <= row["updated_at_ms"], f"fresh rollout timestamps should fit DB updated_at_ms: {event_times}, {dict(row)}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_droid_to_codex_mapping_failure_reports_warning_after_commit():
+    import chat_bridge
+    import sqlite3
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_upsert = chat_bridge._upsert_mapping
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        jsonl_path, settings_path = write_temp_droid_session(factory_home, session_id="droid-map-fail")
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+        chat_bridge._upsert_mapping = lambda *args, **kwargs: (_ for _ in ()).throw(OSError("mapping denied"))
+
+        summary = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=ct.CODEX_DIR,
+            state_db=ct.STATE_DB,
+            sessions_dir=ct.SESSIONS_DIR,
+            global_state_path=ct.GLOBAL_STATE,
+        )
+
+        conn = sqlite3.connect(str(ct.STATE_DB))
+        count = conn.execute("SELECT COUNT(*) FROM threads WHERE id = ?", (summary["codex_session_id"],)).fetchone()[0]
+        conn.close()
+        assert count == 1, "committed Codex import should remain visible after mapping warning"
+        assert summary["warnings"], f"mapping failure should be reported as warning: {summary}"
+        assert "mapping" in summary["warnings"][0], f"warning should identify mapping issue: {summary}"
+    finally:
+        chat_bridge._upsert_mapping = original_upsert
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_mapping_keeps_duplicate_import_pairs():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        jsonl_path, settings_path = write_temp_droid_session(factory_home, session_id="droid-repeat")
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+        first = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=ct.CODEX_DIR,
+            state_db=ct.STATE_DB,
+            sessions_dir=ct.SESSIONS_DIR,
+            global_state_path=ct.GLOBAL_STATE,
+        )
+        second = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=ct.CODEX_DIR,
+            state_db=ct.STATE_DB,
+            sessions_dir=ct.SESSIONS_DIR,
+            global_state_path=ct.GLOBAL_STATE,
+        )
+        mapping = json.loads((ct.CODEX_DIR / "chat_bridge_mappings.json").read_text(encoding="utf-8"))
+        codex_ids = [pair["codex_session_id"] for pair in mapping["pairs"]]
+        assert first["codex_session_id"] in codex_ids, f"first import pair should remain in mapping: {mapping}"
+        assert second["codex_session_id"] in codex_ids, f"second import pair should be appended to mapping: {mapping}"
+        assert len(mapping["pairs"]) == 2, f"duplicate imports should be recorded as separate pairs: {mapping}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_droid_to_codex_import_rolls_back_invalid_rollout():
+    import chat_bridge
+    import sqlite3
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        bridge = {
+            "format": "codex-droid-chat-bridge",
+            "version": 1,
+            "source": {"app": "droid", "session_id": "bad-droid", "path": ""},
+            "session": {"bridge_id": "bad", "title": "Bad", "created_at": "2025-01-02T03:04:05Z", "updated_at": "2025-01-02T03:04:06Z", "provider": "droid", "model": "bad"},
+            "work_context": {"primary_cwd": "", "current": {"confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+            "messages": [{"id": "bad-message", "role": "user", "created_at": "2025-01-02T03:04:05Z", "parts": []}],
+        }
+        try:
+            chat_bridge.import_bridge_to_codex(
+                bridge,
+                codex_dir=ct.CODEX_DIR,
+                state_db=ct.STATE_DB,
+                sessions_dir=ct.SESSIONS_DIR,
+                global_state_path=ct.GLOBAL_STATE,
+            )
+            raise AssertionError("invalid bridge should fail import")
+        except ValueError:
+            pass
+
+        conn = sqlite3.connect(str(ct.STATE_DB))
+        count = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+        conn.close()
+        rollout_files = list(ct.SESSIONS_DIR.rglob("rollout-*.jsonl")) if ct.SESSIONS_DIR.exists() else []
+        assert count == 0, "failed import should not leave a DB row"
+        assert not rollout_files, f"failed import should not leave rollout files: {rollout_files}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_import_writes_session_and_mapping():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        jsonl_text = "\n".join([
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "codex-small",
+                    "timestamp": "2026-05-28T10:00:00Z",
+                    "cwd": r"C:\Projects\Bridge",
+                    "model_provider": "openai",
+                    "model": "gpt-5",
+                    "git": {"branch": "feature/bridge", "commit_hash": "b" * 40, "repository_url": "https://example.invalid/bridge.git"},
+                },
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:01Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello from codex"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:02Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "codex reply"}]},
+            }),
+        ]) + "\n"
+        store_temp_session(
+            "codex-small",
+            "Codex Small",
+            r"C:\Projects\Bridge",
+            jsonl_text=jsonl_text,
+            model_provider="openai",
+            model="gpt-5",
+            git_branch="feature/bridge",
+            git_sha="b" * 40,
+        )
+        row = ct._fetch_session_rows(session_ids=["codex-small"])[0]
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"])
+        factory_home = tmp_dir / "factory"
+
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=factory_home)
+
+        jsonl_path = Path(summary["droid_jsonl_path"])
+        settings_path = Path(summary["droid_settings_path"])
+        assert jsonl_path.exists(), "Droid JSONL should be created"
+        assert settings_path.exists(), "Droid session settings should be created"
+        events = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+        assert events[0]["type"] == "session_start", f"first Droid event should be session_start: {events[0]}"
+        assert "hello from codex" in jsonl_path.read_text(encoding="utf-8"), "Droid JSONL should include Codex text"
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert settings["providerLock"] == "gpt-5", f"settings should preserve model lock: {settings}"
+        mapping = json.loads((factory_home / "chat_bridge_mappings.json").read_text(encoding="utf-8"))
+        assert mapping["pairs"][0]["codex_session_id"] == "codex-small", f"mapping should remember Codex id: {mapping}"
+        assert mapping["pairs"][0]["droid_session_id"] == summary["droid_session_id"], f"mapping should remember Droid id: {mapping}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
 def test_operation_history_redacts_and_loads_newest():
     original, tmp_dir = setup_temp_codex_home()
     try:
@@ -760,6 +1084,59 @@ def test_droid_cli_flags_registered():
     assert args.droid_settings == "C:\\Temp\\factory\\settings.json"
     assert args.droid_with_key is True
     assert args.droid_api_key_env == "DROID_KEY_ENV"
+
+
+def test_chat_bridge_cli_flags_registered():
+    parser = ct.build_parser()
+    args = parser.parse_args([
+        "--droid-to-codex",
+        "--codex-to-droid",
+        "--droid-sessions",
+        "--codex-sessions",
+        "--chat-session", "one,two",
+        "--chat-preserve-timestamps",
+        "--chat-fresh-timestamps",
+        "--chat-pin-old",
+    ])
+    assert args.droid_to_codex is True
+    assert args.codex_to_droid is True
+    assert args.droid_sessions is True
+    assert args.codex_sessions is True
+    assert args.chat_session == "one,two"
+    assert args.chat_preserve_timestamps is True
+    assert args.chat_fresh_timestamps is True
+    assert args.chat_pin_old is True
+
+
+def test_chat_bridge_cli_missing_droid_session_does_not_backup():
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    backup_calls = []
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        factory_home.mkdir(parents=True, exist_ok=True)
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=True,
+            codex_to_droid=False,
+            chat_session="missing-session",
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_old_days=180,
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+
+        handled = ct.handle_chat_bridge_command(args)
+
+        assert handled is True, "chat bridge CLI command should be handled"
+        assert backup_calls == [], f"missing source sessions should not trigger Codex backup: {backup_calls}"
+    finally:
+        ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
 
 
 def test_droid_history_redacts_key():
@@ -2517,9 +2894,18 @@ if __name__ == "__main__":
     test("session search metadata hit", test_search_sessions_metadata_hit)
     test("session search JSONL fallback hit", test_search_sessions_jsonl_fallback_hit)
     test("session search project filter", test_search_sessions_project_filter)
+    test("chat bridge Droid session normalizes messages and tools", test_chat_bridge_droid_session_to_bridge_preserves_messages_and_tools)
+    test("chat bridge Droid to Codex import creates consistent rollout and pins old", test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_old)
+    test("chat bridge Droid to Codex import can use fresh timestamps", test_chat_bridge_droid_to_codex_import_can_use_fresh_timestamps)
+    test("chat bridge Droid to Codex mapping failure reports warning after commit", test_chat_bridge_droid_to_codex_mapping_failure_reports_warning_after_commit)
+    test("chat bridge mapping keeps duplicate import pairs", test_chat_bridge_mapping_keeps_duplicate_import_pairs)
+    test("chat bridge Droid to Codex import rolls back invalid rollout", test_chat_bridge_droid_to_codex_import_rolls_back_invalid_rollout)
+    test("chat bridge Codex to Droid import writes session and mapping", test_chat_bridge_codex_to_droid_import_writes_session_and_mapping)
     test("operation history redacts and loads newest first", test_operation_history_redacts_and_loads_newest)
     test("provider action emits history without secret", test_provider_action_emits_history_without_secret)
     test("droid CLI flags are registered", test_droid_cli_flags_registered)
+    test("chat bridge CLI flags are registered", test_chat_bridge_cli_flags_registered)
+    test("chat bridge CLI missing Droid session does not backup", test_chat_bridge_cli_missing_droid_session_does_not_backup)
     test("droid history redacts keys", test_droid_history_redacts_key)
     test("droid doctor ignores legacy model issues", test_droid_doctor_ignores_legacy_model_issues)
     test("droid JSONC parser respects strings", test_droid_jsonc_parser_respects_strings)

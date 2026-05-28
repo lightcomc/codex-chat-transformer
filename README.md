@@ -149,6 +149,20 @@ python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
 
 Droid writes go to `~/.factory/settings.local.json`. Existing `settings.json`, legacy `config.json`, and Factory auth files remain untouched. By default API keys are written as environment variable references such as `${NEUROGATE_API_KEY}`; direct key writes require `--droid-with-key --api-key ...`.
 
+### Chat Bridge: Codex <-> Droid Sessions
+
+First-slice chat transfer creates new destination sessions and records pairs in `chat_bridge_mappings.json` for later sync work. It does not copy auth files or API keys.
+
+```bash
+python codex_chat_transformer.py --droid-sessions
+python codex_chat_transformer.py --codex-sessions --project C:\Research\my_project
+python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-pin-old
+python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID
+python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-fresh-timestamps
+```
+
+Timestamp preservation is the default. `--chat-fresh-timestamps` makes the imported chat look new. Droid -> Codex creates a full Codex backup first, then writes the Codex rollout JSONL and `threads` row as a verified pair.
+
 ### Pin Chats
 
 Makes chats visible regardless of the active provider. Pinned chats always appear in the sidebar. Used for reactivating chats when transitioning between providers.
@@ -392,10 +406,11 @@ A: Yes: `--sync-pull IP:PORT --pin XXXXXX` opens an interactive CLI menu.
 
 ```
 codex_chat_transformer.py    — CLI: conversion, providers, pin, backup, doctor, edit, sync
+chat_bridge.py               — Codex <-> Droid chat session bridge helpers
 codex_manager_gui.py         — GUI: switching, editing, model change, sync (CLI wrapper)
 codex_sync.py                — P2P sync engine: server, client, Dashboard, file sync, auto-sync
 sync_tray.py                 — System tray widget (optional, requires pystray + Pillow)
-test_smoke.py                — Smoke tests (47 tests)
+test_smoke.py                — Smoke tests (99 tests)
 codex_manager.cmd / .ps1     — Windows launchers
 codex_manager.sh             — Unix launcher
 providers_template.json      — Provider template

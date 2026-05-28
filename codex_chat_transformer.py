@@ -2331,6 +2331,153 @@ def handle_droid_command(args):
     return False
 
 
+def _args_have_chat_bridge_command(args):
+    return any([
+        getattr(args, "droid_sessions", False),
+        getattr(args, "codex_sessions", False),
+        getattr(args, "droid_to_codex", False),
+        getattr(args, "codex_to_droid", False),
+    ])
+
+
+def _chat_session_ids(args):
+    ids = _parse_csv_list(getattr(args, "chat_session", None))
+    return ids
+
+
+def _display_session_text(value, limit=80):
+    text = " ".join(str(value or "-").split())
+    if len(text) > limit:
+        return text[: max(0, limit - 3)] + "..."
+    return text
+
+
+def _print_codex_chat_sessions(rows):
+    print("\n=== Codex Sessions ===")
+    if not rows:
+        print("No sessions found.")
+        return
+    limit = 30
+    for row in rows[:limit]:
+        updated = row.get("updated_at_ms") or (row.get("updated_at") or 0) * 1000
+        updated_text = "-"
+        if updated:
+            updated_text = datetime.datetime.fromtimestamp(updated / 1000).strftime("%Y-%m-%d %H:%M")
+        print(f"  {row.get('id', '')} | {_display_session_text(row.get('title'))} | {row.get('model_provider') or '-'} | {updated_text}")
+    if len(rows) > limit:
+        print(f"  ... {len(rows) - limit} more (use --project to filter)")
+
+
+def _print_droid_chat_sessions(sessions, factory_home):
+    print("\n=== Droid Sessions ===")
+    print(f"Factory home: {factory_home}")
+    if not sessions:
+        print("No sessions found.")
+        return
+    for session in sessions:
+        updated = session.get("mtime")
+        updated_text = "-"
+        if updated:
+            if updated > 100000000000:
+                updated = updated / 1000
+            updated_text = datetime.datetime.fromtimestamp(updated).strftime("%Y-%m-%d %H:%M")
+        print(f"  {session.get('id', '')} | {_display_session_text(session.get('title'))} | messages={session.get('message_count', 0)} | {updated_text}")
+
+
+def handle_chat_bridge_command(args):
+    if not _args_have_chat_bridge_command(args):
+        return False
+
+    try:
+        import chat_bridge
+
+        factory_home = _droid_home_from_args(args)
+
+        if args.droid_sessions:
+            _print_droid_chat_sessions(chat_bridge.list_droid_sessions(factory_home), factory_home)
+            return True
+
+        if args.codex_sessions:
+            _print_codex_chat_sessions(_fetch_session_rows(project=args.project))
+            return True
+
+        ids = _chat_session_ids(args)
+        if not ids:
+            print("ERROR: --chat-session is required for chat transfer commands.")
+            return True
+        preserve_timestamps = not bool(args.chat_fresh_timestamps)
+
+        if args.droid_to_codex:
+            pending = []
+            old_before_ms = None
+            if args.chat_pin_old:
+                old_before = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.chat_old_days)
+                old_before_ms = int(old_before.timestamp() * 1000)
+            for session_id in ids:
+                jsonl_path = factory_home / "sessions" / f"{session_id}.jsonl"
+                settings_path = factory_home / "sessions" / f"{session_id}.settings.json"
+                if not jsonl_path.exists():
+                    print(f"  {session_id}: Droid session JSONL not found")
+                    continue
+                pending.append((session_id, chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)))
+            if not pending:
+                print("No valid Droid sessions to import.")
+                return True
+            backup_path = full_backup()
+            imported = []
+            for session_id, bridge in pending:
+                summary = chat_bridge.import_bridge_to_codex(
+                    bridge,
+                    codex_dir=CODEX_DIR,
+                    state_db=STATE_DB,
+                    sessions_dir=SESSIONS_DIR,
+                    global_state_path=GLOBAL_STATE,
+                    preserve_timestamps=preserve_timestamps,
+                    pin_old=args.chat_pin_old,
+                    old_before_ms=old_before_ms,
+                )
+                imported.append(summary)
+                print(f"  {session_id} -> {summary['codex_session_id']} | pinned={summary['pinned']}")
+            record_history(
+                "chat_bridge_droid_to_codex",
+                backup_path=str(backup_path),
+                details={"sessions": len(imported), "preserve_timestamps": preserve_timestamps},
+            )
+            return True
+
+        if args.codex_to_droid:
+            rows = _fetch_session_rows(session_ids=ids)
+            row_map = {row.get("id"): row for row in rows}
+            imported = []
+            for session_id in ids:
+                row = row_map.get(session_id)
+                if not row:
+                    print(f"  {session_id}: Codex session not found")
+                    continue
+                rollout_path = _normalize_rollout_path(row.get("rollout_path"))
+                if not rollout_path or not os.path.exists(rollout_path):
+                    print(f"  {session_id}: rollout not found")
+                    continue
+                bridge = chat_bridge.codex_session_to_bridge(row, rollout_path)
+                summary = chat_bridge.import_bridge_to_droid(
+                    bridge,
+                    factory_home=factory_home,
+                    preserve_timestamps=preserve_timestamps,
+                )
+                imported.append(summary)
+                print(f"  {session_id} -> {summary['droid_session_id']}")
+            record_history(
+                "chat_bridge_codex_to_droid",
+                details={"sessions": len(imported), "preserve_timestamps": preserve_timestamps, "factory_home": str(factory_home)},
+            )
+            return True
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        return True
+
+    return False
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Transform Codex chats between model_provider types"
@@ -2385,6 +2532,15 @@ def build_parser():
     parser.add_argument("--droid-settings", metavar="PATH", help="Path to Droid Factory settings.json")
     parser.add_argument("--droid-with-key", action="store_true", help="Copy the resolved key into Droid Factory settings when supported")
     parser.add_argument("--droid-api-key-env", metavar="VAR", help="Environment variable name to reference for Droid API keys")
+    parser.add_argument("--droid-sessions", action="store_true", help="List Droid Factory chat sessions without printing bodies")
+    parser.add_argument("--codex-sessions", action="store_true", help="List Codex chat sessions without printing bodies")
+    parser.add_argument("--droid-to-codex", action="store_true", help="Import selected Droid chat session(s) into Codex")
+    parser.add_argument("--codex-to-droid", action="store_true", help="Import selected Codex chat session(s) into Droid Factory")
+    parser.add_argument("--chat-session", metavar="ID1,ID2", help="Chat session ID(s) for bridge transfer")
+    parser.add_argument("--chat-preserve-timestamps", action="store_true", help="Preserve source created/updated timestamps during chat transfer")
+    parser.add_argument("--chat-fresh-timestamps", action="store_true", help="Use fresh timestamps during chat transfer")
+    parser.add_argument("--chat-pin-old", action="store_true", help="Pin old Droid chats when importing them into Codex")
+    parser.add_argument("--chat-old-days", type=int, default=180, metavar="N", help="Age threshold for --chat-pin-old")
 
     # Sync arguments
     parser.add_argument("--sync-host", action="store_true", help="Start P2P sync server + Dashboard")
@@ -2399,6 +2555,8 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     if handle_droid_command(args):
+        return
+    if handle_chat_bridge_command(args):
         return
     provider_filter = None
     session_filter = None

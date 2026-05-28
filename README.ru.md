@@ -149,6 +149,20 @@ python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
 
 Все записи Droid идут в `%USERPROFILE%\.factory\settings.local.json`. Существующие `settings.json`, legacy `config.json` и Factory auth-файлы не трогаются. По умолчанию API-ключи пишутся как ссылки на переменные окружения, например `${NEUROGATE_API_KEY}`; прямую запись ключа нужно явно включить через `--droid-with-key --api-key ...`.
 
+### Chat Bridge: сессии Codex <-> Droid
+
+Первый срез переноса чатов создаёт новые сессии в целевой системе и записывает пары в `chat_bridge_mappings.json` для будущей синхронизации. Auth-файлы и API-ключи не копируются.
+
+```bash
+python codex_chat_transformer.py --droid-sessions
+python codex_chat_transformer.py --codex-sessions --project C:\Research\my_project
+python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-pin-old
+python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID
+python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-fresh-timestamps
+```
+
+По умолчанию сохраняются даты создания и последнего сообщения. `--chat-fresh-timestamps` переносит чат как свежий. Droid -> Codex сначала делает полный бэкап `.codex`, затем создаёт rollout JSONL и строку `threads` как проверенную пару.
+
 ### Закрепление чатов
 
 Делает чаты видимыми при **любом** подключении. Pinned-чаты показываются всегда, независимо от провайдера. Используется для реактивации чатов при переходе между провайдерами.
@@ -391,7 +405,7 @@ codex_chat_transformer.py    — CLI: конвертация, провайдер
 codex_manager_gui.py         — GUI: переключение, редактирование, смена модели, синхронизация (обёртка над CLI)
 codex_sync.py                — Движок P2P синхронизации: сервер, клиент, Dashboard, файлы, авторсинхронизация
 sync_tray.py                 — Виджет в системном трее (опционально, требует pystray + Pillow)
-test_smoke.py                — Smoke-тесты (47 тестов)
+test_smoke.py                — Smoke-тесты (99 тестов)
 codex_manager.cmd / .ps1     — Windows запускаторы
 codex_manager.sh             — Unix запускатор
 providers_template.json      — Шаблон провайдера

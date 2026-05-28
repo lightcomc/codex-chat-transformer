@@ -21,8 +21,13 @@
 - API keys default to environment variable references such as `${NEUROGATE_API_KEY}`; direct key writes require `--droid-with-key --api-key ...`.
 - Droid doctor reports legacy `config.json` model count without failing healthy current `customModels` because legacy BYOK configs can still work.
 
+### Chat Bridge
+- Added first-slice Codex <-> Droid chat transfer helpers and CLI flags: `--droid-sessions`, `--codex-sessions`, `--droid-to-codex`, `--codex-to-droid`, `--chat-session`, `--chat-fresh-timestamps`, and `--chat-pin-old`.
+- Droid -> Codex imports create a verified `threads` row + rollout JSONL pair and create a full `.codex` backup before writing.
+- Chat transfers preserve source timestamps by default, can import as fresh, and record session pairs in `chat_bridge_mappings.json` for future mirror sync.
+
 ### Tests
-- 89 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, provider health checks, and Droid provider management.
+- 99 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, provider health checks, Droid provider management, and Chat Bridge transfer.
 
 ## [1.3.0] — 2026-05-25
 

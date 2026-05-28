@@ -149,6 +149,20 @@ python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
 
 Droid 写入目标是 `%USERPROFILE%\.factory\settings.local.json`。现有 `settings.json`、legacy `config.json` 和 Factory auth 文件保持不变。默认情况下 API key 会写成环境变量引用，例如 `${NEUROGATE_API_KEY}`；直接写入 key 需要显式使用 `--droid-with-key --api-key ...`。
 
+### Chat Bridge: Codex <-> Droid Sessions
+
+The first chat-transfer slice creates new destination sessions and records pairs in `chat_bridge_mappings.json` for later sync work. It does not copy auth files or API keys.
+
+```bash
+python codex_chat_transformer.py --droid-sessions
+python codex_chat_transformer.py --codex-sessions --project C:\Research\my_project
+python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-pin-old
+python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID
+python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-fresh-timestamps
+```
+
+Timestamps are preserved by default. `--chat-fresh-timestamps` imports the chat as fresh. Droid -> Codex creates a full Codex backup first, then writes the rollout JSONL and `threads` row as a verified pair.
+
 ### 固定聊天
 
 使聊天在任何活跃提供商下都可见。固定的聊天始终显示在侧边栏中。用于在提供商之间切换时重新激活聊天。
@@ -391,7 +405,7 @@ codex_chat_transformer.py    — CLI：转换、提供商、固定、备份、�
 codex_manager_gui.py         — GUI：切换、编辑、更改模型、同步（CLI 封装）
 codex_sync.py                — P2P 同步引擎：服务器、客户端、Dashboard、文件同步、自动同步
 sync_tray.py                 — 系统托盘小组件（可选，需 pystray + Pillow）
-test_smoke.py                — 冒烟测试（47 个测试）
+test_smoke.py                — 冒烟测试（99 个测试）
 codex_manager.cmd / .ps1     — Windows 启动器
 codex_manager.sh             — Unix 启动器
 providers_template.json      — 提供商模板
