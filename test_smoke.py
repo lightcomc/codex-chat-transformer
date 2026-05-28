@@ -856,6 +856,24 @@ def test_chat_bridge_droid_session_lookup_finds_project_nested_files():
         assert found_settings == settings_path, f"project Droid settings should follow JSONL path: {found_settings}"
 
 
+def test_chat_bridge_droid_to_bridge_preserves_project_cwd_and_session_title():
+    import chat_bridge
+
+    with tempfile.TemporaryDirectory() as tmp:
+        jsonl_path, settings_path = write_temp_droid_session(tmp, title="seed title")
+        lines = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+        lines[0]["sessionTitle"] = "Review Provided Repository for Analysis"
+        lines[0]["cwd"] = r"C:\Research\nothing"
+        lines[0]["hostId"] = "host-project-1"
+        jsonl_path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+
+    assert bridge["session"]["title"] == "Review Provided Repository for Analysis", f"Droid sessionTitle should become Codex title: {bridge['session']}"
+    assert bridge["work_context"]["primary_cwd"] == r"C:\Research\nothing", f"Droid cwd should become bridge primary cwd: {bridge['work_context']}"
+    assert bridge["work_context"]["current"]["cwd"] == r"C:\Research\nothing", f"Droid cwd should become current cwd: {bridge['work_context']}"
+
+
 def test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_old():
     import chat_bridge
     import sqlite3
@@ -3194,6 +3212,7 @@ if __name__ == "__main__":
     test("session search project filter", test_search_sessions_project_filter)
     test("chat bridge Droid session normalizes messages and tools", test_chat_bridge_droid_session_to_bridge_preserves_messages_and_tools)
     test("chat bridge Droid session lookup finds project nested files", test_chat_bridge_droid_session_lookup_finds_project_nested_files)
+    test("chat bridge Droid to bridge preserves project cwd and session title", test_chat_bridge_droid_to_bridge_preserves_project_cwd_and_session_title)
     test("chat bridge Droid to Codex import creates consistent rollout and pins old", test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_old)
     test("chat bridge Droid to Codex import can use fresh timestamps", test_chat_bridge_droid_to_codex_import_can_use_fresh_timestamps)
     test("chat bridge Droid to Codex mapping failure reports warning after commit", test_chat_bridge_droid_to_codex_mapping_failure_reports_warning_after_commit)

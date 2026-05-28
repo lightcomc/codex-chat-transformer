@@ -30,9 +30,10 @@
 - Codex -> Droid timestamp preservation now updates Droid index/file mtimes from the source session instead of making preserved imports look freshly modified.
 - Windows extended path prefixes such as `\\?\C:\...` are normalized before writing Droid project `cwd` values.
 - Codex -> Droid now writes Droid-valid tool calls by converting JSON-string tool inputs into objects and linking messages with `parentId`.
+- Droid -> Codex now preserves Droid `sessionTitle` and project `cwd` from `session_start`.
 
 ### Tests
-- 108 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, provider health checks, Droid provider management, GUI wiring, and Chat Bridge transfer.
+- 109 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, provider health checks, Droid provider management, GUI wiring, and Chat Bridge transfer.
 
 ## [1.3.0] — 2026-05-25
 

@@ -160,7 +160,8 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
     events = _read_jsonl(jsonl_path)
     session_start = next((e for e in events if e.get("type") == "session_start"), {})
     session_id = str(session_start.get("id") or jsonl_path.stem)
-    title = str(session_start.get("title") or session_id)
+    title = str(session_start.get("sessionTitle") or session_start.get("title") or session_id)
+    cwd = _normalize_droid_cwd(session_start.get("cwd") or "")
     messages = []
     timestamps = []
     raw_event_refs = []
@@ -202,6 +203,12 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
     created_ms = min(timestamps) if timestamps else int(_utc_now().timestamp() * 1000)
     updated_ms = max(timestamps) if timestamps else created_ms
     model = str(settings.get("providerLock") or "")
+    work_context = _unknown_work_context()
+    if cwd:
+        work_context["primary_cwd"] = cwd
+        work_context["current"]["cwd"] = cwd
+        work_context["current"]["source"] = "droid_session_start"
+        work_context["current"]["confidence"] = "observed"
     bridge = {
         "format": BRIDGE_FORMAT,
         "version": BRIDGE_VERSION,
@@ -219,9 +226,15 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
             "provider": "droid",
             "model": model,
         },
-        "work_context": _unknown_work_context(),
+        "work_context": work_context,
         "messages": messages,
         "extras": {
+            "droid_session_start": {
+                "title": session_start.get("title") or "",
+                "sessionTitle": session_start.get("sessionTitle") or "",
+                "cwd": cwd,
+                "hostId": session_start.get("hostId") or "",
+            },
             "droid_settings": {
                 "providerLock": model,
                 "providerLockTimestamp": settings.get("providerLockTimestamp") or "",
