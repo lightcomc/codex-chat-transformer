@@ -272,6 +272,8 @@ GUI 是 CLI 的轻量封装（`import codex_chat_transformer as ct`），无代�
 
 - 一键切换提供商
 - 后台线程转换 —— GUI 不会冻结
+- P2P 同步区域：启动服务器、打开 Dashboard、复制 IP:PIN
+- Chat Bridge 面板：Droid -> Codex 和 Codex -> Droid 会话迁移
 - 编辑提供商：按钮或右键上下文菜单
 - 模型和推理能力可在信息面板中内联编辑
 - 推理能力下拉菜单：low / medium / high / xhigh / default

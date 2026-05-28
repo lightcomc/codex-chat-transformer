@@ -272,6 +272,8 @@ GUI — тонкая обёртка над CLI (`import codex_chat_transformer a
 
 - Переключение провайдеров одним кликом
 - Конвертация чатов в фоновом потоке — GUI не зависает
+- Секция P2P-синхронизации: запуск сервера, Dashboard и копирование IP:PIN
+- Панель Chat Bridge для переноса сессий Droid -> Codex и Codex -> Droid
 - Редактирование провайдера: кнопка или правый клик
 - Модель и reasoning меняются прямо в info-панели
 - Выпадающий список reasoning: low / medium / high / xhigh / default

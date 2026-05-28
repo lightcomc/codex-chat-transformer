@@ -13,7 +13,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 
+import chat_bridge
 import codex_chat_transformer as ct
+import droid_provider_adapter as droid
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -22,6 +24,7 @@ STATE_DB = CODEX_DIR / "state_5.sqlite"
 GLOBAL_STATE = CODEX_DIR / ".codex-global-state.json"
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROVIDERS_FILE = CODEX_DIR / "providers.json"
+SESSIONS_DIR = CODEX_DIR / "sessions"
 
 # ── Theme ──────────────────────────────────────────────────────────────────
 
@@ -129,8 +132,26 @@ T = {
     "sync_stop": {"ru": "Остановить", "en": "Stop"},
     "sync_running": {"ru": "Сервер: {ip}:{port} PIN: {pin}", "en": "Server: {ip}:{port} PIN: {pin}"},
     "sync_stopped": {"ru": "Сервер остановлен", "en": "Server stopped"},
+    "sync_title": {"ru": "Синхронизатор", "en": "Sync"},
     "sync_open": {"ru": "Открыть Dashboard", "en": "Open Dashboard"},
     "sync_copy": {"ru": "Копировать IP:PIN", "en": "Copy IP:PIN"},
+    "chat_bridge": {"ru": "Codex ↔ Droid", "en": "Codex ↔ Droid"},
+    "chat_refresh": {"ru": "Обновить списки", "en": "Refresh lists"},
+    "chat_droid_session": {"ru": "Droid-сессия", "en": "Droid session"},
+    "chat_codex_session": {"ru": "Codex-сессия", "en": "Codex session"},
+    "droid_to_codex": {"ru": "Droid → Codex", "en": "Droid → Codex"},
+    "codex_to_droid": {"ru": "Codex → Droid", "en": "Codex → Droid"},
+    "chat_fresh_timestamps": {"ru": "Импортировать как свежий чат", "en": "Import as fresh chat"},
+    "chat_pin_old": {"ru": "Pin старые Droid-чаты", "en": "Pin old Droid chats"},
+    "chat_lists_ready": {"ru": "Droid: {droid}, Codex: {codex}", "en": "Droid: {droid}, Codex: {codex}"},
+    "chat_no_droid": {"ru": "Выберите Droid-сессию.", "en": "Select a Droid session."},
+    "chat_no_codex": {"ru": "Выберите Codex-сессию.", "en": "Select a Codex session."},
+    "chat_confirm_droid_to_codex": {"ru": "Импортировать Droid-сессию в Codex?\n\nПеред записью будет создан полный backup .codex.", "en": "Import the Droid session into Codex?\n\nA full .codex backup will be created before writing."},
+    "chat_confirm_codex_to_droid": {"ru": "Экспортировать Codex-сессию в Droid?\n\nБудет создана новая Droid-сессия.", "en": "Export the Codex session into Droid?\n\nA new Droid session will be created."},
+    "chat_transfer_running": {"ru": "Перенос чата...", "en": "Transferring chat..."},
+    "chat_imported_codex": {"ru": "Droid → Codex: {session}", "en": "Droid → Codex: {session}"},
+    "chat_imported_droid": {"ru": "Codex → Droid: {session}", "en": "Codex → Droid: {session}"},
+    "chat_refreshing": {"ru": "Обновление списков...", "en": "Refreshing lists..."},
     "consent_title": {"ru": "Codex Chat Transformer — Условия использования", "en": "Codex Chat Transformer — Terms of Use"},
     "consent_accept": {"ru": "Принимаю условия", "en": "I accept the terms"},
     "consent_decline": {"ru": "Отклонить и выйти", "en": "Decline and exit"},
@@ -174,6 +195,20 @@ T = {
 def t(key, *args):
     s = T.get(key, {}).get(LANG, key)
     return s.format(*args) if args else s
+
+
+def _unique_chat_display(display, unique_hint, taken):
+    """Keep combobox display labels unique even after truncation."""
+    display = str(display or "-")
+    if display not in taken:
+        return display
+    hint = " ".join(str(unique_hint or "").split())[:24] or str(len(taken) + 1)
+    candidate = f"{display} [{hint}]"
+    counter = 2
+    while candidate in taken:
+        candidate = f"{display} [{hint} #{counter}]"
+        counter += 1
+    return candidate
 
 
 # ── Data helpers (delegate to CLI module) ────────────────────────────────────
@@ -325,12 +360,13 @@ class CodexManagerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Codex Chat Transformer")
-        self.root.geometry("540x700")
+        self.root.geometry("620x860")
         self.root.configure(bg=BG)
         self.root.resizable(False, False)
         self._setup_styles()
         self._build_ui()
         self._refresh()
+        self._refresh_chat_bridge_sessions(silent=True)
         self._auto_detect()
 
     def _setup_styles(self):
@@ -483,6 +519,8 @@ class CodexManagerApp:
         self._sync_pin = ""
         self._sync_port = 0
 
+        self.lbl_sync_title = ttk.Label(sync_frame, text=t("sync_title"), style="Active.TLabel")
+        self.lbl_sync_title.pack(side="left", padx=(0, 8))
         self.btn_sync = ttk.Button(sync_frame, text=t("sync_start"), command=self._toggle_sync)
         self.btn_sync.pack(side="left")
         self.sync_status = ttk.Label(sync_frame, text=t("sync_stopped"), style="Stats.TLabel")
@@ -491,6 +529,57 @@ class CodexManagerApp:
         self.btn_dash.pack(side="right")
         self.btn_copy_sync = ttk.Button(sync_frame, text=t("sync_copy"), command=self._copy_sync_info, style="Small.TButton")
         self.btn_copy_sync.pack(side="right", padx=(0, 4))
+
+        # Chat Bridge section
+        chat_frame = tk.Frame(self.root, bg=BG2, padx=12, pady=8)
+        chat_frame.pack(fill="x", padx=16, pady=(6, 2))
+
+        self.chat_droid_sessions = []
+        self.chat_codex_sessions = []
+        self.chat_droid_map = {}
+        self.chat_codex_map = {}
+        self.chat_droid_var = tk.StringVar()
+        self.chat_codex_var = tk.StringVar()
+        self.chat_fresh_var = tk.BooleanVar(value=False)
+        self.chat_pin_old_var = tk.BooleanVar(value=True)
+
+        chat_top = tk.Frame(chat_frame, bg=BG2)
+        chat_top.pack(fill="x")
+        self.lbl_chat_bridge = ttk.Label(chat_top, text=t("chat_bridge"), style="Active.TLabel")
+        self.lbl_chat_bridge.pack(side="left")
+        self.btn_chat_refresh = ttk.Button(chat_top, text=t("chat_refresh"), command=self._refresh_chat_bridge_sessions, style="Small.TButton")
+        self.btn_chat_refresh.pack(side="right")
+
+        chat_rows = tk.Frame(chat_frame, bg=BG2)
+        chat_rows.pack(fill="x", pady=(6, 0))
+        chat_rows.columnconfigure(1, weight=1)
+
+        self.lbl_chat_droid = ttk.Label(chat_rows, text=t("chat_droid_session"), style="Stats.TLabel")
+        self.lbl_chat_droid.grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        self.chat_droid_combo = ttk.Combobox(chat_rows, textvariable=self.chat_droid_var, state="readonly", width=54)
+        self.chat_droid_combo.grid(row=0, column=1, sticky="ew", pady=(0, 4))
+
+        self.lbl_chat_codex = ttk.Label(chat_rows, text=t("chat_codex_session"), style="Stats.TLabel")
+        self.lbl_chat_codex.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        self.chat_codex_combo = ttk.Combobox(chat_rows, textvariable=self.chat_codex_var, state="readonly", width=54)
+        self.chat_codex_combo.grid(row=1, column=1, sticky="ew", pady=(0, 4))
+
+        chat_opts = tk.Frame(chat_frame, bg=BG2)
+        chat_opts.pack(fill="x", pady=(2, 0))
+        self.chk_chat_fresh = ttk.Checkbutton(chat_opts, text=t("chat_fresh_timestamps"), variable=self.chat_fresh_var)
+        self.chk_chat_fresh.pack(side="left")
+        self.chk_chat_pin_old = ttk.Checkbutton(chat_opts, text=t("chat_pin_old"), variable=self.chat_pin_old_var)
+        self.chk_chat_pin_old.pack(side="left", padx=(14, 0))
+
+        chat_buttons = tk.Frame(chat_frame, bg=BG2)
+        chat_buttons.pack(fill="x", pady=(6, 0))
+        self.btn_droid_to_codex = ttk.Button(chat_buttons, text=t("droid_to_codex"), command=self._chat_droid_to_codex)
+        self.btn_droid_to_codex.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self.btn_codex_to_droid = ttk.Button(chat_buttons, text=t("codex_to_droid"), command=self._chat_codex_to_droid)
+        self.btn_codex_to_droid.pack(side="left", expand=True, fill="x")
+
+        self.chat_status = ttk.Label(chat_frame, text="", style="Stats.TLabel")
+        self.chat_status.pack(anchor="w", pady=(6, 0))
 
         # Status bar
         tk.Frame(self.root, bg=BG2, height=1).pack(fill="x", padx=16, pady=(8, 2))
@@ -520,11 +609,20 @@ class CodexManagerApp:
         self.btn_create.config(text=t("create_new"))
         self.btn_backup.config(text=t("full_backup"))
         self.btn_restore.config(text=t("restore_zip"))
+        self.lbl_sync_title.config(text=t("sync_title"))
         self.btn_sync.config(text=t("sync_stop") if self._sync_server else t("sync_start"))
         self.btn_dash.config(text=t("sync_open"))
         self.btn_copy_sync.config(text=t("sync_copy"))
         if not self._sync_server:
             self.sync_status.config(text=t("sync_stopped"))
+        self.lbl_chat_bridge.config(text=t("chat_bridge"))
+        self.btn_chat_refresh.config(text=t("chat_refresh"))
+        self.lbl_chat_droid.config(text=t("chat_droid_session"))
+        self.lbl_chat_codex.config(text=t("chat_codex_session"))
+        self.chk_chat_fresh.config(text=t("chat_fresh_timestamps"))
+        self.chk_chat_pin_old.config(text=t("chat_pin_old"))
+        self.btn_droid_to_codex.config(text=t("droid_to_codex"))
+        self.btn_codex_to_droid.config(text=t("codex_to_droid"))
         self.btn_fixdates.config(text=t("fix_dates"))
         self.btn_edit.config(text=t("edit_provider"))
         self.ctx_menu.entryconfig(0, label=t("ctx_switch"))
@@ -614,6 +712,235 @@ class CodexManagerApp:
 
         if active not in profiles:
             self.status_var.set(t("not_saved", active))
+
+    def _short_chat_text(self, value, limit=62):
+        text = " ".join(str(value or "-").split())
+        if len(text) > limit:
+            return text[: max(0, limit - 3)] + "..."
+        return text
+
+    def _chat_time_text(self, value):
+        if not value:
+            return "-"
+        try:
+            raw = float(value)
+            if raw > 100000000000:
+                raw = raw / 1000
+            return datetime.datetime.fromtimestamp(raw).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return "-"
+
+    def _droid_session_display(self, session):
+        return " | ".join([
+            self._short_chat_text(session.get("id"), 28),
+            self._short_chat_text(session.get("title"), 36),
+            f"msg={session.get('message_count', 0)}",
+            self._chat_time_text(session.get("mtime")),
+        ])
+
+    def _codex_session_display(self, row):
+        updated = row.get("updated_at_ms") or ((row.get("updated_at") or 0) * 1000)
+        return " | ".join([
+            self._short_chat_text(row.get("id"), 28),
+            self._short_chat_text(row.get("title"), 34),
+            self._short_chat_text(row.get("model_provider") or "-", 16),
+            self._chat_time_text(updated),
+        ])
+
+    def _refresh_chat_bridge_sessions(self, silent=False):
+        if not silent:
+            self.chat_status.config(text=t("chat_refreshing"))
+        threading.Thread(target=self._refresh_chat_bridge_sessions_thread, args=(silent,), daemon=True).start()
+
+    def _refresh_chat_bridge_sessions_thread(self, silent=False):
+        try:
+            factory_home = droid.factory_home_from_settings(None)
+            droid_sessions = chat_bridge.list_droid_sessions(factory_home)
+            codex_sessions = ct._fetch_session_rows()
+
+            droid_map = {}
+            droid_values = []
+            for session in droid_sessions[:80]:
+                display = self._droid_session_display(session)
+                display = _unique_chat_display(display, session.get("id"), droid_map)
+                droid_map[display] = session
+                droid_values.append(display)
+
+            codex_map = {}
+            codex_values = []
+            for row in codex_sessions[:80]:
+                display = self._codex_session_display(row)
+                display = _unique_chat_display(display, row.get("id"), codex_map)
+                codex_map[display] = row
+                codex_values.append(display)
+
+            self.root.after(
+                0,
+                lambda: self._apply_chat_bridge_sessions(
+                    droid_sessions, codex_sessions, droid_values, codex_values, droid_map, codex_map, silent
+                ),
+            )
+        except Exception as e:
+            error = str(e)
+            self.root.after(0, lambda: self._chat_bridge_refresh_failed(error, silent))
+
+    def _apply_chat_bridge_sessions(self, droid_sessions, codex_sessions, droid_values, codex_values, droid_map, codex_map, silent=False):
+        self.chat_droid_sessions = droid_sessions
+        self.chat_codex_sessions = codex_sessions
+        self.chat_droid_map = droid_map
+        self.chat_codex_map = codex_map
+        self.chat_droid_combo.config(values=droid_values)
+        self.chat_codex_combo.config(values=codex_values)
+        if self.chat_droid_var.get() not in self.chat_droid_map:
+            self.chat_droid_var.set(droid_values[0] if droid_values else "")
+        if self.chat_codex_var.get() not in self.chat_codex_map:
+            self.chat_codex_var.set(codex_values[0] if codex_values else "")
+
+        status = t("chat_lists_ready").format(droid=len(droid_sessions), codex=len(codex_sessions))
+        if not silent or not self.chat_status.cget("text"):
+            self.chat_status.config(text=status)
+        if not silent:
+            self.status_var.set(status)
+
+    def _chat_bridge_refresh_failed(self, error, silent=False):
+        self.chat_status.config(text=error)
+        if not silent:
+            messagebox.showerror(t("error"), error)
+
+    def _selected_droid_chat(self):
+        session = self.chat_droid_map.get(self.chat_droid_var.get())
+        if not session:
+            messagebox.showwarning(t("warning"), t("chat_no_droid"))
+            return None
+        return session
+
+    def _selected_codex_chat(self):
+        row = self.chat_codex_map.get(self.chat_codex_var.get())
+        if not row:
+            messagebox.showwarning(t("warning"), t("chat_no_codex"))
+            return None
+        return row
+
+    def _chat_droid_to_codex(self):
+        session = self._selected_droid_chat()
+        if not session:
+            return
+        if not messagebox.askyesno(t("chat_bridge"), t("chat_confirm_droid_to_codex")):
+            return
+        self._start_chat_transfer("droid_to_codex", session)
+
+    def _chat_codex_to_droid(self):
+        row = self._selected_codex_chat()
+        if not row:
+            return
+        if not messagebox.askyesno(t("chat_bridge"), t("chat_confirm_codex_to_droid")):
+            return
+        self._start_chat_transfer("codex_to_droid", row)
+
+    def _start_chat_transfer(self, direction, item):
+        self.status_var.set(t("chat_transfer_running"))
+        self.chat_status.config(text=t("chat_transfer_running"))
+        self._set_buttons_state("disabled")
+        preserve_timestamps = not self.chat_fresh_var.get()
+        pin_old = self.chat_pin_old_var.get()
+        threading.Thread(
+            target=self._chat_transfer_thread,
+            args=(direction, item, preserve_timestamps, pin_old),
+            daemon=True,
+        ).start()
+
+    def _chat_transfer_thread(self, direction, item, preserve_timestamps=True, pin_old=False):
+        try:
+            if direction == "droid_to_codex":
+                summary = self._run_droid_to_codex_transfer(item, preserve_timestamps, pin_old)
+                message = t("chat_imported_codex").format(session=summary["codex_session_id"])
+            else:
+                summary = self._run_codex_to_droid_transfer(item, preserve_timestamps)
+                message = t("chat_imported_droid").format(session=summary["droid_session_id"])
+            warnings = summary.get("warnings") or []
+            detail = message
+            if warnings:
+                detail += " | warnings: " + "; ".join(str(w) for w in warnings)
+            self.root.after(0, lambda: self._chat_transfer_done(message, detail))
+        except Exception as e:
+            error = str(e)
+            self.root.after(0, lambda: self._chat_transfer_failed(error))
+
+    def _run_droid_to_codex_transfer(self, session, preserve_timestamps=True, pin_old=False):
+        session_id = session.get("id") or ""
+        jsonl_path = Path(session.get("jsonl_path") or (droid.factory_home_from_settings(None) / "sessions" / f"{session_id}.jsonl"))
+        settings_path = Path(session.get("settings_path") or jsonl_path.with_suffix(".settings.json"))
+        if not jsonl_path.exists():
+            raise ValueError(f"Droid session JSONL not found: {jsonl_path}")
+
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path if settings_path.exists() else None)
+        backup_path = ct.full_backup()
+        old_before = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=180)
+        summary = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=ct.CODEX_DIR,
+            state_db=ct.STATE_DB,
+            sessions_dir=getattr(ct, "SESSIONS_DIR", SESSIONS_DIR),
+            global_state_path=ct.GLOBAL_STATE,
+            preserve_timestamps=preserve_timestamps,
+            pin_old=pin_old,
+            old_before_ms=int(old_before.timestamp() * 1000),
+        )
+        ct.record_history(
+            "chat_bridge_droid_to_codex",
+            source="gui",
+            backup_path=str(backup_path),
+            details={
+                "sessions": 1,
+                "droid_session_id": session_id,
+                "codex_session_id": summary.get("codex_session_id"),
+                "preserve_timestamps": preserve_timestamps,
+            },
+        )
+        return summary
+
+    def _run_codex_to_droid_transfer(self, row, preserve_timestamps=True):
+        session_id = row.get("id") or ""
+        rows = ct._fetch_session_rows(session_ids=[session_id])
+        if not rows:
+            raise ValueError(f"Codex session not found: {session_id}")
+        row = rows[0]
+        rollout_path = ct._normalize_rollout_path(row.get("rollout_path"))
+        if not rollout_path or not os.path.exists(rollout_path):
+            raise ValueError(f"Codex rollout not found: {rollout_path or session_id}")
+        bridge = chat_bridge.codex_session_to_bridge(row, rollout_path)
+        factory_home = droid.factory_home_from_settings(None)
+        summary = chat_bridge.import_bridge_to_droid(
+            bridge,
+            factory_home=factory_home,
+            preserve_timestamps=preserve_timestamps,
+        )
+        ct.record_history(
+            "chat_bridge_codex_to_droid",
+            source="gui",
+            details={
+                "sessions": 1,
+                "codex_session_id": session_id,
+                "droid_session_id": summary.get("droid_session_id"),
+                "preserve_timestamps": preserve_timestamps,
+                "factory_home": str(factory_home),
+            },
+        )
+        return summary
+
+    def _chat_transfer_done(self, message, detail):
+        self._set_buttons_state("normal")
+        self._refresh()
+        self._refresh_chat_bridge_sessions(silent=True)
+        self.status_var.set(message)
+        self.chat_status.config(text=detail)
+        messagebox.showinfo(t("ok"), detail)
+
+    def _chat_transfer_failed(self, error):
+        self._set_buttons_state("normal")
+        self.status_var.set(error)
+        self.chat_status.config(text=error)
+        messagebox.showerror(t("error"), error)
 
     # ── Auto-detect ────────────────────────────────────────────────────────
 
@@ -801,7 +1128,8 @@ class CodexManagerApp:
 
     def _set_buttons_state(self, state):
         for btn in [self.btn_use, self.btn_edit, self.btn_save, self.btn_remove,
-                    self.btn_json, self.btn_create, self.btn_backup, self.btn_restore]:
+                    self.btn_json, self.btn_create, self.btn_backup, self.btn_restore,
+                    self.btn_chat_refresh, self.btn_droid_to_codex, self.btn_codex_to_droid]:
             try:
                 btn.config(state=state)
             except Exception:

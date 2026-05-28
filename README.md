@@ -275,6 +275,8 @@ GUI is a thin wrapper over CLI (`import codex_chat_transformer as ct`), no code 
 
 - One-click provider switching
 - Background thread conversion — GUI doesn't freeze
+- P2P sync section with server start, Dashboard open, and IP:PIN copy
+- Chat Bridge panel for Droid -> Codex and Codex -> Droid session transfer
 - Edit provider: button or right-click context menu
 - Model and reasoning editable inline in info panel
 - Reasoning dropdown: low / medium / high / xhigh / default

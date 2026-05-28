@@ -2,6 +2,7 @@
 """Smoke tests for Codex Chat Transformer."""
 
 import argparse
+import ast
 import contextlib
 import io
 import json
@@ -153,6 +154,61 @@ def test_gui_syntax():
     py_compile.compile(
         str(Path(__file__).parent / "codex_manager_gui.py"), doraise=True
     )
+
+
+def test_gui_chat_bridge_controls_are_wired():
+    text = (Path(__file__).parent / "codex_manager_gui.py").read_text(encoding="utf-8")
+    required = [
+        "import chat_bridge",
+        "import droid_provider_adapter as droid",
+        '"chat_bridge"',
+        '"chat_refresh"',
+        '"droid_to_codex"',
+        '"codex_to_droid"',
+        '"chat_fresh_timestamps"',
+        '"chat_pin_old"',
+        "self.chat_droid_combo",
+        "self.chat_codex_combo",
+        "def _refresh_chat_bridge_sessions",
+        "def _refresh_chat_bridge_sessions_thread",
+        "def _apply_chat_bridge_sessions",
+        "def _chat_droid_to_codex",
+        "def _chat_codex_to_droid",
+        "def _chat_transfer_thread",
+    ]
+    for needle in required:
+        assert needle in text, f"GUI Chat Bridge wiring missing: {needle}"
+
+
+def test_gui_chat_bridge_display_keys_remain_unique():
+    import codex_manager_gui as gui
+
+    taken = set()
+    first = gui._unique_chat_display("same label", "session-a", taken)
+    taken.add(first)
+    second = gui._unique_chat_display("same label", "session-b", taken)
+    assert first != second, "duplicate rendered labels must not overwrite combobox mappings"
+    assert second.endswith("[session-b]"), "duplicate labels should include a stable session hint"
+
+
+def test_gui_chat_bridge_buttons_bind_expected_callbacks():
+    path = Path(__file__).parent / "codex_manager_gui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    commands = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            value = keyword.value
+            if (
+                keyword.arg == "command"
+                and isinstance(value, ast.Attribute)
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "self"
+            ):
+                commands.add(value.attr)
+    for callback in ["_refresh_chat_bridge_sessions", "_chat_droid_to_codex", "_chat_codex_to_droid"]:
+        assert callback in commands, f"GUI Chat Bridge button callback not bound: {callback}"
 
 
 def test_merge_preserves_all_sections():
@@ -2867,6 +2923,9 @@ if __name__ == "__main__":
 
     test("CLI syntax valid", test_cli_syntax)
     test("GUI syntax valid", test_gui_syntax)
+    test("GUI Chat Bridge controls are wired", test_gui_chat_bridge_controls_are_wired)
+    test("GUI Chat Bridge display keys remain unique", test_gui_chat_bridge_display_keys_remain_unique)
+    test("GUI Chat Bridge buttons bind expected callbacks", test_gui_chat_bridge_buttons_bind_expected_callbacks)
     test("_merge_config preserves all provider sections", test_merge_preserves_all_sections)
     test("_merge_config appends new section", test_merge_append_new_section)
     test("b64 encode/decode roundtrip", test_b64_roundtrip)
