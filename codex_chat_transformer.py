@@ -420,6 +420,16 @@ def _read_config_info():
     return info
 
 
+def _chat_import_target_config():
+    info = _read_config_info()
+    provider = info.get("provider")
+    model = info.get("model")
+    return {
+        "provider": provider if provider and provider != "?" else _get_active_provider(),
+        "model": model if model and model != "?" else None,
+    }
+
+
 def _read_auth_info():
     """Read current auth.json info."""
     auth_path = CODEX_DIR / "auth.json"
@@ -2337,6 +2347,10 @@ def _args_have_chat_bridge_command(args):
         getattr(args, "codex_sessions", False),
         getattr(args, "droid_to_codex", False),
         getattr(args, "codex_to_droid", False),
+        getattr(args, "chat_bridge_doctor", False),
+        getattr(args, "chat_mapping_plan", False),
+        getattr(args, "chat_mirror_plan", False),
+        getattr(args, "chat_mirror_apply", False),
     ])
 
 
@@ -2385,6 +2399,379 @@ def _print_droid_chat_sessions(sessions, factory_home):
         print(f"  {session.get('id', '')} | {_display_session_text(session.get('title'))} | messages={session.get('message_count', 0)} | {updated_text}{cwd_text}")
 
 
+def _print_chat_mirror_plan(plan):
+    print("\n=== Chat Mirror Plan ===")
+    print("Read-only: no files or databases will be modified.")
+    summary = plan.get("summary") or {}
+    statuses = summary.get("statuses") or {}
+    print(f"Pairs: {summary.get('total_pairs', 0)}")
+    if statuses:
+        counts = ", ".join(f"{name}={count}" for name, count in sorted(statuses.items()))
+        print(f"Statuses: {counts}")
+    else:
+        print("Statuses: none")
+
+    items = plan.get("items") or []
+    if not items:
+        print("No mapped pairs found.")
+        return
+    for item in items[:50]:
+        codex = item.get("codex_session_id") or "-"
+        droid = item.get("droid_session_id") or "-"
+        status = item.get("status") or "-"
+        action = item.get("action") or "none"
+        print(f"  {status} | {action} | codex={codex} | droid={droid}")
+    if len(items) > 50:
+        print(f"  ... {len(items) - 50} more")
+
+
+def _print_chat_mirror_actions(selection, confirmed=False):
+    print("\n=== Chat Mirror Apply ===")
+    if not confirmed:
+        print("Preview only: add --chat-mirror-confirm to create new target chat copies.")
+    else:
+        print("Confirmed: eligible actions will create new target chat copies; existing chats are not overwritten.")
+    summary = selection.get("summary") or {}
+    print(f"Selected: {summary.get('selected', 0)} | Skipped: {summary.get('skipped', 0)}")
+    for item in selection.get("items") or []:
+        codex = item.get("codex_session_id") or "-"
+        droid = item.get("droid_session_id") or "-"
+        action = item.get("action") or item.get("status") or "-"
+        direction = item.get("apply_direction") or "-"
+        print(f"  {action} | {direction} | codex={codex} | droid={droid}")
+    skipped = selection.get("skipped") or []
+    if skipped:
+        print("Skipped:")
+        for item in skipped[:20]:
+            codex = item.get("codex_session_id") or "-"
+            droid = item.get("droid_session_id") or "-"
+            print(f"  {item.get('status') or '-'} | {item.get('skip_reason') or '-'} | codex={codex} | droid={droid}")
+        if len(skipped) > 20:
+            print(f"  ... {len(skipped) - 20} more skipped")
+
+
+def _print_chat_bridge_doctor(report):
+    print("\n=== Chat Bridge Doctor ===")
+    summary = report.get("summary") or {}
+    print("Read-only: no files or databases will be modified.")
+    print(f"Pairs: {summary.get('pairs', 0)} | ok={summary.get('ok', 0)} warn={summary.get('warn', 0)} error={summary.get('error', 0)}")
+    for item in report.get("items") or []:
+        print(f"  {item.get('status', '-')} | codex={item.get('codex_session_id') or '-'} | droid={item.get('droid_session_id') or '-'}")
+        for issue in item.get("issues") or []:
+            print(f"    {issue.get('severity', 'warn')} {issue.get('code')}: {issue.get('message')}")
+
+
+def _quote_cli_arg(value):
+    text = str(value or "")
+    if not text:
+        return '""'
+    if any(ch.isspace() for ch in text) or any(ch in text for ch in ('"', "'", "&", "(", ")")):
+        return '"' + text.replace('"', '\\"') + '"'
+    return text
+
+
+def _chat_reexport_command(direction, session_id, factory_home, include_system=True, compaction_mode="archived"):
+    if not session_id:
+        return ""
+    parts = ["python", "codex_chat_transformer.py"]
+    if direction == "codex_to_droid":
+        parts.extend(["--codex-to-droid", "--chat-session", session_id])
+    elif direction == "droid_to_codex":
+        parts.extend(["--droid-to-codex", "--chat-session", session_id])
+    else:
+        return ""
+    parts.extend(["--droid-settings", str(Path(factory_home) / "settings.json")])
+    if not include_system:
+        parts.append("--chat-skip-system")
+    if compaction_mode:
+        parts.extend(["--chat-compaction-mode", compaction_mode])
+    return " ".join(_quote_cli_arg(part) for part in parts)
+
+
+_CHAT_MAPPING_STRUCTURAL_CODES = {
+    "message_count",
+    "role_sequence",
+    "part_type_sequence",
+    "tool_call_count",
+    "tool_result_count",
+    "compaction_count",
+    "source_event_count",
+}
+
+
+def _build_chat_mapping_plan(chat_bridge, factory_home, session_ids=None, project=None, include_system=True, compaction_mode="archived"):
+    mirror_plan = _build_chat_mirror_plan(chat_bridge, factory_home, project=project)
+    doctor = _build_chat_bridge_doctor_report(
+        chat_bridge,
+        factory_home,
+        session_ids=session_ids,
+        project=project,
+        include_system=include_system,
+    )
+    mirror_by_pair = {
+        (item.get("codex_session_id") or "", item.get("droid_session_id") or ""): item
+        for item in mirror_plan.get("items") or []
+    }
+    statuses = {}
+    items = []
+
+    for doctor_item in doctor.get("items") or []:
+        codex_id = doctor_item.get("codex_session_id") or ""
+        droid_id = doctor_item.get("droid_session_id") or ""
+        mirror_item = mirror_by_pair.get((codex_id, droid_id), {})
+        issues = list(doctor_item.get("issues") or [])
+        issue_codes = [issue.get("code") for issue in issues if issue.get("code")]
+        issue_set = set(issue_codes)
+        source_app = mirror_item.get("source_app") or ""
+        command = ""
+        optional_command = ""
+        recommended_action = "none"
+
+        if "mapping_conflict" in issue_set:
+            status = "mapping_conflict"
+            recommended_action = "review_mapping_conflict"
+        elif "missing_codex" in issue_set or "missing_droid" in issue_set:
+            status = "stale_mapping"
+            recommended_action = "review_stale_mapping"
+            if "missing_droid" in issue_set and codex_id:
+                optional_command = _chat_reexport_command("codex_to_droid", codex_id, factory_home, include_system, compaction_mode)
+            elif "missing_codex" in issue_set and droid_id:
+                optional_command = _chat_reexport_command("droid_to_codex", droid_id, factory_home, include_system, compaction_mode)
+        elif any(str(code or "").endswith("_unreadable") for code in issue_set):
+            status = "source_unreadable"
+            recommended_action = "inspect_source_files"
+        elif issue_set & _CHAT_MAPPING_STRUCTURAL_CODES:
+            status = "needs_reexport"
+            if source_app == "droid":
+                recommended_action = "create_fresh_codex_copy"
+                command = _chat_reexport_command("droid_to_codex", droid_id, factory_home, include_system, compaction_mode)
+            else:
+                recommended_action = "create_fresh_droid_copy"
+                command = _chat_reexport_command("codex_to_droid", codex_id, factory_home, include_system, compaction_mode)
+        elif issues:
+            status = "metadata_drift"
+            recommended_action = "review_metadata"
+        else:
+            status = "ok"
+
+        statuses[status] = statuses.get(status, 0) + 1
+        items.append({
+            "status": status,
+            "read_only": True,
+            "codex_session_id": codex_id,
+            "droid_session_id": droid_id,
+            "source_app": source_app,
+            "mirror_status": mirror_item.get("status") or "",
+            "doctor_status": doctor_item.get("status") or "",
+            "recommended_action": recommended_action,
+            "recommended_command": command,
+            "optional_command": optional_command,
+            "issue_codes": issue_codes,
+            "issues": issues,
+            "mapping_roots": list(mirror_item.get("mapping_roots") or []),
+            "mapping_conflict_import_ids": list(mirror_item.get("mapping_conflict_import_ids") or []),
+        })
+
+    return {
+        "version": 1,
+        "kind": "chat_mapping_plan",
+        "read_only": True,
+        "summary": {
+            "pairs": len(items),
+            "statuses": statuses,
+            "codex_root": str(CODEX_DIR),
+            "factory_home": str(Path(factory_home)),
+            "project": str(project or ""),
+        },
+        "items": items,
+    }
+
+
+def _print_chat_mapping_plan(plan):
+    print("\n=== Chat Mapping Plan ===")
+    print("Read-only: no files or databases will be modified.")
+    summary = plan.get("summary") or {}
+    statuses = summary.get("statuses") or {}
+    status_text = ", ".join(f"{key}={value}" for key, value in sorted(statuses.items())) or "none"
+    print(f"Pairs: {summary.get('pairs', 0)}")
+    print(f"Statuses: {status_text}")
+    for item in plan.get("items") or []:
+        codex = item.get("codex_session_id") or "-"
+        droid = item.get("droid_session_id") or "-"
+        print(f"  {item.get('status') or '-'} | {item.get('recommended_action') or '-'} | codex={codex} | droid={droid}")
+        issue_codes = item.get("issue_codes") or []
+        if issue_codes:
+            print(f"    issues: {', '.join(issue_codes)}")
+        if item.get("recommended_command"):
+            print(f"    command: {item.get('recommended_command')}")
+        if item.get("optional_command"):
+            print(f"    optional: {item.get('optional_command')}")
+
+
+def _build_chat_mirror_plan(chat_bridge, factory_home, project=None):
+    codex_rows = _fetch_session_rows()
+    droid_sessions = chat_bridge.list_droid_sessions(factory_home)
+    return chat_bridge.build_mirror_plan(CODEX_DIR, factory_home, codex_rows, droid_sessions, project=project)
+
+
+def _build_chat_bridge_doctor_report(chat_bridge, factory_home, session_ids=None, project=None, include_system=True):
+    session_filter = set(session_ids or [])
+    codex_rows = _fetch_session_rows()
+    droid_sessions = chat_bridge.list_droid_sessions(factory_home)
+    plan = chat_bridge.build_mirror_plan(CODEX_DIR, factory_home, codex_rows, droid_sessions, project=project)
+    codex_row_map = {row.get("id"): row for row in codex_rows}
+    items = []
+    summary = {"pairs": 0, "ok": 0, "warn": 0, "error": 0}
+
+    for pair in plan.get("items") or []:
+        codex_id = pair.get("codex_session_id") or ""
+        droid_id = pair.get("droid_session_id") or ""
+        if session_filter and codex_id not in session_filter and droid_id not in session_filter:
+            continue
+        summary["pairs"] += 1
+        if pair.get("mapping_conflict"):
+            item = {
+                "status": "error",
+                "codex_session_id": codex_id,
+                "droid_session_id": droid_id,
+                "issues": [{"code": "mapping_conflict", "severity": "error", "message": pair.get("mapping_conflict_reason") or "Mapping conflict"}],
+            }
+            items.append(item)
+            summary["error"] += 1
+            continue
+        if not pair.get("codex_present") or not pair.get("droid_present"):
+            missing = "codex" if not pair.get("codex_present") else "droid"
+            item = {
+                "status": "error",
+                "codex_session_id": codex_id,
+                "droid_session_id": droid_id,
+                "issues": [{"code": f"missing_{missing}", "severity": "error", "message": f"Missing {missing} session"}],
+            }
+            items.append(item)
+            summary["error"] += 1
+            continue
+        row = codex_row_map.get(codex_id)
+        rollout_path = _normalize_rollout_path((row or {}).get("rollout_path"))
+        jsonl_path, settings_path = chat_bridge.find_droid_session_paths(factory_home, droid_id)
+        if not row or not rollout_path or not os.path.exists(rollout_path) or not jsonl_path or not jsonl_path.exists():
+            issues = []
+            if not row or not rollout_path or not os.path.exists(rollout_path):
+                issues.append({"code": "codex_source_unreadable", "severity": "error", "message": "Codex rollout could not be read"})
+            if not jsonl_path or not jsonl_path.exists():
+                issues.append({"code": "droid_source_unreadable", "severity": "error", "message": "Droid JSONL could not be read"})
+            items.append({"status": "error", "codex_session_id": codex_id, "droid_session_id": droid_id, "issues": issues})
+            summary["error"] += 1
+            continue
+        issues = []
+        codex_bridge = None
+        droid_bridge = None
+        try:
+            codex_bridge = chat_bridge.codex_session_to_bridge(row, rollout_path, include_system=include_system)
+        except Exception as exc:
+            issues.append({"code": "codex_source_unreadable", "severity": "error", "message": f"Codex rollout could not be converted: {exc}"})
+        droid_settings_path = None
+        if settings_path and settings_path.exists():
+            try:
+                settings_data = json.loads(settings_path.read_text(encoding="utf-8"))
+                if not isinstance(settings_data, dict):
+                    raise ValueError("settings JSON root is not an object")
+                droid_settings_path = settings_path
+            except Exception as exc:
+                issues.append({"code": "droid_settings_unreadable", "severity": "error", "message": f"Droid settings could not be read: {exc}"})
+        try:
+            droid_bridge = chat_bridge.droid_session_to_bridge(jsonl_path, droid_settings_path)
+        except Exception as exc:
+            issues.append({"code": "droid_source_unreadable", "severity": "error", "message": f"Droid JSONL could not be converted: {exc}"})
+        if issues:
+            items.append({"status": "error", "codex_session_id": codex_id, "droid_session_id": droid_id, "issues": issues})
+            summary["error"] += 1
+            continue
+        item = chat_bridge.diagnose_bridge_pair(codex_bridge, droid_bridge, codex_id, droid_id)
+        items.append(item)
+        summary[item.get("status") or "warn"] = summary.get(item.get("status") or "warn", 0) + 1
+
+    return {
+        "version": 1,
+        "kind": "chat_bridge_doctor",
+        "read_only": True,
+        "summary": summary,
+        "items": items,
+    }
+
+
+def _apply_chat_mirror_actions(
+    chat_bridge,
+    selection,
+    factory_home,
+    preserve_timestamps=True,
+    include_system=True,
+    compaction_mode="archived",
+    pin_old=False,
+    old_before_ms=None,
+    backup_codex=False,
+):
+    items = selection.get("items") or []
+    codex_ids = sorted({item.get("codex_session_id") for item in items if item.get("apply_direction") == "codex_to_droid" and item.get("codex_session_id")})
+    codex_rows = _fetch_session_rows(session_ids=codex_ids) if codex_ids else []
+    codex_row_map = {row.get("id"): row for row in codex_rows}
+    backup_path = None
+    target_config = _chat_import_target_config()
+    results = []
+    errors = []
+
+    for item in items:
+        direction = item.get("apply_direction")
+        if direction == "codex_to_droid":
+            session_id = item.get("codex_session_id") or ""
+            row = codex_row_map.get(session_id)
+            if not row:
+                errors.append({"item": item, "error": "Codex session not found at apply time"})
+                continue
+            rollout_path = _normalize_rollout_path(row.get("rollout_path"))
+            if not rollout_path or not os.path.exists(rollout_path):
+                errors.append({"item": item, "error": "Codex rollout not found at apply time"})
+                continue
+            bridge = chat_bridge.codex_session_to_bridge(row, rollout_path, include_system=include_system)
+            summary = chat_bridge.import_bridge_to_droid(
+                bridge,
+                factory_home=factory_home,
+                preserve_timestamps=preserve_timestamps,
+                compaction_mode=compaction_mode,
+            )
+            result = {"direction": direction, "source_id": session_id, "target_id": summary.get("droid_session_id"), "summary": summary}
+            results.append(result)
+            print(f"  {session_id} -> {summary['droid_session_id']} | codex_to_droid")
+            continue
+
+        if direction == "droid_to_codex":
+            session_id = item.get("droid_session_id") or ""
+            jsonl_path, settings_path = chat_bridge.find_droid_session_paths(factory_home, session_id)
+            if not jsonl_path or not jsonl_path.exists():
+                errors.append({"item": item, "error": "Droid session JSONL not found at apply time"})
+                continue
+            bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path if settings_path and settings_path.exists() else None)
+            if backup_codex and backup_path is None:
+                backup_path = full_backup()
+            summary = chat_bridge.import_bridge_to_codex(
+                bridge,
+                codex_dir=CODEX_DIR,
+                state_db=STATE_DB,
+                sessions_dir=SESSIONS_DIR,
+                global_state_path=GLOBAL_STATE,
+                preserve_timestamps=preserve_timestamps,
+                pin_old=pin_old,
+                old_before_ms=old_before_ms,
+                compaction_mode=compaction_mode,
+                target_provider=target_config.get("provider"),
+                target_model=target_config.get("model"),
+            )
+            result = {"direction": direction, "source_id": session_id, "target_id": summary.get("codex_session_id"), "summary": summary}
+            results.append(result)
+            print(f"  {session_id} -> {summary['codex_session_id']} | droid_to_codex")
+
+    return {"results": results, "errors": errors, "backup_path": str(backup_path) if backup_path else ""}
+
+
 def handle_chat_bridge_command(args):
     if not _args_have_chat_bridge_command(args):
         return False
@@ -2402,15 +2789,105 @@ def handle_chat_bridge_command(args):
             _print_codex_chat_sessions(_fetch_session_rows(project=args.project))
             return True
 
+        include_system = not bool(getattr(args, "chat_skip_system", False))
+
+        if getattr(args, "chat_bridge_doctor", False):
+            report = _build_chat_bridge_doctor_report(
+                chat_bridge,
+                factory_home,
+                session_ids=_chat_session_ids(args),
+                project=getattr(args, "project", None),
+                include_system=include_system,
+            )
+            _print_chat_bridge_doctor(report)
+            return True
+
+        if getattr(args, "chat_mapping_plan", False):
+            plan = _build_chat_mapping_plan(
+                chat_bridge,
+                factory_home,
+                session_ids=_chat_session_ids(args),
+                project=getattr(args, "project", None),
+                include_system=include_system,
+                compaction_mode=getattr(args, "chat_compaction_mode", "archived"),
+            )
+            _print_chat_mapping_plan(plan)
+            return True
+
+        if getattr(args, "chat_mirror_plan", False):
+            plan = _build_chat_mirror_plan(chat_bridge, factory_home, project=getattr(args, "project", None))
+            _print_chat_mirror_plan(plan)
+            return True
+
+        preserve_timestamps = not bool(args.chat_fresh_timestamps)
+        compaction_mode = getattr(args, "chat_compaction_mode", "archived")
+
+        if getattr(args, "chat_mirror_apply", False):
+            plan = _build_chat_mirror_plan(chat_bridge, factory_home, project=getattr(args, "project", None))
+            selection = chat_bridge.select_mirror_actions(
+                plan,
+                direction=getattr(args, "chat_mirror_direction", "newer"),
+                session_ids=_parse_csv_list(getattr(args, "chat_mirror_session", None)),
+                statuses=_parse_csv_list(getattr(args, "chat_mirror_status", None)),
+                limit=getattr(args, "chat_mirror_limit", None),
+            )
+            confirmed = bool(getattr(args, "chat_mirror_confirm", False))
+            _print_chat_mirror_actions(selection, confirmed=confirmed)
+            if not confirmed:
+                return True
+            old_before_ms = None
+            if getattr(args, "chat_pin_old", False):
+                old_before = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.chat_old_days)
+                old_before_ms = int(old_before.timestamp() * 1000)
+            outcome = _apply_chat_mirror_actions(
+                chat_bridge,
+                selection,
+                factory_home,
+                preserve_timestamps=preserve_timestamps,
+                include_system=include_system,
+                compaction_mode=compaction_mode,
+                pin_old=getattr(args, "chat_pin_old", False),
+                old_before_ms=old_before_ms,
+                backup_codex=getattr(args, "chat_backup", False),
+            )
+            for error in outcome.get("errors") or []:
+                item = error.get("item") or {}
+                print(f"  ERROR {item.get('codex_session_id') or '-'} / {item.get('droid_session_id') or '-'}: {error.get('error')}")
+            applied_count = len(outcome.get("results") or [])
+            error_count = len(outcome.get("errors") or [])
+            history_status = "ok"
+            if error_count and not applied_count:
+                history_status = "error"
+            elif error_count:
+                history_status = "partial"
+            record_history(
+                "chat_bridge_mirror_apply",
+                status=history_status,
+                backup_path=outcome.get("backup_path") or None,
+                details={
+                    "selected": len(selection.get("items") or []),
+                    "applied": applied_count,
+                    "errors": error_count,
+                    "direction": getattr(args, "chat_mirror_direction", "newer"),
+                    "session_filter": _parse_csv_list(getattr(args, "chat_mirror_session", None)),
+                    "status_filter": _parse_csv_list(getattr(args, "chat_mirror_status", None)),
+                    "limit": getattr(args, "chat_mirror_limit", None),
+                    "preserve_timestamps": preserve_timestamps,
+                    "include_system": include_system,
+                    "compaction_mode": compaction_mode,
+                    "factory_home": str(factory_home),
+                },
+            )
+            return True
+
         ids = _chat_session_ids(args)
         if not ids:
             print("ERROR: --chat-session is required for chat transfer commands.")
             return True
-        preserve_timestamps = not bool(args.chat_fresh_timestamps)
-        include_system = not bool(getattr(args, "chat_skip_system", False))
 
         if args.droid_to_codex:
             pending = []
+            target_config = _chat_import_target_config()
             old_before_ms = None
             if args.chat_pin_old:
                 old_before = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.chat_old_days)
@@ -2424,7 +2901,7 @@ def handle_chat_bridge_command(args):
             if not pending:
                 print("No valid Droid sessions to import.")
                 return True
-            backup_path = full_backup()
+            backup_path = full_backup() if getattr(args, "chat_backup", False) else None
             imported = []
             for session_id, bridge in pending:
                 summary = chat_bridge.import_bridge_to_codex(
@@ -2436,13 +2913,16 @@ def handle_chat_bridge_command(args):
                     preserve_timestamps=preserve_timestamps,
                     pin_old=args.chat_pin_old,
                     old_before_ms=old_before_ms,
+                    compaction_mode=compaction_mode,
+                    target_provider=target_config.get("provider"),
+                    target_model=target_config.get("model"),
                 )
                 imported.append(summary)
                 print(f"  {session_id} -> {summary['codex_session_id']} | pinned={summary['pinned']}")
             record_history(
                 "chat_bridge_droid_to_codex",
-                backup_path=str(backup_path),
-                details={"sessions": len(imported), "preserve_timestamps": preserve_timestamps},
+                backup_path=str(backup_path) if backup_path else None,
+                details={"sessions": len(imported), "preserve_timestamps": preserve_timestamps, "compaction_mode": compaction_mode},
             )
             return True
 
@@ -2464,12 +2944,13 @@ def handle_chat_bridge_command(args):
                     bridge,
                     factory_home=factory_home,
                     preserve_timestamps=preserve_timestamps,
+                    compaction_mode=compaction_mode,
                 )
                 imported.append(summary)
                 print(f"  {session_id} -> {summary['droid_session_id']}")
             record_history(
                 "chat_bridge_codex_to_droid",
-                details={"sessions": len(imported), "preserve_timestamps": preserve_timestamps, "factory_home": str(factory_home), "include_system": include_system},
+                details={"sessions": len(imported), "preserve_timestamps": preserve_timestamps, "factory_home": str(factory_home), "include_system": include_system, "compaction_mode": compaction_mode},
             )
             return True
     except ValueError as e:
@@ -2537,12 +3018,25 @@ def build_parser():
     parser.add_argument("--codex-sessions", action="store_true", help="List Codex chat sessions without printing bodies")
     parser.add_argument("--droid-to-codex", action="store_true", help="Import selected Droid chat session(s) into Codex")
     parser.add_argument("--codex-to-droid", action="store_true", help="Import selected Codex chat session(s) into Droid Factory")
+    parser.add_argument("--chat-bridge-doctor", action="store_true", help="Read-only diagnostics for mapped Codex/Droid chat pairs")
+    parser.add_argument("--chat-mapping-plan", action="store_true", help="Read-only cleanup/re-export plan for mapped Codex/Droid chat pairs")
+    parser.add_argument("--chat-mirror-plan", action="store_true", help="Read-only plan for mapped Codex/Droid chat pairs")
+    parser.add_argument("--chat-mirror-apply", action="store_true", help="Preview or apply mapped Codex/Droid chat mirror actions")
+    parser.add_argument("--chat-mirror-confirm", action="store_true", help="Actually create new target chat copies for --chat-mirror-apply")
+    parser.add_argument("--chat-mirror-direction", choices=["newer", "codex-to-droid", "droid-to-codex"], default="newer",
+                        help="Mirror apply direction")
+    parser.add_argument("--chat-mirror-session", metavar="ID1,ID2", help="Limit mirror apply preview/confirm to Codex or Droid session IDs")
+    parser.add_argument("--chat-mirror-status", metavar="STATUS1,STATUS2", help="Limit mirror apply preview/confirm to mirror statuses")
+    parser.add_argument("--chat-mirror-limit", type=int, metavar="N", help="Limit number of mirror actions selected for apply")
     parser.add_argument("--chat-session", metavar="ID1,ID2", help="Chat session ID(s) for bridge transfer")
     parser.add_argument("--chat-preserve-timestamps", action="store_true", help="Preserve source created/updated timestamps during chat transfer")
     parser.add_argument("--chat-fresh-timestamps", action="store_true", help="Use fresh timestamps during chat transfer")
     parser.add_argument("--chat-pin-old", action="store_true", help="Pin old Droid chats when importing them into Codex")
+    parser.add_argument("--chat-backup", action="store_true", help="Create a full .codex backup before chat imports that write to Codex")
     parser.add_argument("--chat-old-days", type=int, default=180, metavar="N", help="Age threshold for --chat-pin-old")
     parser.add_argument("--chat-skip-system", action="store_true", help="Skip Codex system messages when exporting chats to Droid")
+    parser.add_argument("--chat-compaction-mode", choices=["archived", "inline", "native", "raw"], default="archived",
+                        help="How to transfer chat compaction state: archived full history (default), inline native events, Droid-style continuation, or raw archive alias")
 
     # Sync arguments
     parser.add_argument("--sync-host", action="store_true", help="Start P2P sync server + Dashboard")

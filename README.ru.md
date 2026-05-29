@@ -161,9 +161,14 @@ python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_I
 python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID
 python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID --chat-skip-system
 python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-fresh-timestamps
+python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-backup
+python codex_chat_transformer.py --chat-mapping-plan --project C:\Research\my_project
+python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID --chat-compaction-mode inline
 ```
 
-По умолчанию сохраняются даты создания и последнего сообщения, включая Droid index/file mtime при импорте Codex -> Droid. `--chat-fresh-timestamps` переносит чат как свежий. Droid -> Codex сначала делает полный бэкап `.codex`, затем создаёт rollout JSONL и строку `threads` как проверенную пару.
+По умолчанию сохраняются даты создания и последнего сообщения, включая Droid index/file mtime при импорте Codex -> Droid. `--chat-fresh-timestamps` переносит чат как свежий. Droid -> Codex создаёт rollout JSONL и строку `threads` как проверенную пару; полный backup `.codex` создаётся только при явном `--chat-backup`.
+`--chat-compaction-mode archived` теперь режим по умолчанию: переносится вся видимая история, включая tool calls и tool results, а compaction/source events остаются только архивными bridge-метаданными. `raw` - legacy alias для `archived`. `inline` и `native` стоит включать только когда нужно явно создать native compaction/continuation state в целевом чате. Codex `reasoning` и Droid `thinking` теперь сохраняются, включая OpenAI encrypted reasoning payloads, которые нужны для native continuation.
+`--chat-mapping-plan` работает только на чтение: классифицирует пары как stale, metadata drift или requiring fresh re-export, печатает рекомендованные команды, но не меняет mapping и не создает сессии.
 
 ### Закрепление чатов
 

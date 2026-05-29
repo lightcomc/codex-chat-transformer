@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -166,14 +167,27 @@ def test_gui_chat_bridge_controls_are_wired():
         '"droid_to_codex"',
         '"codex_to_droid"',
         '"chat_fresh_timestamps"',
+        '"chat_skip_system"',
+        '"chat_compaction_mode"',
+        '"chat_mirror_plan"',
         '"chat_pin_old"',
         "self.chat_droid_combo",
         "self.chat_codex_combo",
+        "self.chat_skip_system_var",
+        "self.chk_chat_skip_system",
+        "self.chat_compaction_mode_var",
+        "self.chat_compaction_mode_combo",
+        "self.btn_chat_mirror_plan",
+        "include_system=not skip_system",
+        "compaction_mode=compaction_mode",
+        "build_mirror_plan",
+        "select_mirror_actions",
         "def _refresh_chat_bridge_sessions",
         "def _refresh_chat_bridge_sessions_thread",
         "def _apply_chat_bridge_sessions",
         "def _chat_droid_to_codex",
         "def _chat_codex_to_droid",
+        "def _chat_mirror_plan",
         "def _chat_transfer_thread",
     ]
     for needle in required:
@@ -792,7 +806,7 @@ def write_temp_droid_session(home, session_id="droid-old", title="Droid Old Chat
             "parentId": "msg-assistant-1",
             "message": {
                 "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}],
+                "content": [{"type": "tool_result", "tool_use_id": "tool-1", "is_error": False, "content": "ok"}],
             },
         },
         {"type": "todo_state", "id": "todo-1", "timestamp": "2025-01-02T03:04:09.000Z", "todos": []},
@@ -800,7 +814,9 @@ def write_temp_droid_session(home, session_id="droid-old", title="Droid Old Chat
     jsonl_path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
     settings_path.write_text(
         json.dumps({
-            "providerLock": "custom:NeuroGate-GPT-5.5-1",
+            "model": "custom:NeuroGate-GPT-5.5-1",
+            "reasoningEffort": "medium",
+            "providerLock": "openai",
             "providerLockTimestamp": "2025-01-02T03:04:05.000Z",
             "tokenUsage": {"total": 123},
         }),
@@ -820,7 +836,8 @@ def test_chat_bridge_droid_session_to_bridge_preserves_messages_and_tools():
     assert bridge["source"]["app"] == "droid", f"unexpected source app: {bridge['source']}"
     assert bridge["source"]["session_id"] == "droid-old", f"source id should come from session_start: {bridge['source']}"
     assert bridge["session"]["title"] == "Droid Old Chat", "title should come from session_start"
-    assert bridge["session"]["model"] == "custom:NeuroGate-GPT-5.5-1", "providerLock should become bridge model"
+    assert bridge["session"]["provider"] == "openai", "providerLock should become bridge provider"
+    assert bridge["session"]["model"] == "custom:NeuroGate-GPT-5.5-1", "Droid model should become bridge model"
     assert bridge["work_context"]["current"]["confidence"] == "unknown", "Droid git context should be unknown in v1"
     assert bridge["work_context"]["timeline_complete"] is False, "Droid timeline should be explicitly incomplete"
     assert [m["role"] for m in bridge["messages"][:3]] == ["user", "assistant", "tool"], f"unexpected roles: {bridge['messages']}"
@@ -828,7 +845,66 @@ def test_chat_bridge_droid_session_to_bridge_preserves_messages_and_tools():
     assert "text" in part_types, f"text parts should be preserved: {part_types}"
     assert "tool_call" in part_types, f"tool_use should become tool_call: {part_types}"
     assert "tool_result" in part_types, f"tool_result should be preserved: {part_types}"
+    tool_result = next(p for m in bridge["messages"] for p in m["parts"] if p.get("type") == "tool_result")
+    assert tool_result["is_error"] is False, f"Droid tool_result error state should be preserved: {tool_result}"
     assert "todo_state" in part_types, f"todo_state should be preserved as metadata: {part_types}"
+
+
+def test_chat_bridge_droid_to_bridge_preserves_compaction_state_and_parent():
+    import chat_bridge
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sessions_dir = Path(tmp) / "sessions" / "-C-Research-nothing"
+        sessions_dir.mkdir(parents=True)
+        jsonl_path = sessions_dir / "droid-child.jsonl"
+        settings_path = sessions_dir / "droid-child.settings.json"
+        events = [
+            {
+                "type": "session_start",
+                "id": "droid-child",
+                "title": "New Session",
+                "sessionTitle": "New Session",
+                "owner": "test",
+                "parent": "droid-parent",
+                "version": 2,
+                "cwd": r"C:\Research\nothing",
+                "hostId": "host-1",
+            },
+            {
+                "type": "compaction_state",
+                "id": "compact-1",
+                "timestamp": "2026-05-28T13:01:08.623Z",
+                "summaryText": "Earlier Droid summary",
+                "summaryTokens": 623,
+                "summaryKind": "llm_summary",
+                "removedCount": 9,
+                "systemInfo": {
+                    "osName": "win32 10.0.26100",
+                    "directoryInfo": [{"cmd": "pwd", "out": r"C:\Research\nothing"}],
+                    "gitInfo": [{"cmd": "git status -b --porcelain | head -n1", "out": "not a git repository"}],
+                    "guidelinesInfo": [],
+                    "designGuidelinesInfo": [],
+                },
+            },
+        ]
+        jsonl_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        settings_path.write_text(json.dumps({"model": "custom:model", "providerLock": "openai"}), encoding="utf-8")
+
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+
+    compactions = bridge.get("compactions") or []
+    assert len(compactions) == 1, f"Droid compaction_state should become bridge compaction: {bridge}"
+    compaction = compactions[0]
+    assert compaction["source"] == "droid", f"source should be Droid: {compaction}"
+    assert compaction["id"] == "compact-1", f"compaction id should be preserved: {compaction}"
+    assert compaction["summary_text"] == "Earlier Droid summary", f"summary text should be preserved: {compaction}"
+    assert compaction["summary_tokens"] == 623, f"summary token count should be preserved: {compaction}"
+    assert compaction["removed_count"] == 9, f"removedCount should be preserved: {compaction}"
+    assert compaction["parent_session_id"] == "droid-parent", f"manual /compress parent should be preserved: {compaction}"
+    assert compaction["system_info"]["directoryInfo"][0]["out"] == r"C:\Research\nothing", f"systemInfo should be preserved: {compaction}"
+    assert compaction["anchor_message_index"] == -1, f"manual Droid /compress summary should be anchorless: {compaction}"
+    source_types = [event["payload_type"] for event in bridge["source_events"]]
+    assert "compaction_state" in source_types, f"raw compaction_state should still be lossless source event: {source_types}"
 
 
 def test_chat_bridge_droid_session_lookup_finds_project_nested_files():
@@ -894,6 +970,8 @@ def test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_o
             preserve_timestamps=True,
             pin_old=True,
             old_before_ms=1767225600000,
+            target_provider="NeuroGate_API",
+            target_model="gpt-5.5",
         )
 
         conn = sqlite3.connect(str(ct.STATE_DB))
@@ -902,6 +980,8 @@ def test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_o
         conn.close()
 
         assert row is not None, "Droid import should insert a Codex threads row"
+        codex_id_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
+        assert codex_id_re.match(summary["codex_session_id"]), f"Codex import should use sidebar-compatible UUIDv7-like ids: {summary['codex_session_id']}"
         rollout_path = Path(row["rollout_path"])
         assert rollout_path.exists(), "threads.rollout_path should point at a real rollout file"
         lines = [json.loads(line) for line in rollout_path.read_text(encoding="utf-8").splitlines()]
@@ -910,8 +990,17 @@ def test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_o
         assert meta["payload"]["id"] == row["id"], "rollout session id should match DB id"
         assert meta["payload"]["model_provider"] == row["model_provider"], "provider should match DB"
         assert meta["payload"]["model"] == row["model"], "model should match DB"
+        assert row["model_provider"] == "NeuroGate_API", f"Codex import should use target provider for sidebar visibility: {dict(row)}"
+        assert row["model"] == "gpt-5.5", f"Codex import should use target model: {dict(row)}"
         assert row["created_at_ms"] == 1735787045000, f"created timestamp should be preserved, got {row['created_at_ms']}"
         assert row["updated_at_ms"] == 1735787049000, f"updated timestamp should be preserved, got {row['updated_at_ms']}"
+
+        session_index_path = ct.CODEX_DIR / "session_index.jsonl"
+        index_entries = [json.loads(line) for line in session_index_path.read_text(encoding="utf-8").splitlines()]
+        index_entry = next((entry for entry in index_entries if entry.get("id") == summary["codex_session_id"]), None)
+        assert index_entry is not None, "Droid import should append session_index.jsonl so Codex sidebar can discover it"
+        assert index_entry["thread_name"] == "Droid Old Chat", f"session index should use imported title: {index_entry}"
+        assert index_entry["updated_at"].startswith("2025-01-02T03:04:09"), f"session index should use imported updated time: {index_entry}"
 
         pinned = json.loads(ct.GLOBAL_STATE.read_text(encoding="utf-8"))["pinned-thread-ids"]
         assert summary["codex_session_id"] in pinned, "old imported Droid session should be pinned when requested"
@@ -1026,6 +1115,397 @@ def test_chat_bridge_mapping_keeps_duplicate_import_pairs():
         restore_temp_codex_home(original, tmp_dir)
 
 
+def test_chat_bridge_mirror_plan_merges_roots_and_classifies_states():
+    import chat_bridge
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        codex_root = root / "codex"
+        factory_home = root / "factory"
+        codex_root.mkdir()
+        factory_home.mkdir()
+
+        (codex_root / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [
+                {"import_id": "shared", "codex_session_id": "codex-newer", "droid_session_id": "droid-newer"},
+                {"codex_session_id": "codex-older", "droid_session_id": "droid-older"},
+                {"codex_session_id": "codex-only", "droid_session_id": "missing-droid"},
+            ],
+        }), encoding="utf-8")
+        (factory_home / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [
+                {"import_id": "shared", "codex_session_id": "codex-newer", "droid_session_id": "droid-newer"},
+                {"codex_session_id": "codex-older", "droid_session_id": "droid-older"},
+                {"codex_session_id": "codex-sync", "droid_session_id": "droid-sync"},
+                {"codex_session_id": "missing-codex", "droid_session_id": "droid-only"},
+                {"codex_session_id": "missing-both", "droid_session_id": "missing-both"},
+            ],
+        }), encoding="utf-8")
+
+        codex_rows = [
+            {"id": "codex-newer", "title": "Codex Newer", "updated_at_ms": 5000},
+            {"id": "codex-older", "title": "Codex Older", "updated_at_ms": 1000},
+            {"id": "codex-sync", "title": "Codex Sync", "updated_at_ms": 3000},
+            {"id": "codex-only", "title": "Codex Only", "updated_at_ms": 2000},
+        ]
+        droid_sessions = [
+            {"id": "droid-newer", "title": "Droid Newer", "mtime": 2},
+            {"id": "droid-older", "title": "Droid Older", "mtime": 5},
+            {"id": "droid-sync", "title": "Droid Sync", "mtime": 3.4},
+            {"id": "droid-only", "title": "Droid Only", "mtime": 4},
+        ]
+
+        plan = chat_bridge.build_mirror_plan(codex_root, factory_home, codex_rows, droid_sessions, timestamp_tolerance_ms=1000)
+
+    items = {(item["codex_session_id"], item["droid_session_id"]): item for item in plan["items"]}
+    assert plan["read_only"] is True, f"mirror plan must be explicitly read-only: {plan}"
+    assert plan["summary"]["total_pairs"] == 6, f"duplicate mapping pairs should be merged: {plan}"
+    assert items[("codex-newer", "droid-newer")]["status"] == "codex_newer", f"expected Codex-newer status: {items}"
+    assert items[("codex-older", "droid-older")]["status"] == "droid_newer", f"expected Droid-newer status: {items}"
+    assert items[("codex-sync", "droid-sync")]["status"] == "in_sync", f"close timestamps should be in sync: {items}"
+    assert items[("codex-only", "missing-droid")]["status"] == "missing_droid", f"missing Droid should be detected: {items}"
+    assert items[("missing-codex", "droid-only")]["status"] == "missing_codex", f"missing Codex should be detected: {items}"
+    assert items[("missing-both", "missing-both")]["status"] == "stale_pair", f"stale pair should be detected: {items}"
+    assert plan["summary"]["statuses"]["codex_newer"] == 1, f"summary should count statuses: {plan}"
+
+
+def test_chat_bridge_mirror_plan_surfaces_import_id_conflicts():
+    import chat_bridge
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        codex_root = root / "codex"
+        factory_home = root / "factory"
+        codex_root.mkdir()
+        factory_home.mkdir()
+
+        (codex_root / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"import_id": "conflict-id", "codex_session_id": "codex-a", "droid_session_id": "droid-a"}],
+        }), encoding="utf-8")
+        (factory_home / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"import_id": "conflict-id", "codex_session_id": "codex-b", "droid_session_id": "droid-b"}],
+        }), encoding="utf-8")
+
+        plan = chat_bridge.build_mirror_plan(
+            codex_root,
+            factory_home,
+            [{"id": "codex-a", "title": "A", "updated_at_ms": 1000}, {"id": "codex-b", "title": "B", "updated_at_ms": 1000}],
+            [{"id": "droid-a", "title": "A", "mtime": 1}, {"id": "droid-b", "title": "B", "mtime": 1}],
+        )
+
+    conflict_items = [item for item in plan["items"] if item["status"] == "mapping_conflict"]
+    assert len(conflict_items) == 2, f"same import_id with different pairs must not be silently collapsed: {plan}"
+    assert {item["codex_session_id"] for item in conflict_items} == {"codex-a", "codex-b"}, f"both conflicting rows should be visible: {plan}"
+    assert plan["summary"]["statuses"]["mapping_conflict"] == 2, f"summary should surface mapping conflicts: {plan}"
+
+
+def test_chat_bridge_mirror_plan_project_filter_does_not_create_false_missing_codex():
+    import chat_bridge
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        codex_root = root / "codex"
+        factory_home = root / "factory"
+        codex_root.mkdir()
+        factory_home.mkdir()
+
+        (codex_root / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [
+                {"codex_session_id": "codex-in", "droid_session_id": "droid-in"},
+                {"codex_session_id": "codex-out", "droid_session_id": "droid-out"},
+                {"codex_session_id": "missing-codex", "droid_session_id": "droid-unknown-project"},
+            ],
+        }), encoding="utf-8")
+
+        plan = chat_bridge.build_mirror_plan(
+            codex_root,
+            factory_home,
+            [
+                {"id": "codex-in", "title": "In", "cwd": r"C:\Research\nothing", "updated_at_ms": 1000},
+                {"id": "codex-out", "title": "Out", "cwd": r"C:\Research\other", "updated_at_ms": 1000},
+            ],
+            [
+                {"id": "droid-in", "title": "In", "mtime": 1},
+                {"id": "droid-out", "title": "Out", "mtime": 1},
+                {"id": "droid-unknown-project", "title": "Unknown", "mtime": 1},
+            ],
+            project="nothing",
+        )
+
+    assert [item["codex_session_id"] for item in plan["items"]] == ["codex-in"], f"project filter should keep only matching Codex rows: {plan}"
+    assert "missing_codex" not in plan["summary"]["statuses"], f"unknown-project pairs should not become false missing_codex: {plan}"
+
+
+def test_chat_bridge_mirror_actions_select_newer_and_skip_unsafe_states():
+    import chat_bridge
+
+    plan = {
+        "items": [
+            {"status": "codex_newer", "action": "would_export_to_droid", "codex_session_id": "codex-newer", "droid_session_id": "droid-old"},
+            {"status": "missing_droid", "action": "would_create_droid", "codex_session_id": "codex-only", "droid_session_id": "missing-droid"},
+            {"status": "droid_newer", "action": "would_import_to_codex", "codex_session_id": "codex-old", "droid_session_id": "droid-newer"},
+            {"status": "missing_codex", "action": "would_create_codex", "codex_session_id": "missing-codex", "droid_session_id": "droid-only"},
+            {"status": "in_sync", "action": "none", "codex_session_id": "codex-sync", "droid_session_id": "droid-sync"},
+            {"status": "mapping_conflict", "action": "none", "codex_session_id": "codex-conflict", "droid_session_id": "droid-conflict"},
+            {"status": "stale_pair", "action": "none", "codex_session_id": "codex-stale", "droid_session_id": "droid-stale"},
+        ],
+    }
+
+    selected = chat_bridge.select_mirror_actions(plan, direction="newer")
+
+    assert [item["codex_session_id"] for item in selected["items"]] == [
+        "codex-newer",
+        "codex-only",
+        "codex-old",
+        "missing-codex",
+    ], f"newer direction should select only actionable newer/missing target states: {selected}"
+    directions = {item["codex_session_id"]: item["apply_direction"] for item in selected["items"]}
+    assert directions["codex-newer"] == "codex_to_droid", f"Codex-newer should export to Droid: {selected}"
+    assert directions["codex-old"] == "droid_to_codex", f"Droid-newer should import to Codex: {selected}"
+    skipped_statuses = {item["status"] for item in selected["skipped"]}
+    assert {"in_sync", "mapping_conflict", "stale_pair"}.issubset(skipped_statuses), f"unsafe/no-op statuses should be skipped: {selected}"
+
+
+def test_chat_bridge_mirror_actions_can_force_one_direction():
+    import chat_bridge
+
+    plan = {
+        "items": [
+            {"status": "codex_newer", "action": "would_export_to_droid", "codex_session_id": "codex-newer", "droid_session_id": "droid-old"},
+            {"status": "missing_droid", "action": "would_create_droid", "codex_session_id": "codex-only", "droid_session_id": "missing-droid"},
+            {"status": "droid_newer", "action": "would_import_to_codex", "codex_session_id": "codex-old", "droid_session_id": "droid-newer"},
+        ],
+    }
+
+    selected = chat_bridge.select_mirror_actions(plan, direction="codex-to-droid")
+
+    assert [item["codex_session_id"] for item in selected["items"]] == ["codex-newer", "codex-only"], f"forced direction should only export Codex rows: {selected}"
+    assert all(item["apply_direction"] == "codex_to_droid" for item in selected["items"]), f"forced direction should be reflected per item: {selected}"
+
+
+def test_chat_bridge_mirror_actions_skip_ambiguous_one_to_many_pairs():
+    import chat_bridge
+
+    plan = {
+        "items": [
+            {"status": "codex_newer", "codex_session_id": "codex-a", "droid_session_id": "droid-a"},
+            {"status": "codex_newer", "codex_session_id": "codex-a", "droid_session_id": "droid-b"},
+            {"status": "droid_newer", "codex_session_id": "codex-b", "droid_session_id": "droid-c"},
+            {"status": "droid_newer", "codex_session_id": "codex-c", "droid_session_id": "droid-c"},
+        ],
+    }
+
+    selected = chat_bridge.select_mirror_actions(plan, direction="newer")
+
+    assert selected["items"] == [], f"one-to-many mappings should not be auto-applied: {selected}"
+    assert {item["skip_reason"] for item in selected["skipped"]} == {"ambiguous_mapping"}, f"ambiguity should be explicit: {selected}"
+
+
+def test_chat_bridge_mirror_actions_support_session_status_and_limit_filters():
+    import chat_bridge
+
+    plan = {
+        "items": [
+            {"status": "codex_newer", "codex_session_id": "codex-a", "droid_session_id": "droid-a"},
+            {"status": "missing_droid", "codex_session_id": "codex-b", "droid_session_id": "droid-b"},
+            {"status": "droid_newer", "codex_session_id": "codex-c", "droid_session_id": "droid-c"},
+        ],
+    }
+
+    selected = chat_bridge.select_mirror_actions(
+        plan,
+        direction="newer",
+        session_ids=["codex-a", "codex-b", "droid-c"],
+        statuses=["codex_newer", "droid_newer"],
+        limit=1,
+    )
+
+    assert [item["codex_session_id"] for item in selected["items"]] == ["codex-a"], f"limit should apply after session/status filters: {selected}"
+    skipped_reasons = {(item["codex_session_id"], item["skip_reason"]) for item in selected["skipped"]}
+    assert ("codex-b", "status_filter") in skipped_reasons, f"status filter should skip codex-b: {selected}"
+    assert ("codex-c", "limit") in skipped_reasons, f"limit should skip extra matching item: {selected}"
+
+
+def test_chat_bridge_mirror_actions_mark_previous_copy_as_already_applied():
+    import chat_bridge
+
+    plan = {
+        "items": [
+            {
+                "status": "missing_droid",
+                "codex_session_id": "codex-source",
+                "droid_session_id": "missing-target",
+                "bridge_id": "codex-codex-source",
+                "source_app": "",
+            },
+            {
+                "status": "in_sync",
+                "codex_session_id": "codex-source",
+                "droid_session_id": "bridge-droid-copy",
+                "bridge_id": "codex-codex-source",
+                "source_app": "codex",
+            },
+        ],
+    }
+
+    selected = chat_bridge.select_mirror_actions(plan, direction="newer")
+
+    assert selected["items"] == [], f"previously applied logical source should not fan out again: {selected}"
+    already = [item for item in selected["skipped"] if item.get("skip_reason") == "already_applied"]
+    assert already and already[0]["codex_session_id"] == "codex-source", f"duplicate guard should be explicit: {selected}"
+
+
+def test_chat_bridge_doctor_detects_structural_differences():
+    import chat_bridge
+
+    codex_bridge = {
+        "session": {"provider": "openai", "model": "gpt-5"},
+        "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"git_branch": "main", "git_sha": "a" * 40}},
+        "messages": [
+            {"role": "user", "parts": [{"type": "text", "text": "hello"}]},
+            {"role": "assistant", "parts": [{"type": "tool_call", "id": "tool-1", "name": "shell", "input": {"cmd": "echo ok"}}]},
+            {"role": "tool", "parts": [{"type": "tool_result", "tool_call_id": "tool-1", "content": "ok"}]},
+        ],
+        "compactions": [{"summary_text": "summary"}],
+        "source_events": [{"payload_type": "message"}],
+    }
+    droid_bridge = {
+        "session": {"provider": "openai", "model": "gpt-5"},
+        "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {}},
+        "messages": [
+            {"role": "user", "parts": [{"type": "text", "text": "hello"}]},
+            {"role": "assistant", "parts": [{"type": "tool_call", "id": "tool-1", "name": "shell", "input": {"cmd": "echo ok"}}]},
+        ],
+        "compactions": [],
+        "source_events": [],
+    }
+
+    report = chat_bridge.diagnose_bridge_pair(codex_bridge, droid_bridge, "codex-a", "droid-a")
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert report["read_only"] is True, f"doctor report should be read-only: {report}"
+    assert report["status"] == "warn", f"structural differences should warn: {report}"
+    assert {"message_count", "role_sequence", "part_type_sequence", "tool_result_count", "compaction_count", "source_event_count"}.issubset(codes), f"doctor should flag missing transferred parts: {report}"
+
+
+def test_chat_bridge_doctor_detects_one_sided_metadata_loss():
+    import chat_bridge
+
+    codex_bridge = {
+        "session": {"provider": "openai", "model": "gpt-5"},
+        "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"git_branch": "main", "git_sha": "a" * 40}},
+        "messages": [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        "compactions": [],
+        "source_events": [],
+    }
+    droid_bridge = {
+        "session": {"provider": "", "model": "gpt-5"},
+        "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"git_branch": "main", "git_sha": "a" * 40}},
+        "messages": [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        "compactions": [],
+        "source_events": [],
+    }
+
+    report = chat_bridge.diagnose_bridge_pair(codex_bridge, droid_bridge, "codex-a", "droid-a")
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert report["status"] == "warn", f"one-sided provider loss should warn: {report}"
+    assert "provider" in codes, f"doctor should flag one-sided provider loss: {report}"
+
+
+def test_chat_bridge_doctor_normalizes_extended_windows_cwd():
+    import chat_bridge
+
+    codex_bridge = {
+        "session": {"provider": "openai", "model": "gpt-5"},
+        "work_context": {"primary_cwd": r"\\?\C:\Research\nothing", "current": {"git_branch": "", "git_sha": ""}},
+        "messages": [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        "compactions": [],
+        "source_events": [],
+    }
+    droid_bridge = {
+        "session": {"provider": "openai", "model": "gpt-5"},
+        "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"git_branch": "", "git_sha": ""}},
+        "messages": [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        "compactions": [],
+        "source_events": [],
+    }
+
+    report = chat_bridge.diagnose_bridge_pair(codex_bridge, droid_bridge, "codex-a", "droid-a")
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert "primary_cwd" not in codes, f"extended Windows cwd prefix should not create doctor noise: {report}"
+    assert report["status"] == "ok", f"normalized cwd pair should otherwise be clean: {report}"
+
+
+def test_chat_bridge_doctor_reports_malformed_mapped_droid_jsonl():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-bad-droid",
+            "Codex Bad Droid",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-bad-droid"),
+        )
+        factory_home = tmp_dir / "factory"
+        sessions_dir = factory_home / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        (sessions_dir / "droid-bad-jsonl.jsonl").write_text("{not json}\n", encoding="utf-8")
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"codex_session_id": "codex-bad-droid", "droid_session_id": "droid-bad-jsonl"}],
+        }), encoding="utf-8")
+
+        report = ct._build_chat_bridge_doctor_report(chat_bridge, factory_home)
+
+        assert report["summary"]["error"] == 1, f"malformed Droid JSONL should be reported as pair error: {report}"
+        item = report["items"][0]
+        codes = {issue["code"] for issue in item["issues"]}
+        assert item["status"] == "error", f"malformed Droid JSONL should not abort or downgrade: {report}"
+        assert "droid_source_unreadable" in codes, f"doctor should flag unreadable Droid source: {report}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_doctor_reports_malformed_droid_settings():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-bad-settings",
+            "Codex Bad Settings",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-bad-settings"),
+        )
+        factory_home = tmp_dir / "factory"
+        _jsonl_path, settings_path = write_temp_droid_session(factory_home, session_id="droid-bad-settings", title="Droid Bad Settings")
+        settings_path.write_text("{not json}\n", encoding="utf-8")
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"codex_session_id": "codex-bad-settings", "droid_session_id": "droid-bad-settings"}],
+        }), encoding="utf-8")
+
+        report = ct._build_chat_bridge_doctor_report(chat_bridge, factory_home)
+
+        assert report["summary"]["error"] == 1, f"malformed Droid settings should be reported as pair error: {report}"
+        item = report["items"][0]
+        codes = {issue["code"] for issue in item["issues"]}
+        assert item["status"] == "error", f"malformed Droid settings should not become normal metadata noise: {report}"
+        assert "droid_settings_unreadable" in codes, f"doctor should flag unreadable Droid settings: {report}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
 def test_chat_bridge_droid_to_codex_import_rolls_back_invalid_rollout():
     import chat_bridge
     import sqlite3
@@ -1117,7 +1597,8 @@ def test_chat_bridge_codex_to_droid_import_writes_session_and_mapping():
         assert events[0]["type"] == "session_start", f"first Droid event should be session_start: {events[0]}"
         assert "hello from codex" in jsonl_path.read_text(encoding="utf-8"), "Droid JSONL should include Codex text"
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
-        assert settings["providerLock"] == "gpt-5", f"settings should preserve model lock: {settings}"
+        assert settings["model"] == "gpt-5", f"settings should preserve selected model: {settings}"
+        assert settings["providerLock"] == "openai", f"settings should preserve provider lock: {settings}"
         mapping = json.loads((factory_home / "chat_bridge_mappings.json").read_text(encoding="utf-8"))
         assert mapping["pairs"][0]["codex_session_id"] == "codex-small", f"mapping should remember Codex id: {mapping}"
         assert mapping["pairs"][0]["droid_session_id"] == summary["droid_session_id"], f"mapping should remember Droid id: {mapping}"
@@ -1299,6 +1780,956 @@ def test_chat_bridge_codex_to_droid_writes_droid_valid_tool_inputs_and_parent_ch
     assert messages[2]["parentId"] == messages[1]["id"], f"tool result should point at assistant tool call message: {messages}"
 
 
+def test_chat_bridge_codex_to_droid_uses_unique_event_ids_for_tool_pairs():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        jsonl_text = "\n".join([
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "inspect"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:01Z",
+                "type": "response_item",
+                "payload": {"type": "function_call", "call_id": "call-same", "name": "shell", "arguments": "{\"cmd\":\"dir\"}"},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:02Z",
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "call_id": "call-same", "output": "ok"},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:03Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "final summary"}]},
+            }),
+        ]) + "\n"
+        store_temp_session("codex-tool-pair", "Tool Pair", r"C:\Research\nothing", jsonl_text=jsonl_text)
+        row = ct._fetch_session_rows(session_ids=["codex-tool-pair"])[0]
+
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"])
+        summary = chat_bridge.import_bridge_to_droid(
+            bridge,
+            factory_home=tmp_dir / "factory",
+            preserve_timestamps=True,
+            compaction_mode="inline",
+        )
+        events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+        messages = [event for event in events if event.get("type") == "message"]
+        ids = [message["id"] for message in messages]
+
+        assert len(ids) == len(set(ids)), f"Droid event ids must be unique so the UI can render the full chain: {ids}"
+        assert messages[-1]["message"]["content"][0]["text"] == "final summary", f"final assistant message should stay at chain tail: {messages[-1]}"
+        assert messages[-1]["parentId"] == messages[-2]["id"], f"final assistant message should parent to unique tool result event: {messages[-2:]}"
+        tool_use = next(part for event in messages for part in event["message"]["content"] if part.get("type") == "tool_use")
+        tool_result = next(part for event in messages for part in event["message"]["content"] if part.get("type") == "tool_result")
+        assert tool_use["id"] == "call-same", f"tool_use id should still preserve Codex call_id: {tool_use}"
+        assert tool_result["tool_use_id"] == "call-same", f"tool_result should still link to tool_use id: {tool_result}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_groups_parallel_tool_calls_like_droid():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        jsonl_text = "\n".join([
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "inspect"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:01Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "I will inspect files."}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:02Z",
+                "type": "response_item",
+                "payload": {"type": "function_call", "call_id": "call-ls", "name": "exec_command", "arguments": "{\"cmd\":\"dir\"}"},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:02Z",
+                "type": "response_item",
+                "payload": {"type": "function_call", "call_id": "call-read", "name": "exec_command", "arguments": "{\"cmd\":\"type README.md\"}"},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:03Z",
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "call_id": "call-ls", "output": "index.html\nREADME.md"},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:03Z",
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "call_id": "call-read", "output": "# Project"},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:04Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+            }),
+        ]) + "\n"
+        store_temp_session("codex-tool-group", "Tool Group", r"C:\Research\nothing", jsonl_text=jsonl_text)
+        row = ct._fetch_session_rows(session_ids=["codex-tool-group"])[0]
+
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"])
+        bridge_part_groups = [[part["type"] for part in message["parts"]] for message in bridge["messages"]]
+        assert bridge_part_groups == [
+            ["text"],
+            ["text", "tool_call", "tool_call"],
+            ["tool_result", "tool_result"],
+            ["text"],
+        ], f"Codex bridge should group Droid-native parallel tools: {bridge['messages']}"
+
+        summary = chat_bridge.import_bridge_to_droid(
+            bridge,
+            factory_home=tmp_dir / "factory",
+            preserve_timestamps=True,
+            compaction_mode="inline",
+        )
+        events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+        messages = [event for event in events if event.get("type") == "message"]
+        droid_part_groups = [[part["type"] for part in event["message"]["content"]] for event in messages]
+
+        assert droid_part_groups == [
+            ["text"],
+            ["text", "tool_use", "tool_use"],
+            ["tool_result", "tool_result"],
+            ["text"],
+        ], f"Droid session should receive native grouped tool transcript: {messages}"
+        assert messages[1]["message"]["content"][1]["id"] == "call-ls", f"first tool id should be preserved: {messages[1]}"
+        assert messages[2]["message"]["content"][1]["tool_use_id"] == "call-read", f"second result should link to the second tool: {messages[2]}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_renders_grouped_tool_message_to_codex_in_part_order():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "droid", "session_id": "droid-tools", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {
+            "bridge_id": "droid-droid-tools",
+            "title": "Droid Tool Order",
+            "created_at": "2026-05-28T10:00:00Z",
+            "updated_at": "2026-05-28T10:00:04Z",
+            "provider": "openai",
+            "model": "custom:model",
+        },
+        "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"cwd": r"C:\Research\nothing"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {
+                "id": "assistant-tools",
+                "role": "assistant",
+                "created_at": "2026-05-28T10:00:01Z",
+                "parts": [
+                    {"type": "text", "text": "I will inspect files."},
+                    {"type": "tool_call", "id": "call-ls", "name": "LS", "input": {"directory_path": r"C:\Research\nothing"}},
+                    {"type": "tool_call", "id": "call-read", "name": "Read", "input": {"file_path": r"C:\Research\nothing\README.md"}},
+                ],
+            },
+            {
+                "id": "tool-results",
+                "role": "tool",
+                "created_at": "2026-05-28T10:00:02Z",
+                "parts": [
+                    {"type": "tool_result", "tool_call_id": "call-ls", "content": "index.html\nREADME.md"},
+                    {"type": "tool_result", "tool_call_id": "call-read", "content": "# Project"},
+                ],
+            },
+        ],
+        "extras": {},
+        "raw_event_refs": [],
+    }
+
+    rendered = chat_bridge._render_codex_rollout(
+        bridge,
+        "codex-tool-order",
+        chat_bridge._ms("2026-05-28T10:00:00Z"),
+        chat_bridge._ms("2026-05-28T10:00:04Z"),
+    )
+    events = [json.loads(line) for line in rendered.splitlines()]
+    payload_types = [event.get("payload", {}).get("type") for event in events if event.get("type") == "response_item"]
+
+    assert payload_types == ["message", "function_call", "function_call", "function_call_output", "function_call_output"], f"Codex rollout should preserve grouped Droid part order: {events}"
+    assert events[1]["payload"]["content"][0]["text"] == "I will inspect files.", f"assistant text should stay before tool calls: {events}"
+
+
+def test_chat_bridge_codex_to_droid_preserves_lossless_source_events():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        raw_events = [
+            {
+                "timestamp": "2026-05-28T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "codex-lossless",
+                    "timestamp": "2026-05-28T10:00:00Z",
+                    "cwd": r"C:\Research\nothing",
+                    "git": {"branch": "main", "commit_hash": "c" * 40},
+                },
+            },
+            {
+                "timestamp": "2026-05-28T10:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "model": "gpt-5", "cwd": r"C:\Research\nothing"},
+            },
+            {
+                "timestamp": "2026-05-28T10:00:02Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "inspect repo"}]},
+            },
+            {
+                "timestamp": "2026-05-28T10:00:03Z",
+                "type": "response_item",
+                "payload": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Need inspect files first."}]},
+            },
+            {
+                "timestamp": "2026-05-28T10:00:04Z",
+                "type": "response_item",
+                "payload": {"type": "function_call", "call_id": "call-1", "name": "shell", "arguments": "{\"cmd\":\"dir\"}"},
+            },
+            {
+                "timestamp": "2026-05-28T10:00:05Z",
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "call_id": "call-1", "output": "tool output body"},
+            },
+            {
+                "timestamp": "2026-05-28T10:00:06Z",
+                "type": "response_item",
+                "payload": {"type": "token_count", "input_tokens": 123, "output_tokens": 45},
+            },
+            {
+                "timestamp": "2026-05-28T10:00:07Z",
+                "type": "event_msg",
+                "payload": {"type": "mcp_tool_call_end", "call_id": "call-1", "duration_ms": 17},
+            },
+            {
+                "timestamp": "2026-05-28T10:00:08Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": "done"},
+            },
+            {
+                "timestamp": "2026-05-28T10:00:09Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "final summary"}]},
+            },
+        ]
+        jsonl_text = "".join(json.dumps(event) + "\n" for event in raw_events)
+        store_temp_session("codex-lossless", "Lossless Events", r"C:\Research\nothing", jsonl_text=jsonl_text)
+        row = ct._fetch_session_rows(session_ids=["codex-lossless"])[0]
+
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"])
+        source_events = bridge.get("source_events") or []
+        assert len(source_events) == len(raw_events), f"bridge should preserve every raw Codex event: {source_events}"
+        for index, source_event in enumerate(source_events):
+            assert source_event["index"] == index, f"source event should keep original index: {source_event}"
+            assert source_event["raw"] == raw_events[index], f"source event should keep raw payload: {source_event}"
+            assert "outer_type" in source_event and "payload_type" in source_event, f"source event should describe source types: {source_event}"
+
+        payload_types = {event["payload_type"] for event in source_events}
+        assert {"task_started", "reasoning", "token_count", "mcp_tool_call_end", "task_complete"} <= payload_types, f"non-message events should survive: {payload_types}"
+        represented = {event["payload_type"]: event.get("represented_by") or "" for event in source_events}
+        assert represented["message"], f"normalized message source event should point at bridge message: {source_events}"
+        assert represented["function_call"], f"tool call should point at a bridge assistant message: {source_events}"
+        assert represented["function_call_output"].startswith("codex-tool-result-"), f"tool output should point at synthetic message id: {source_events}"
+        assert represented["reasoning"], f"reasoning source event should point at bridge reasoning message: {source_events}"
+
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp_dir / "factory", preserve_timestamps=True)
+        events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+        droid_source_events = [event for event in events if event.get("type") == "bridge_source_event"]
+        assert len(droid_source_events) == len(source_events), f"Droid JSONL should keep every bridge source event: {events}"
+        assert droid_source_events[3]["payloadType"] == "reasoning", f"reasoning should be present in Droid JSONL: {droid_source_events[3]}"
+        assert droid_source_events[5]["raw"]["payload"]["output"] == "tool output body", f"tool output body should survive losslessly: {droid_source_events[5]}"
+
+        discovery = json.loads((tmp_dir / "factory" / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
+        discovered = discovery["entries"][summary["droid_session_id"]]
+        assert discovered["messageCount"] == len(bridge["messages"]), f"lossless metadata should not inflate Droid message count: {discovered}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_reasoning_preserves_encrypted_content_for_droid():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        raw_events = [
+            {
+                "timestamp": "2026-05-28T10:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": None,
+                    "encrypted_content": "gAAAAAB-not-transferable",
+                },
+            },
+            {
+                "timestamp": "2026-05-28T10:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "visible"}],
+                },
+            },
+        ]
+        store_temp_session("codex-encrypted-source", "Encrypted Source", r"C:\Research\nothing", jsonl_text="".join(json.dumps(event) + "\n" for event in raw_events))
+        row = ct._fetch_session_rows(session_ids=["codex-encrypted-source"])[0]
+
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"])
+        source_events = bridge.get("source_events") or []
+        assert len(source_events) == 2, f"source event metadata should remain for diagnostics: {source_events}"
+        assert "gAAAAAB-not-transferable" in json.dumps(source_events, ensure_ascii=False), f"encrypted Codex reasoning should stay available for native continuation: {source_events}"
+        assert source_events[0]["raw"]["payload"]["type"] == "reasoning", f"sanitized reasoning metadata should remain: {source_events[0]}"
+        reasoning_parts = [part for message in bridge["messages"] for part in message.get("parts", []) if part.get("type") == "reasoning"]
+        assert reasoning_parts and reasoning_parts[0]["encrypted_content"] == "gAAAAAB-not-transferable", f"Codex reasoning should normalize into a bridge part: {bridge['messages']}"
+
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp_dir / "factory", preserve_timestamps=True, compaction_mode="archived")
+        droid_events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+        thinking_parts = [
+            part
+            for event in droid_events
+            if event.get("type") == "message"
+            for part in event.get("message", {}).get("content", [])
+            if part.get("type") == "thinking"
+        ]
+        assert thinking_parts and thinking_parts[0]["openaiEncryptedContent"] == "gAAAAAB-not-transferable", f"Droid thinking should keep encrypted reasoning: {droid_events}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_droid_thinking_preserves_encrypted_reasoning_for_codex():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        sessions_dir = factory_home / "sessions"
+        sessions_dir.mkdir(parents=True)
+        jsonl_path = sessions_dir / "droid-thinking.jsonl"
+        settings_path = sessions_dir / "droid-thinking.settings.json"
+        signature_payload = {
+            "id": "rs_droid_1",
+            "type": "reasoning",
+            "encrypted_content": "gAAAAAB-droid-native",
+            "summary": [{"type": "summary_text", "text": "inspected repo"}],
+        }
+        events = [
+            {"type": "session_start", "id": "droid-thinking", "title": "Thinking", "owner": "test", "version": 2, "cwd": r"C:\Research\nothing"},
+            {
+                "type": "message",
+                "id": "assistant-thinking",
+                "timestamp": "2026-05-28T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "planning text",
+                            "signature": json.dumps(signature_payload),
+                            "signatureProvider": "openai",
+                            "durationMs": 1234,
+                            "openaiEncryptedContent": "gAAAAAB-droid-native",
+                            "openaiReasoningId": "rs_droid_1",
+                            "openaiReasoningSummary": "inspected repo",
+                        },
+                        {"type": "text", "text": "final answer"},
+                    ],
+                },
+            },
+        ]
+        jsonl_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        settings_path.write_text(json.dumps({"model": "custom:NeuroGate-GPT-5.5-1", "providerLock": "openai", "reasoningEffort": "high"}), encoding="utf-8")
+
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+        reasoning_parts = [part for message in bridge["messages"] for part in message.get("parts", []) if part.get("type") == "reasoning"]
+        assert reasoning_parts, f"Droid thinking should normalize into bridge reasoning: {bridge['messages']}"
+        reasoning = reasoning_parts[0]
+        assert reasoning["encrypted_content"] == "gAAAAAB-droid-native", f"encrypted reasoning should be preserved: {reasoning}"
+        assert reasoning["reasoning_id"] == "rs_droid_1", f"reasoning id should be preserved: {reasoning}"
+        assert reasoning["summary_text"] == "inspected repo", f"reasoning summary should be preserved: {reasoning}"
+        assert reasoning["text"] == "planning text", f"plain thinking text should be preserved: {reasoning}"
+
+        summary = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=tmp_dir,
+            state_db=tmp_dir / "state_5.sqlite",
+            sessions_dir=tmp_dir / "sessions",
+            global_state_path=tmp_dir / "global_state.json",
+            preserve_timestamps=True,
+        )
+        rollout_events = chat_bridge._read_jsonl(summary["rollout_path"])
+        reasoning_events = [event for event in rollout_events if event.get("payload", {}).get("type") == "reasoning"]
+        assert reasoning_events, f"Codex rollout should contain native reasoning event: {rollout_events}"
+        payload = reasoning_events[0]["payload"]
+        assert payload["encrypted_content"] == "gAAAAAB-droid-native", f"Codex reasoning encrypted payload should survive: {payload}"
+        assert payload["id"] == "rs_droid_1", f"Codex reasoning id should survive: {payload}"
+        assert payload["summary"] == [{"type": "summary_text", "text": "inspected repo"}], f"Codex reasoning summary should survive: {payload}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_round_trip_preserves_unknown_role_and_source_events():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-round-trip-lossless", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {
+            "bridge_id": "codex-codex-round-trip-lossless",
+            "title": "Round Trip Lossless",
+            "created_at": "2026-05-28T10:00:00Z",
+            "updated_at": "2026-05-28T10:00:03Z",
+            "provider": "NeuroGate_API",
+            "model": "gpt-5.5",
+        },
+        "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"cwd": r"C:\Research\nothing", "confidence": "observed"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {"id": "m-unknown", "role": "unknown", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "text", "text": "internal"}]},
+            {"id": "m-user", "role": "user", "created_at": "2026-05-28T10:00:02Z", "parts": [{"type": "text", "text": "hello"}]},
+        ],
+        "source_events": [
+            {"index": 0, "timestamp": "2026-05-28T10:00:00Z", "outer_type": "session_meta", "payload_type": "session_meta", "represented_by": "", "raw": {"type": "session_meta"}},
+            {"index": 1, "timestamp": "2026-05-28T10:00:01Z", "outer_type": "response_item", "payload_type": "message", "represented_by": "m-unknown", "raw": {"type": "response_item"}},
+        ],
+        "compactions": [],
+        "extras": {},
+        "raw_event_refs": [],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True)
+        round_trip = chat_bridge.droid_session_to_bridge(summary["droid_jsonl_path"], summary["droid_settings_path"])
+
+    roles = [message.get("role") for message in round_trip.get("messages") or []]
+    assert roles == ["unknown", "user"], f"bridge-only roles should survive Droid round-trip for doctor comparisons: {roles}"
+    assert len(round_trip.get("source_events") or []) == len(bridge["source_events"]), f"round-trip source event archive should not be double-counted: {round_trip.get('source_events')}"
+
+
+def test_chat_bridge_doctor_treats_canonical_droid_provider_as_equivalent():
+    import chat_bridge
+
+    codex_bridge = {
+        "session": {"provider": "NeuroGate_API", "model": "gpt-5.5"},
+        "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"git_branch": "", "git_sha": ""}},
+        "messages": [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        "compactions": [],
+        "source_events": [],
+    }
+    droid_bridge = {
+        "session": {"provider": "openai", "model": "gpt-5.5"},
+        "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"git_branch": "", "git_sha": ""}},
+        "messages": [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
+        "compactions": [],
+        "source_events": [],
+    }
+
+    report = chat_bridge.diagnose_bridge_pair(codex_bridge, droid_bridge, "codex-a", "droid-a")
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert "provider" not in codes, f"canonical Droid provider should not warn when model is preserved: {report}"
+    assert report["status"] == "ok", f"canonical provider equivalent pair should be clean: {report}"
+
+
+def test_chat_bridge_codex_to_bridge_extracts_compaction_metadata():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        replacement_history = [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "chack this repo"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checked repository."}]},
+        ]
+        raw_events = [
+            {
+                "timestamp": "2026-05-28T08:00:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "chack this repo"}]},
+            },
+            {
+                "timestamp": "2026-05-28T08:03:32Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checked repository."}]},
+            },
+            {
+                "timestamp": "2026-05-28T12:20:51Z",
+                "type": "compacted",
+                "payload": {
+                    "message": "Another language model started to solve this problem and produced a summary.",
+                    "replacement_history": replacement_history,
+                },
+            },
+            {
+                "timestamp": "2026-05-28T12:20:52Z",
+                "type": "event_msg",
+                "payload": {"type": "context_compacted"},
+            },
+        ]
+        store_temp_session("codex-compact", "Codex Compact", r"C:\Research\nothing", jsonl_text="".join(json.dumps(event) + "\n" for event in raw_events))
+        row = ct._fetch_session_rows(session_ids=["codex-compact"])[0]
+
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"])
+
+        compactions = bridge.get("compactions") or []
+        assert len(compactions) == 1, f"Codex compacted event should become bridge compaction: {bridge}"
+        compaction = compactions[0]
+        assert compaction["source"] == "codex", f"source should be Codex: {compaction}"
+        assert compaction["summary_text"].startswith("Another language model"), f"summary text should come from payload.message: {compaction}"
+        assert compaction["replacement_history"] == replacement_history, f"replacement_history should be preserved: {compaction}"
+        assert compaction["source_event_index"] == 2, f"source index should point at compacted event: {compaction}"
+        assert compaction["context_compacted_event_index"] == 3, f"context_compacted marker should be linked: {compaction}"
+        assert compaction["anchor_message_id"] == bridge["messages"][1]["id"], f"anchor should be last visible message before compaction: {compaction}"
+        assert compaction["anchor_message_index"] == 1, f"anchor index should match normalized messages: {compaction}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_writes_compaction_state_event():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        raw_events = [
+            {
+                "timestamp": "2026-05-28T08:00:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "chack this repo"}]},
+            },
+            {
+                "timestamp": "2026-05-28T08:03:32Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Checked repository."}]},
+            },
+            {
+                "timestamp": "2026-05-28T12:20:51Z",
+                "type": "compacted",
+                "payload": {
+                    "message": "Codex compacted summary",
+                    "replacement_history": [{"role": "user", "content": "chack this repo"}],
+                },
+            },
+            {
+                "timestamp": "2026-05-28T12:20:52Z",
+                "type": "event_msg",
+                "payload": {"type": "context_compacted"},
+            },
+        ]
+        store_temp_session("codex-compact-droid", "Codex Compact Droid", r"C:\Research\nothing", jsonl_text="".join(json.dumps(event) + "\n" for event in raw_events))
+        row = ct._fetch_session_rows(session_ids=["codex-compact-droid"])[0]
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"])
+
+        summary = chat_bridge.import_bridge_to_droid(
+            bridge,
+            factory_home=tmp_dir / "factory",
+            preserve_timestamps=True,
+            compaction_mode="inline",
+        )
+        events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+
+        compaction_events = [event for event in events if event.get("type") == "compaction_state"]
+        assert len(compaction_events) == 1, f"Droid JSONL should contain one native compaction_state: {events}"
+        compaction = compaction_events[0]
+        assert compaction["summaryText"] == "Codex compacted summary", f"summaryText should come from Codex payload.message: {compaction}"
+        assert compaction["summaryKind"] == "llm_summary", f"Codex compaction should import as Droid LLM summary: {compaction}"
+        assert compaction["removedCount"] == 1, f"removedCount should use replacement_history length: {compaction}"
+        assert compaction["anchorMessage"]["id"] == bridge["messages"][1]["id"], f"anchor id should target last pre-compaction message: {compaction}"
+        assert compaction["anchorMessage"]["index"] == 1, f"anchor index should target last pre-compaction message: {compaction}"
+        message_count = len([event for event in events if event.get("type") == "message"])
+        discovery = json.loads((tmp_dir / "factory" / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
+        assert discovery["entries"][summary["droid_session_id"]]["messageCount"] == message_count, f"compaction_state should not inflate message count: {discovery}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_droid_compaction_import_to_codex_writes_compacted_events():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        sessions_dir = factory_home / "sessions"
+        sessions_dir.mkdir(parents=True)
+        jsonl_path = sessions_dir / "droid-compact.jsonl"
+        settings_path = sessions_dir / "droid-compact.settings.json"
+        events = [
+            {"type": "session_start", "id": "droid-compact", "title": "Compressed", "owner": "test", "parent": "droid-parent"},
+            {
+                "type": "compaction_state",
+                "id": "compact-1",
+                "timestamp": "2026-05-28T13:01:08Z",
+                "summaryText": "Droid compacted summary",
+                "summaryTokens": 7,
+                "summaryKind": "llm_summary",
+                "removedCount": 3,
+            },
+            {
+                "type": "message",
+                "id": "msg-after",
+                "timestamp": "2026-05-28T13:01:09Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+            },
+        ]
+        jsonl_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        settings_path.write_text(json.dumps({"model": "custom:model", "providerLock": "openai"}), encoding="utf-8")
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+
+        summary = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=tmp_dir,
+            state_db=tmp_dir / "state_5.sqlite",
+            sessions_dir=tmp_dir / "sessions",
+            global_state_path=tmp_dir / "global_state.json",
+            preserve_timestamps=True,
+            compaction_mode="inline",
+        )
+        rollout_events = chat_bridge._read_jsonl(summary["rollout_path"])
+
+        compacted = [event for event in rollout_events if event.get("type") == "compacted"]
+        assert len(compacted) == 1, f"Codex rollout should contain compacted event for Droid summary: {rollout_events}"
+        assert compacted[0]["payload"]["message"] == "Droid compacted summary", f"summary should be preserved: {compacted[0]}"
+        assert compacted[0]["payload"]["removed_count"] == 3, f"removedCount should be preserved: {compacted[0]}"
+        assert any(event.get("payload", {}).get("type") == "context_compacted" for event in rollout_events), f"context_compacted marker should be written: {rollout_events}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_droid_compaction_survives_codex_round_trip():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        sessions_dir = factory_home / "sessions"
+        sessions_dir.mkdir(parents=True)
+        jsonl_path = sessions_dir / "droid-round-trip.jsonl"
+        settings_path = sessions_dir / "droid-round-trip.settings.json"
+        system_info = {
+            "osName": "win32 10.0.26100",
+            "directoryInfo": [{"cmd": "pwd", "out": r"C:\Research\nothing"}],
+            "gitInfo": [{"cmd": "git status -b --porcelain | head -n1", "out": "not a git repository"}],
+            "guidelinesInfo": [],
+            "designGuidelinesInfo": [],
+        }
+        events = [
+            {
+                "type": "session_start",
+                "id": "droid-round-trip",
+                "title": "Compressed",
+                "owner": "test",
+                "parent": "droid-parent",
+                "version": 2,
+                "cwd": r"C:\Research\nothing",
+            },
+            {
+                "type": "message",
+                "id": "msg-anchor",
+                "timestamp": "2026-05-28T13:01:07Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": "anchor"}]},
+            },
+            {
+                "type": "compaction_state",
+                "id": "compact-rt",
+                "timestamp": "2026-05-28T13:01:08Z",
+                "summaryText": "Droid summary survives",
+                "summaryTokens": 17,
+                "summaryKind": "llm_summary",
+                "removedCount": 4,
+                "anchorMessage": {"id": "msg-anchor", "index": 0},
+                "systemInfo": system_info,
+                "uiRenderCutoffMessageId": "msg-anchor",
+            },
+        ]
+        jsonl_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        settings_path.write_text(json.dumps({"model": "custom:model", "providerLock": "openai"}), encoding="utf-8")
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+
+        summary = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=tmp_dir,
+            state_db=tmp_dir / "state_5.sqlite",
+            sessions_dir=tmp_dir / "sessions",
+            global_state_path=tmp_dir / "global_state.json",
+            preserve_timestamps=True,
+            compaction_mode="inline",
+        )
+        round_tripped = chat_bridge.codex_session_to_bridge(
+            {
+                "id": summary["codex_session_id"],
+                "title": "Round Trip",
+                "cwd": r"C:\Research\nothing",
+                "created_at_ms": 1779973267000,
+                "updated_at_ms": 1779973268000,
+            },
+            summary["rollout_path"],
+        )
+
+        compaction = (round_tripped.get("compactions") or [])[0]
+        assert compaction["summary_text"] == "Droid summary survives", f"summary should survive Codex round-trip: {compaction}"
+        assert compaction["summary_tokens"] == 17, f"summary tokens should survive Codex round-trip: {compaction}"
+        assert compaction["removed_count"] == 4, f"removed count should survive Codex round-trip: {compaction}"
+        assert compaction["parent_session_id"] == "droid-parent", f"Droid parent should survive Codex round-trip: {compaction}"
+        assert compaction["anchor_message_id"] == "msg-anchor", f"anchor id should survive Codex round-trip: {compaction}"
+        assert compaction["anchor_message_index"] == 0, f"anchor index should survive Codex round-trip: {compaction}"
+        assert compaction["system_info"] == system_info, f"systemInfo should survive Codex round-trip: {compaction}"
+        assert compaction["ui_render_cutoff_message_id"] == "msg-anchor", f"ui cutoff should survive Codex round-trip: {compaction}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_raw_compaction_mode_skips_native_state():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-raw", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {"bridge_id": "codex-codex-raw", "title": "Raw Mode", "created_at": "2026-05-28T10:00:00Z", "updated_at": "2026-05-28T10:00:03Z", "provider": "openai", "model": "gpt-5"},
+        "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {"id": "m1", "role": "user", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "text", "text": "before"}]},
+            {"id": "m2", "role": "assistant", "created_at": "2026-05-28T10:00:02Z", "parts": [{"type": "text", "text": "after"}]},
+        ],
+        "compactions": [{"source": "codex", "id": "compact-1", "timestamp": "2026-05-28T10:00:02Z", "summary_text": "summary", "removed_count": 1, "anchor_message_id": "m1", "anchor_message_index": 0}],
+        "source_events": [
+            {"index": 0, "timestamp": "2026-05-28T10:00:01Z", "outer_type": "event_msg", "payload_type": "task_started", "represented_by": "", "raw": {"type": "event_msg", "payload": {"type": "task_started"}}},
+            {"index": 1, "timestamp": "2026-05-28T10:00:02Z", "outer_type": "compacted", "payload_type": "compacted", "represented_by": "", "raw": {"type": "compacted", "payload": {"message": "summary"}}},
+        ],
+        "raw_event_refs": [],
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True, compaction_mode="raw")
+        events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+        discovery = json.loads((Path(tmp) / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
+
+    assert not [event for event in events if event.get("type") == "compaction_state"], f"raw mode should not write native Droid compaction_state: {events}"
+    source_events = [event for event in events if event.get("type") == "bridge_source_event"]
+    assert len(source_events) == 2, f"raw mode should keep mixed lossless source events: {events}"
+    assert [event["payloadType"] for event in source_events] == ["task_started", "compacted"], f"raw mode source event order should be preserved: {source_events}"
+    assert len([event for event in events if event.get("type") == "message"]) == 2, f"raw mode should keep visible messages: {events}"
+    assert discovery["entries"][summary["droid_session_id"]]["messageCount"] == 2, f"source events should not inflate message count: {discovery}"
+
+
+def test_chat_bridge_codex_to_droid_default_archived_compaction_mode_skips_native_state():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-archived", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {"bridge_id": "codex-codex-archived", "title": "Archived Mode", "created_at": "2026-05-28T10:00:00Z", "updated_at": "2026-05-28T10:00:03Z", "provider": "openai", "model": "gpt-5"},
+        "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {"id": "m1", "role": "user", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "text", "text": "before"}]},
+            {"id": "m2", "role": "assistant", "created_at": "2026-05-28T10:00:02Z", "parts": [{"type": "text", "text": "after"}]},
+        ],
+        "compactions": [{"source": "codex", "id": "compact-archived", "timestamp": "2026-05-28T10:00:02Z", "summary_text": "summary", "removed_count": 1, "anchor_message_id": "m1", "anchor_message_index": 0}],
+        "source_events": [
+            {"index": 0, "timestamp": "2026-05-28T10:00:02Z", "outer_type": "compacted", "payload_type": "compacted", "represented_by": "", "raw": {"type": "compacted", "payload": {"message": "summary"}}},
+        ],
+        "raw_event_refs": [],
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True)
+        events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+
+    assert not [event for event in events if event.get("type") == "compaction_state"], f"default archived mode should not activate Droid compaction: {events}"
+    assert [event["payloadType"] for event in events if event.get("type") == "bridge_source_event"] == ["compacted"], f"default archived mode should keep compaction only as source archive: {events}"
+    assert len([event for event in events if event.get("type") == "message"]) == 2, f"default archived mode should keep full visible history: {events}"
+
+
+def test_chat_bridge_codex_to_droid_native_compaction_mode_writes_continuation_suffix():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-native", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {"bridge_id": "codex-codex-native", "title": "Native Mode", "created_at": "2026-05-28T10:00:00Z", "updated_at": "2026-05-28T10:00:04Z", "provider": "openai", "model": "gpt-5"},
+        "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"cwd": r"C:\Research\nothing", "confidence": "observed"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {"id": "before-user", "role": "user", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "text", "text": "before user"}]},
+            {"id": "before-assistant", "role": "assistant", "created_at": "2026-05-28T10:00:02Z", "parts": [{"type": "text", "text": "before assistant"}]},
+            {"id": "after-user", "role": "user", "created_at": "2026-05-28T10:00:03Z", "parts": [{"type": "text", "text": "after compaction"}]},
+        ],
+        "compactions": [{"source": "codex", "id": "compact-native", "timestamp": "2026-05-28T10:00:02Z", "summary_text": "native summary", "summary_tokens": 5, "removed_count": 2, "anchor_message_id": "before-assistant", "anchor_message_index": 1, "parent_session_id": "droid-parent"}],
+        "source_events": [],
+        "raw_event_refs": [],
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True, compaction_mode="native")
+        events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+        discovery = json.loads((Path(tmp) / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
+
+    session_start = events[0]
+    compaction = next(event for event in events if event.get("type") == "compaction_state")
+    messages = [event for event in events if event.get("type") == "message"]
+    assert session_start["parent"] == "droid-parent", f"native mode should preserve Droid parent when known: {session_start}"
+    assert "anchorMessage" not in compaction, f"native Droid continuation should use anchorless summary: {compaction}"
+    assert compaction["summaryText"] == "native summary", f"native mode should preserve summary: {compaction}"
+    assert [message["id"] for message in messages] == ["after-user"], f"native mode should keep only suffix messages: {messages}"
+    assert discovery["entries"][summary["droid_session_id"]]["messageCount"] == 1, f"native mode messageCount should count only suffix messages: {discovery}"
+
+
+def test_chat_bridge_codex_to_droid_native_compaction_mode_skips_tool_result_suffix_start():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-native-tool", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {"bridge_id": "codex-codex-native-tool", "title": "Native Tool", "created_at": "2026-05-28T10:00:00Z", "updated_at": "2026-05-28T10:00:04Z", "provider": "openai", "model": "gpt-5"},
+        "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {"id": "tool-call", "role": "assistant", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "tool_call", "id": "call-1", "name": "shell", "input": {"cmd": "dir"}}]},
+            {"id": "tool-result", "role": "tool", "created_at": "2026-05-28T10:00:02Z", "parts": [{"type": "tool_result", "tool_call_id": "call-1", "content": "ok"}]},
+            {"id": "after-user", "role": "user", "created_at": "2026-05-28T10:00:03Z", "parts": [{"type": "text", "text": "continue"}]},
+        ],
+        "compactions": [{"source": "codex", "id": "compact-native-tool", "timestamp": "2026-05-28T10:00:01Z", "summary_text": "summary", "removed_count": 1, "anchor_message_id": "tool-call", "anchor_message_index": 0}],
+        "source_events": [],
+        "raw_event_refs": [],
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True, compaction_mode="native")
+        events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+
+    messages = [event for event in events if event.get("type") == "message"]
+    assert [message["id"] for message in messages] == ["after-user"], f"native suffix must not start with tool_result: {messages}"
+    assert not any(part.get("type") == "tool_result" for message in messages for part in message["message"]["content"]), f"orphaned tool_result should be skipped: {messages}"
+
+
+def test_chat_bridge_droid_to_codex_raw_compaction_mode_skips_compacted_events():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        bridge = {
+            "format": "codex-droid-chat-bridge",
+            "version": 1,
+            "source": {"app": "droid", "session_id": "droid-raw", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+            "session": {"bridge_id": "droid-droid-raw", "title": "Droid Raw", "created_at": "2026-05-28T10:00:00Z", "updated_at": "2026-05-28T10:00:02Z", "provider": "openai", "model": "custom:model"},
+            "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+            "messages": [{"id": "m1", "role": "user", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "text", "text": "continue"}]}],
+            "compactions": [{"source": "droid", "id": "compact-raw", "timestamp": "2026-05-28T10:00:00Z", "summary_text": "summary", "removed_count": 3}],
+            "source_events": [],
+            "raw_event_refs": [],
+        }
+
+        summary = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=tmp_dir,
+            state_db=tmp_dir / "state_5.sqlite",
+            sessions_dir=tmp_dir / "sessions",
+            global_state_path=tmp_dir / "global_state.json",
+            preserve_timestamps=True,
+            compaction_mode="raw",
+        )
+        events = chat_bridge._read_jsonl(summary["rollout_path"])
+
+        assert not [event for event in events if event.get("type") == "compacted"], f"raw mode should skip Codex compacted events: {events}"
+        assert not [event for event in events if event.get("payload", {}).get("type") == "context_compacted"], f"raw mode should skip context_compacted: {events}"
+        assert any(event.get("payload", {}).get("type") == "message" for event in events), f"raw mode should still write visible messages: {events}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_droid_to_codex_default_archived_compaction_mode_skips_compacted_events():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        bridge = {
+            "format": "codex-droid-chat-bridge",
+            "version": 1,
+            "source": {"app": "droid", "session_id": "droid-archived", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+            "session": {"bridge_id": "droid-droid-archived", "title": "Droid Archived", "created_at": "2026-05-28T10:00:00Z", "updated_at": "2026-05-28T10:00:02Z", "provider": "openai", "model": "custom:model"},
+            "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+            "messages": [{"id": "m1", "role": "user", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "text", "text": "continue"}]}],
+            "compactions": [{"source": "droid", "id": "compact-archived", "timestamp": "2026-05-28T10:00:00Z", "summary_text": "summary", "removed_count": 3}],
+            "source_events": [],
+            "raw_event_refs": [],
+        }
+
+        summary = chat_bridge.import_bridge_to_codex(
+            bridge,
+            codex_dir=tmp_dir,
+            state_db=tmp_dir / "state_5.sqlite",
+            sessions_dir=tmp_dir / "sessions",
+            global_state_path=tmp_dir / "global_state.json",
+            preserve_timestamps=True,
+        )
+        events = chat_bridge._read_jsonl(summary["rollout_path"])
+
+        assert not [event for event in events if event.get("type") == "compacted"], f"default archived mode should skip Codex compacted events: {events}"
+        assert not [event for event in events if event.get("payload", {}).get("type") == "context_compacted"], f"default archived mode should skip context_compacted: {events}"
+        assert any(event.get("payload", {}).get("type") == "message" for event in events), f"default archived mode should still write visible messages: {events}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_droid_archived_source_events_preserve_encrypted_content():
+    import chat_bridge
+
+    with tempfile.TemporaryDirectory() as tmp:
+        session_path = Path(tmp) / "droid-archive.jsonl"
+        settings_path = Path(tmp) / "droid-archive.settings.json"
+        events = [
+            {"type": "session_start", "id": "droid-archive", "title": "Archive", "owner": "test"},
+            {
+                "type": "bridge_source_event",
+                "id": "bridge-source-event-000001",
+                "timestamp": "2026-05-28T10:00:00Z",
+                "sourceIndex": 1,
+                "outerType": "response_item",
+                "payloadType": "reasoning",
+                "representedBy": "",
+                "raw": {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "reasoning",
+                        "summary": [{"text": "keep this"}],
+                        "encrypted_content": "opaque",
+                        "nested": {"encrypted_content": "opaque-nested", "visible": "kept"},
+                    },
+                },
+            },
+        ]
+        session_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        settings_path.write_text("{}", encoding="utf-8")
+
+        bridge = chat_bridge.droid_session_to_bridge(session_path, settings_path)
+
+    source_events = bridge.get("source_events") or []
+    assert len(source_events) == 1, f"archived Droid source event should round-trip: {source_events}"
+    assert "opaque" in json.dumps(source_events, ensure_ascii=False), f"encrypted archived source data should remain available for native continuation: {source_events}"
+    assert source_events[0]["raw"]["payload"]["nested"]["visible"] == "kept", f"non-encrypted metadata should remain: {source_events[0]}"
+
+
 def test_chat_bridge_codex_to_droid_can_skip_system_messages():
     import chat_bridge
 
@@ -1335,6 +2766,212 @@ def test_chat_bridge_codex_to_droid_can_skip_system_messages():
         assert "real assistant reply" in text, "assistant content should still be transferred"
     finally:
         restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_skip_system_filters_internal_envelopes():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        jsonl_text = "\n".join([
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<permissions instructions>\nsecret runtime policy"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:01Z",
+                "type": "response_item",
+                "payload": {"type": "message", "content": [{"type": "input_text", "text": "<app-context>\nprivate app context"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:02Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>\nC:\\Research\\nothing"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:03Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "chack this repo"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:04Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "I will inspect the repository."}]},
+            }),
+        ]) + "\n"
+        store_temp_session("codex-internal", "Codex Internal", r"C:\Research\nothing", jsonl_text=jsonl_text)
+        row = ct._fetch_session_rows(session_ids=["codex-internal"])[0]
+
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"], include_system=False)
+        bridge_texts = [part["text"] for message in bridge["messages"] for part in message["parts"] if part.get("type") == "text"]
+        assert bridge_texts == ["chack this repo", "I will inspect the repository."], f"internal Codex context should be stripped: {bridge_texts}"
+
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp_dir / "factory", preserve_timestamps=True)
+        events = [json.loads(line) for line in Path(summary["droid_jsonl_path"]).read_text(encoding="utf-8").splitlines()]
+        messages = [event for event in events if event.get("type") == "message"]
+        assert messages[0]["message"]["content"][0]["text"] == "chack this repo", f"Droid first message should be the real user prompt: {messages}"
+        raw = Path(summary["droid_jsonl_path"]).read_text(encoding="utf-8")
+        assert "<permissions instructions>" not in raw
+        assert "<app-context>" not in raw
+        assert "<environment_context>" not in raw
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_default_filters_internal_envelopes_from_messages():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        jsonl_text = "\n".join([
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "content": [{"type": "input_text", "text": "<permissions instructions>\nruntime policy"}, {"type": "input_text", "text": "<skills_instructions>\nskills"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:01Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>\nC:\\Research\\nothing"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:02Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "chack this repo"}]},
+            }),
+        ]) + "\n"
+        store_temp_session("codex-internal-default", "Codex Internal Default", r"C:\Research\nothing", jsonl_text=jsonl_text)
+        row = ct._fetch_session_rows(session_ids=["codex-internal-default"])[0]
+
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"], include_system=True)
+        bridge_texts = [part["text"] for message in bridge["messages"] for part in message["parts"] if part.get("type") == "text"]
+        assert bridge_texts == ["chack this repo"], f"runtime envelopes should not be visible bridge messages by default: {bridge_texts}"
+        assert len(bridge.get("source_events") or []) == 3, f"raw source events should remain available for diagnostics: {bridge.get('source_events')}"
+
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp_dir / "factory", preserve_timestamps=True)
+        droid_bridge = chat_bridge.droid_session_to_bridge(summary["droid_jsonl_path"], summary["droid_settings_path"])
+        droid_texts = [part["text"] for message in droid_bridge["messages"] for part in message["parts"] if part.get("type") == "text"]
+        assert droid_texts == ["chack this repo"], f"Droid visible messages should exclude runtime envelopes: {droid_texts}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_preserves_tool_result_errors():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        jsonl_text = "\n".join([
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run failing command"}]},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:01Z",
+                "type": "response_item",
+                "payload": {"type": "function_call", "call_id": "call-fail", "name": "shell", "arguments": "{\"cmd\":\"exit 1\"}"},
+            }),
+            json.dumps({
+                "timestamp": "2026-05-28T10:00:02Z",
+                "type": "response_item",
+                "payload": {"type": "function_call_output", "call_id": "call-fail", "output": "exit code 1", "is_error": True},
+            }),
+        ]) + "\n"
+        store_temp_session("codex-tool-error", "Tool Error", r"C:\Research\nothing", jsonl_text=jsonl_text)
+        row = ct._fetch_session_rows(session_ids=["codex-tool-error"])[0]
+
+        bridge = chat_bridge.codex_session_to_bridge(row, row["rollout_path"])
+        tool_result = next(part for message in bridge["messages"] for part in message["parts"] if part.get("type") == "tool_result")
+        assert tool_result["is_error"] is True, f"bridge tool_result should preserve Codex error state: {tool_result}"
+
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp_dir / "factory", preserve_timestamps=True)
+        events = [json.loads(line) for line in Path(summary["droid_jsonl_path"]).read_text(encoding="utf-8").splitlines()]
+        droid_result = next(part for event in events if event.get("type") == "message" for part in event["message"]["content"] if part.get("type") == "tool_result")
+        assert droid_result["is_error"] is True, f"Droid tool_result should preserve error state: {droid_result}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_codex_to_droid_maps_custom_model_settings():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-custom-model", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {
+            "bridge_id": "codex-codex-custom-model",
+            "title": "Custom Model",
+            "created_at": "2026-05-28T10:00:00Z",
+            "updated_at": "2026-05-28T10:00:01Z",
+            "provider": "openai",
+            "model": "gpt-5.5",
+        },
+        "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {"id": "m1", "role": "user", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "text", "text": "hello"}]},
+        ],
+        "extras": {},
+        "raw_event_refs": [],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        factory_home = Path(tmp)
+        (factory_home / "settings.json").write_text(json.dumps({
+            "customModels": [
+                {
+                    "id": "custom:NeuroGate-GPT-5.5-1",
+                    "model": "gpt-5.5",
+                    "displayName": "NeuroGate GPT-5.5",
+                    "provider": "openai",
+                    "reasoningEffort": "medium",
+                }
+            ],
+            "sessionDefaultSettings": {"model": "custom:NeuroGate-GPT-5.5-1", "reasoningEffort": "medium"},
+        }), encoding="utf-8")
+
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=factory_home, preserve_timestamps=True)
+        settings = json.loads(Path(summary["droid_settings_path"]).read_text(encoding="utf-8"))
+
+    assert settings["model"] == "custom:NeuroGate-GPT-5.5-1", f"Droid session should use matching custom model id: {settings}"
+    assert settings["providerLock"] == "openai", f"Droid provider lock should use the custom model provider: {settings}"
+    assert settings["reasoningEffort"] == "medium", f"Droid reasoning effort should follow the custom model/default: {settings}"
+
+
+def test_chat_bridge_codex_to_droid_maps_profile_provider_to_droid_backend():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-profile-provider", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {
+            "bridge_id": "codex-codex-profile-provider",
+            "title": "Profile Provider",
+            "created_at": "2026-05-28T10:00:00Z",
+            "updated_at": "2026-05-28T10:00:01Z",
+            "provider": "NeuroGate_API",
+            "model": "gpt-5.5",
+            "reasoning_effort": "xhigh",
+        },
+        "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {"id": "m1", "role": "user", "created_at": "2026-05-28T10:00:01Z", "parts": [{"type": "text", "text": "hello"}]},
+        ],
+        "extras": {},
+        "raw_event_refs": [],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True)
+        settings = json.loads(Path(summary["droid_settings_path"]).read_text(encoding="utf-8"))
+
+    assert settings["model"] == "gpt-5.5", f"fallback should keep source model when no Droid custom model matches: {settings}"
+    assert settings["providerLock"] == "openai", f"GPT-like Codex profile names should map to Droid openai backend: {settings}"
+    assert settings["reasoningEffort"] == "xhigh", f"Codex reasoning effort should be preserved when present: {settings}"
 
 
 def test_operation_history_redacts_and_loads_newest():
@@ -1404,21 +3041,49 @@ def test_chat_bridge_cli_flags_registered():
         "--codex-to-droid",
         "--droid-sessions",
         "--codex-sessions",
+        "--chat-bridge-doctor",
+        "--chat-mapping-plan",
+        "--chat-mirror-plan",
+        "--chat-mirror-apply",
+        "--chat-mirror-confirm",
+        "--chat-mirror-direction", "droid-to-codex",
+        "--chat-mirror-session", "codex-a,droid-b",
+        "--chat-mirror-status", "codex_newer,droid_newer",
+        "--chat-mirror-limit", "2",
         "--chat-session", "one,two",
         "--chat-preserve-timestamps",
         "--chat-fresh-timestamps",
         "--chat-pin-old",
+        "--chat-backup",
         "--chat-skip-system",
+        "--chat-compaction-mode", "native",
     ])
     assert args.droid_to_codex is True
     assert args.codex_to_droid is True
     assert args.droid_sessions is True
     assert args.codex_sessions is True
+    assert args.chat_bridge_doctor is True
+    assert args.chat_mapping_plan is True
+    assert args.chat_mirror_plan is True
+    assert args.chat_mirror_apply is True
+    assert args.chat_mirror_confirm is True
+    assert args.chat_mirror_direction == "droid-to-codex"
+    assert args.chat_mirror_session == "codex-a,droid-b"
+    assert args.chat_mirror_status == "codex_newer,droid_newer"
+    assert args.chat_mirror_limit == 2
     assert args.chat_session == "one,two"
     assert args.chat_preserve_timestamps is True
     assert args.chat_fresh_timestamps is True
     assert args.chat_pin_old is True
+    assert args.chat_backup is True
     assert args.chat_skip_system is True
+    assert args.chat_compaction_mode == "native"
+
+    default_args = parser.parse_args([])
+    assert default_args.chat_compaction_mode == "archived", "chat bridge should default to full visible history with compactions archived"
+    assert default_args.chat_backup is False, "chat imports should not create full .codex backups unless requested"
+    archived_args = parser.parse_args(["--chat-compaction-mode", "archived"])
+    assert archived_args.chat_compaction_mode == "archived", "archived compaction mode should be accepted by CLI"
 
 
 def test_chat_bridge_cli_missing_droid_session_does_not_backup():
@@ -1437,7 +3102,9 @@ def test_chat_bridge_cli_missing_droid_session_does_not_backup():
             chat_session="missing-session",
             chat_fresh_timestamps=False,
             chat_pin_old=False,
+            chat_backup=False,
             chat_old_days=180,
+            chat_compaction_mode="raw",
             droid_settings=str(factory_home / "settings.json"),
             project=None,
         )
@@ -1449,6 +3116,705 @@ def test_chat_bridge_cli_missing_droid_session_does_not_backup():
         assert backup_calls == [], f"missing source sessions should not trigger Codex backup: {backup_calls}"
     finally:
         ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_cli_droid_to_codex_import_does_not_backup_by_default():
+    import contextlib
+    import io
+    import sqlite3
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    backup_calls = []
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        write_temp_droid_session(factory_home, session_id="droid-import", title="Droid Import")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=True,
+            codex_to_droid=False,
+            chat_session="droid-import",
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_backup=False,
+            chat_old_days=180,
+            chat_compaction_mode="raw",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        conn = sqlite3.connect(str(ct.STATE_DB))
+        count = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+        conn.close()
+        assert handled is True, "Droid-to-Codex import should be handled"
+        assert backup_calls == [], f"default Droid-to-Codex import must not create full .codex backup: {backup_calls}"
+        assert count == 1, f"import should still create one Codex session copy, got {count}"
+    finally:
+        ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_cli_droid_to_codex_import_backs_up_when_requested():
+    import contextlib
+    import io
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    backup_calls = []
+    try:
+        create_temp_threads_db()
+        factory_home = tmp_dir / "factory"
+        write_temp_droid_session(factory_home, session_id="droid-import-backup", title="Droid Import Backup")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=True,
+            codex_to_droid=False,
+            chat_session="droid-import-backup",
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_backup=True,
+            chat_old_days=180,
+            chat_compaction_mode="raw",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        assert handled is True, "Droid-to-Codex import should be handled"
+        assert backup_calls == ["called"], f"--chat-backup should create one full .codex backup: {backup_calls}"
+    finally:
+        ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_cli_mirror_plan_is_read_only_and_does_not_require_session():
+    import contextlib
+    import io
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    backup_calls = []
+    try:
+        create_temp_threads_db()
+        store_temp_session("codex-plan", "Codex Plan", r"C:\Research\nothing", updated_at_ms=5000)
+        factory_home = tmp_dir / "factory"
+        jsonl_path, _settings_path = write_temp_droid_session(factory_home, session_id="droid-plan", title="Droid Plan")
+        os.utime(jsonl_path, (2, 2))
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"codex_session_id": "codex-plan", "droid_session_id": "droid-plan"}],
+        }), encoding="utf-8")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=False,
+            codex_to_droid=False,
+            chat_mirror_plan=True,
+            chat_session=None,
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_old_days=180,
+            chat_compaction_mode="raw",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        text = out.getvalue()
+        assert handled is True, "chat mirror plan CLI command should be handled"
+        assert backup_calls == [], f"read-only mirror plan should not create backups: {backup_calls}"
+        assert "Mirror Plan" in text, f"mirror plan output should be visible: {text}"
+        assert "codex_newer" in text, f"mirror plan should classify mapped pair: {text}"
+    finally:
+        ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_cli_doctor_is_read_only_and_reports_pair_differences():
+    import contextlib
+    import io
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    backup_calls = []
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-doctor",
+            "Codex Doctor",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-doctor"),
+            updated_at_ms=5000,
+        )
+        factory_home = tmp_dir / "factory"
+        jsonl_path, _settings_path = write_temp_droid_session(factory_home, session_id="droid-doctor", title="Droid Doctor")
+        os.utime(jsonl_path, (5, 5))
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"codex_session_id": "codex-doctor", "droid_session_id": "droid-doctor"}],
+        }), encoding="utf-8")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=False,
+            codex_to_droid=False,
+            chat_bridge_doctor=True,
+            chat_mirror_plan=False,
+            chat_mirror_apply=False,
+            chat_mirror_confirm=False,
+            chat_mirror_direction="newer",
+            chat_mirror_session=None,
+            chat_mirror_status=None,
+            chat_mirror_limit=None,
+            chat_session="codex-doctor",
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_backup=False,
+            chat_old_days=180,
+            chat_skip_system=False,
+            chat_compaction_mode="inline",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        text = out.getvalue()
+        assert handled is True, "chat bridge doctor CLI should be handled"
+        assert backup_calls == [], f"doctor must not create backups: {backup_calls}"
+        assert "Chat Bridge Doctor" in text, f"doctor output should be visible: {text}"
+        assert "message_count" in text or "tool_result_count" in text, f"doctor should report structural differences: {text}"
+    finally:
+        ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_mapping_plan_classifies_stale_and_reexport_read_only():
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-map-plan",
+            "Codex Map Plan",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-map-plan"),
+            updated_at_ms=5000,
+        )
+        factory_home = tmp_dir / "factory"
+        jsonl_path, _settings_path = write_temp_droid_session(factory_home, session_id="droid-map-partial", title="Droid Partial")
+        os.utime(jsonl_path, (5, 5))
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [
+                {
+                    "codex_session_id": "codex-map-plan",
+                    "droid_session_id": "droid-map-missing",
+                    "source_app": "codex",
+                    "bridge_id": "codex-codex-map-plan",
+                },
+                {
+                    "codex_session_id": "codex-map-plan",
+                    "droid_session_id": "droid-map-partial",
+                    "source_app": "codex",
+                    "bridge_id": "codex-codex-map-plan",
+                },
+            ],
+        }), encoding="utf-8")
+
+        plan = ct._build_chat_mapping_plan(chat_bridge, factory_home)
+
+        assert plan["read_only"] is True, f"mapping plan must be read-only: {plan}"
+        statuses = plan["summary"]["statuses"]
+        assert statuses["stale_mapping"] == 1, f"missing target should be classified as stale mapping: {plan}"
+        assert statuses["needs_reexport"] == 1, f"structural drift should recommend re-export: {plan}"
+        stale = [item for item in plan["items"] if item["status"] == "stale_mapping"][0]
+        reexport = [item for item in plan["items"] if item["status"] == "needs_reexport"][0]
+        assert stale["recommended_action"] == "review_stale_mapping", f"stale mapping should not auto-clean: {plan}"
+        assert reexport["recommended_action"] == "create_fresh_droid_copy", f"Codex source drift should suggest fresh Droid copy: {plan}"
+        assert "--codex-to-droid" in reexport["recommended_command"], f"plan should show explicit re-export command: {plan}"
+        assert "--chat-session codex-map-plan" in reexport["recommended_command"], f"plan command should identify source session: {plan}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_cli_mapping_plan_is_read_only():
+    import contextlib
+    import io
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    backup_calls = []
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-map-cli",
+            "Codex Map CLI",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-map-cli"),
+        )
+        factory_home = tmp_dir / "factory"
+        factory_home.mkdir(parents=True, exist_ok=True)
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"codex_session_id": "codex-map-cli", "droid_session_id": "droid-map-cli-missing", "source_app": "codex", "bridge_id": "codex-codex-map-cli"}],
+        }), encoding="utf-8")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=False,
+            codex_to_droid=False,
+            chat_bridge_doctor=False,
+            chat_mapping_plan=True,
+            chat_mirror_plan=False,
+            chat_mirror_apply=False,
+            chat_mirror_confirm=False,
+            chat_mirror_direction="newer",
+            chat_mirror_session=None,
+            chat_mirror_status=None,
+            chat_mirror_limit=None,
+            chat_session=None,
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_backup=False,
+            chat_old_days=180,
+            chat_skip_system=False,
+            chat_compaction_mode="inline",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        text = out.getvalue()
+        assert handled is True, "chat mapping plan CLI should be handled"
+        assert backup_calls == [], f"mapping plan must not create backups: {backup_calls}"
+        assert "Chat Mapping Plan" in text, f"mapping plan output should be visible: {text}"
+        assert "stale_mapping" in text, f"mapping plan should classify stale pairs: {text}"
+    finally:
+        ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def _codex_mirror_apply_jsonl(session_id="codex-copy"):
+    return "\n".join([
+        json.dumps({
+            "timestamp": "2026-05-28T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "timestamp": "2026-05-28T10:00:00Z",
+                "cwd": r"C:\Research\nothing",
+                "model_provider": "openai",
+                "model": "gpt-5",
+            },
+        }),
+        json.dumps({
+            "timestamp": "2026-05-28T10:00:01Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "mirror me"}]},
+        }),
+        json.dumps({
+            "timestamp": "2026-05-28T10:00:02Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "mirrored"}]},
+        }),
+    ]) + "\n"
+
+
+def test_chat_bridge_cli_mirror_apply_preview_does_not_write_or_backup():
+    import contextlib
+    import io
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    backup_calls = []
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-preview",
+            "Codex Preview",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-preview"),
+            updated_at_ms=5000,
+        )
+        factory_home = tmp_dir / "factory"
+        factory_home.mkdir(parents=True, exist_ok=True)
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"codex_session_id": "codex-preview", "droid_session_id": "missing-droid"}],
+        }), encoding="utf-8")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=False,
+            codex_to_droid=False,
+            chat_mirror_plan=False,
+            chat_mirror_apply=True,
+            chat_mirror_confirm=False,
+            chat_mirror_direction="newer",
+            chat_session=None,
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_old_days=180,
+            chat_skip_system=False,
+            chat_compaction_mode="inline",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        text = out.getvalue()
+        assert handled is True, "mirror apply preview should be handled"
+        assert backup_calls == [], f"preview must not create Codex backups: {backup_calls}"
+        assert not list(factory_home.rglob("*.jsonl")), f"preview must not create Droid sessions: {list(factory_home.rglob('*.jsonl'))}"
+        assert "Preview only" in text, f"preview output should make write safety explicit: {text}"
+        assert "would_create_droid" in text, f"preview should list selected action: {text}"
+    finally:
+        ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_cli_mirror_apply_preview_honors_session_status_and_limit_filters():
+    import contextlib
+    import io
+
+    original, tmp_dir = setup_temp_codex_home()
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-keep",
+            "Codex Keep",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-keep"),
+            updated_at_ms=5000,
+        )
+        store_temp_session(
+            "codex-drop",
+            "Codex Drop",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-drop"),
+            updated_at_ms=6000,
+        )
+        factory_home = tmp_dir / "factory"
+        jsonl_path, _settings_path = write_temp_droid_session(factory_home, session_id="droid-newer", title="Droid Newer")
+        os.utime(jsonl_path, (7, 7))
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [
+                {"codex_session_id": "codex-keep", "droid_session_id": "missing-keep"},
+                {"codex_session_id": "codex-drop", "droid_session_id": "missing-drop"},
+                {"codex_session_id": "missing-codex", "droid_session_id": "droid-newer"},
+            ],
+        }), encoding="utf-8")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=False,
+            codex_to_droid=False,
+            chat_mirror_plan=False,
+            chat_mirror_apply=True,
+            chat_mirror_confirm=False,
+            chat_mirror_direction="newer",
+            chat_mirror_session="codex-keep,missing-codex",
+            chat_mirror_status="missing_droid,missing_codex",
+            chat_mirror_limit=1,
+            chat_session=None,
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_old_days=180,
+            chat_skip_system=False,
+            chat_compaction_mode="inline",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        text = out.getvalue()
+        assert handled is True, "filtered mirror preview should be handled"
+        assert "Selected: 1" in text, f"limit should reduce selected actions: {text}"
+        assert "codex=codex-keep" in text, f"session filter should include codex-keep: {text}"
+        assert "codex=codex-drop" in text and "session_filter" in text, f"session filter skip should be visible: {text}"
+        assert "limit" in text, f"limit skip should be visible: {text}"
+    finally:
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_cli_mirror_apply_confirm_exports_codex_copy_to_droid():
+    import contextlib
+    import io
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    backup_calls = []
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-export",
+            "Codex Export",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-export"),
+            updated_at_ms=5000,
+        )
+        factory_home = tmp_dir / "factory"
+        factory_home.mkdir(parents=True, exist_ok=True)
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"codex_session_id": "codex-export", "droid_session_id": "missing-droid"}],
+        }), encoding="utf-8")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=False,
+            codex_to_droid=False,
+            chat_mirror_plan=False,
+            chat_mirror_apply=True,
+            chat_mirror_confirm=True,
+            chat_mirror_direction="newer",
+            chat_session=None,
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_backup=False,
+            chat_old_days=180,
+            chat_skip_system=True,
+            chat_compaction_mode="inline",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        text = out.getvalue()
+        droid_rollouts = list((factory_home / "sessions").rglob("*.jsonl"))
+        assert handled is True, "confirmed mirror apply should be handled"
+        assert backup_calls == [], f"Codex-to-Droid mirror copy should not back up Codex DB: {backup_calls}"
+        assert len(droid_rollouts) == 1, f"confirmed export should create one Droid session copy: {droid_rollouts}"
+        assert "codex-export ->" in text, f"output should report exported session pair: {text}"
+        assert "mirror me" in droid_rollouts[0].read_text(encoding="utf-8"), "Droid copy should contain transferred messages"
+    finally:
+        ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_cli_mirror_apply_confirm_imports_droid_copy_to_codex_without_backup_by_default():
+    import contextlib
+    import io
+    import sqlite3
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    backup_calls = []
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-old",
+            "Codex Old",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-old"),
+            updated_at_ms=1000,
+        )
+        factory_home = tmp_dir / "factory"
+        jsonl_path, _settings_path = write_temp_droid_session(factory_home, session_id="droid-new", title="Droid New")
+        os.utime(jsonl_path, (5, 5))
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"codex_session_id": "codex-old", "droid_session_id": "droid-new"}],
+        }), encoding="utf-8")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=False,
+            codex_to_droid=False,
+            chat_mirror_plan=False,
+            chat_mirror_apply=True,
+            chat_mirror_confirm=True,
+            chat_mirror_direction="newer",
+            chat_session=None,
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_backup=False,
+            chat_old_days=180,
+            chat_skip_system=False,
+            chat_compaction_mode="inline",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        conn = sqlite3.connect(str(ct.STATE_DB))
+        count = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+        conn.close()
+        text = out.getvalue()
+        assert handled is True, "confirmed Droid-to-Codex mirror apply should be handled"
+        assert backup_calls == [], f"default Droid-to-Codex mirror apply must not create full .codex backup: {backup_calls}"
+        assert count == 2, f"confirmed import should create one additional Codex session copy, got {count}"
+        assert "droid-new ->" in text, f"output should report imported Droid session: {text}"
+    finally:
+        ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_cli_mirror_apply_confirm_imports_droid_copy_to_codex_with_backup_when_requested():
+    import contextlib
+    import io
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    backup_calls = []
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-old-backup",
+            "Codex Old Backup",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-old-backup"),
+            updated_at_ms=1000,
+        )
+        factory_home = tmp_dir / "factory"
+        jsonl_path, _settings_path = write_temp_droid_session(factory_home, session_id="droid-new-backup", title="Droid New Backup")
+        os.utime(jsonl_path, (5, 5))
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"codex_session_id": "codex-old-backup", "droid_session_id": "droid-new-backup"}],
+        }), encoding="utf-8")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=False,
+            codex_to_droid=False,
+            chat_mirror_plan=False,
+            chat_mirror_apply=True,
+            chat_mirror_confirm=True,
+            chat_mirror_direction="newer",
+            chat_session=None,
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_backup=True,
+            chat_old_days=180,
+            chat_skip_system=False,
+            chat_compaction_mode="inline",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        assert handled is True, "confirmed Droid-to-Codex mirror apply should be handled"
+        assert backup_calls == ["called"], f"--chat-backup should create one full .codex backup for mirror import: {backup_calls}"
+    finally:
+        ct.full_backup = original_full_backup
+        restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_cli_mirror_apply_stale_droid_source_does_not_backup_and_records_error():
+    import contextlib
+    import io
+    import sqlite3
+    import chat_bridge
+
+    original, tmp_dir = setup_temp_codex_home()
+    original_full_backup = ct.full_backup
+    original_record_history = ct.record_history
+    original_find_droid_session_paths = chat_bridge.find_droid_session_paths
+    backup_calls = []
+    history_calls = []
+    try:
+        create_temp_threads_db()
+        store_temp_session(
+            "codex-stale",
+            "Codex Stale",
+            r"C:\Research\nothing",
+            jsonl_text=_codex_mirror_apply_jsonl("codex-stale"),
+            updated_at_ms=1000,
+        )
+        factory_home = tmp_dir / "factory"
+        jsonl_path, _settings_path = write_temp_droid_session(factory_home, session_id="droid-stale", title="Droid Stale")
+        os.utime(jsonl_path, (5, 5))
+        (ct.CODEX_DIR / "chat_bridge_mappings.json").write_text(json.dumps({
+            "version": 1,
+            "pairs": [{"codex_session_id": "codex-stale", "droid_session_id": "droid-stale"}],
+        }), encoding="utf-8")
+        args = argparse.Namespace(
+            droid_sessions=False,
+            codex_sessions=False,
+            droid_to_codex=False,
+            codex_to_droid=False,
+            chat_mirror_plan=False,
+            chat_mirror_apply=True,
+            chat_mirror_confirm=True,
+            chat_mirror_direction="newer",
+            chat_session=None,
+            chat_fresh_timestamps=False,
+            chat_pin_old=False,
+            chat_backup=False,
+            chat_old_days=180,
+            chat_skip_system=False,
+            chat_compaction_mode="inline",
+            droid_settings=str(factory_home / "settings.json"),
+            project=None,
+        )
+        ct.full_backup = lambda: backup_calls.append("called") or (tmp_dir / "backup.zip")
+        ct.record_history = lambda action, **fields: history_calls.append({"action": action, **fields})
+        chat_bridge.find_droid_session_paths = lambda *args, **kwargs: (None, None)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            handled = ct.handle_chat_bridge_command(args)
+
+        conn = sqlite3.connect(str(ct.STATE_DB))
+        count = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+        conn.close()
+        text = out.getvalue()
+        assert handled is True, "stale confirmed apply should still be handled"
+        assert backup_calls == [], f"stale source should not create a backup before any Codex write: {backup_calls}"
+        assert count == 1, f"stale source should not create a Codex copy, got {count}"
+        assert "ERROR" in text and "Droid session JSONL not found" in text, f"stale source error should be visible: {text}"
+        assert history_calls and history_calls[-1].get("status") == "error", f"all-error apply should be recorded as error: {history_calls}"
+    finally:
+        ct.full_backup = original_full_backup
+        ct.record_history = original_record_history
+        chat_bridge.find_droid_session_paths = original_find_droid_session_paths
         restore_temp_codex_home(original, tmp_dir)
 
 
@@ -3211,24 +5577,74 @@ if __name__ == "__main__":
     test("session search JSONL fallback hit", test_search_sessions_jsonl_fallback_hit)
     test("session search project filter", test_search_sessions_project_filter)
     test("chat bridge Droid session normalizes messages and tools", test_chat_bridge_droid_session_to_bridge_preserves_messages_and_tools)
+    test("chat bridge Droid to bridge preserves compaction state and parent", test_chat_bridge_droid_to_bridge_preserves_compaction_state_and_parent)
     test("chat bridge Droid session lookup finds project nested files", test_chat_bridge_droid_session_lookup_finds_project_nested_files)
     test("chat bridge Droid to bridge preserves project cwd and session title", test_chat_bridge_droid_to_bridge_preserves_project_cwd_and_session_title)
     test("chat bridge Droid to Codex import creates consistent rollout and pins old", test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_old)
     test("chat bridge Droid to Codex import can use fresh timestamps", test_chat_bridge_droid_to_codex_import_can_use_fresh_timestamps)
     test("chat bridge Droid to Codex mapping failure reports warning after commit", test_chat_bridge_droid_to_codex_mapping_failure_reports_warning_after_commit)
     test("chat bridge mapping keeps duplicate import pairs", test_chat_bridge_mapping_keeps_duplicate_import_pairs)
+    test("chat bridge mirror plan merges roots and classifies states", test_chat_bridge_mirror_plan_merges_roots_and_classifies_states)
+    test("chat bridge mirror plan surfaces import_id conflicts", test_chat_bridge_mirror_plan_surfaces_import_id_conflicts)
+    test("chat bridge mirror plan project filter avoids false missing_codex", test_chat_bridge_mirror_plan_project_filter_does_not_create_false_missing_codex)
+    test("chat bridge mirror actions select newer and skip unsafe states", test_chat_bridge_mirror_actions_select_newer_and_skip_unsafe_states)
+    test("chat bridge mirror actions can force one direction", test_chat_bridge_mirror_actions_can_force_one_direction)
+    test("chat bridge mirror actions skip ambiguous one-to-many pairs", test_chat_bridge_mirror_actions_skip_ambiguous_one_to_many_pairs)
+    test("chat bridge mirror actions support session status and limit filters", test_chat_bridge_mirror_actions_support_session_status_and_limit_filters)
+    test("chat bridge mirror actions mark previous copy as already applied", test_chat_bridge_mirror_actions_mark_previous_copy_as_already_applied)
+    test("chat bridge doctor detects structural differences", test_chat_bridge_doctor_detects_structural_differences)
+    test("chat bridge doctor detects one-sided metadata loss", test_chat_bridge_doctor_detects_one_sided_metadata_loss)
+    test("chat bridge doctor normalizes extended Windows cwd", test_chat_bridge_doctor_normalizes_extended_windows_cwd)
+    test("chat bridge doctor reports malformed mapped Droid JSONL", test_chat_bridge_doctor_reports_malformed_mapped_droid_jsonl)
+    test("chat bridge doctor reports malformed Droid settings", test_chat_bridge_doctor_reports_malformed_droid_settings)
     test("chat bridge Droid to Codex import rolls back invalid rollout", test_chat_bridge_droid_to_codex_import_rolls_back_invalid_rollout)
     test("chat bridge Codex to Droid import writes session and mapping", test_chat_bridge_codex_to_droid_import_writes_session_and_mapping)
     test("chat bridge Codex to Droid preserves project context", test_chat_bridge_codex_to_droid_preserves_project_context)
     test("chat bridge Codex to Droid normalizes extended Windows cwd", test_chat_bridge_codex_to_droid_normalizes_extended_windows_cwd)
     test("chat bridge Codex to Droid preserves Droid index timestamps", test_chat_bridge_codex_to_droid_preserves_droid_index_timestamps)
     test("chat bridge Codex to Droid writes valid tool inputs and parent chain", test_chat_bridge_codex_to_droid_writes_droid_valid_tool_inputs_and_parent_chain)
+    test("chat bridge Codex to Droid uses unique event ids for tool pairs", test_chat_bridge_codex_to_droid_uses_unique_event_ids_for_tool_pairs)
+    test("chat bridge Codex to Droid groups parallel tools like Droid", test_chat_bridge_codex_to_droid_groups_parallel_tool_calls_like_droid)
+    test("chat bridge renders grouped tools to Codex in part order", test_chat_bridge_renders_grouped_tool_message_to_codex_in_part_order)
+    test("chat bridge Codex to Droid preserves lossless source events", test_chat_bridge_codex_to_droid_preserves_lossless_source_events)
+    test("chat bridge Codex reasoning preserves encrypted content for Droid", test_chat_bridge_codex_reasoning_preserves_encrypted_content_for_droid)
+    test("chat bridge Droid thinking preserves encrypted reasoning for Codex", test_chat_bridge_droid_thinking_preserves_encrypted_reasoning_for_codex)
+    test("chat bridge Codex to Droid round-trip preserves unknown role and source events", test_chat_bridge_codex_to_droid_round_trip_preserves_unknown_role_and_source_events)
+    test("chat bridge doctor treats canonical Droid provider as equivalent", test_chat_bridge_doctor_treats_canonical_droid_provider_as_equivalent)
+    test("chat bridge Codex to bridge extracts compaction metadata", test_chat_bridge_codex_to_bridge_extracts_compaction_metadata)
+    test("chat bridge Codex to Droid writes compaction state event", test_chat_bridge_codex_to_droid_writes_compaction_state_event)
+    test("chat bridge Droid compaction import to Codex writes compacted events", test_chat_bridge_droid_compaction_import_to_codex_writes_compacted_events)
+    test("chat bridge Droid compaction survives Codex round-trip", test_chat_bridge_droid_compaction_survives_codex_round_trip)
+    test("chat bridge Codex to Droid raw compaction mode skips native state", test_chat_bridge_codex_to_droid_raw_compaction_mode_skips_native_state)
+    test("chat bridge Codex to Droid default archived compaction mode skips native state", test_chat_bridge_codex_to_droid_default_archived_compaction_mode_skips_native_state)
+    test("chat bridge Codex to Droid native compaction mode writes continuation suffix", test_chat_bridge_codex_to_droid_native_compaction_mode_writes_continuation_suffix)
+    test("chat bridge Codex to Droid native compaction mode skips tool result suffix start", test_chat_bridge_codex_to_droid_native_compaction_mode_skips_tool_result_suffix_start)
+    test("chat bridge Droid to Codex raw compaction mode skips compacted events", test_chat_bridge_droid_to_codex_raw_compaction_mode_skips_compacted_events)
+    test("chat bridge Droid to Codex default archived compaction mode skips compacted events", test_chat_bridge_droid_to_codex_default_archived_compaction_mode_skips_compacted_events)
+    test("chat bridge Droid archived source events preserve encrypted content", test_chat_bridge_droid_archived_source_events_preserve_encrypted_content)
     test("chat bridge Codex to Droid can skip system messages", test_chat_bridge_codex_to_droid_can_skip_system_messages)
+    test("chat bridge Codex to Droid skip-system filters internal envelopes", test_chat_bridge_codex_to_droid_skip_system_filters_internal_envelopes)
+    test("chat bridge Codex to Droid default filters internal envelopes from messages", test_chat_bridge_codex_to_droid_default_filters_internal_envelopes_from_messages)
+    test("chat bridge Codex to Droid preserves tool result errors", test_chat_bridge_codex_to_droid_preserves_tool_result_errors)
+    test("chat bridge Codex to Droid maps custom model settings", test_chat_bridge_codex_to_droid_maps_custom_model_settings)
+    test("chat bridge Codex to Droid maps profile provider to Droid backend", test_chat_bridge_codex_to_droid_maps_profile_provider_to_droid_backend)
     test("operation history redacts and loads newest first", test_operation_history_redacts_and_loads_newest)
     test("provider action emits history without secret", test_provider_action_emits_history_without_secret)
     test("droid CLI flags are registered", test_droid_cli_flags_registered)
     test("chat bridge CLI flags are registered", test_chat_bridge_cli_flags_registered)
     test("chat bridge CLI missing Droid session does not backup", test_chat_bridge_cli_missing_droid_session_does_not_backup)
+    test("chat bridge CLI Droid to Codex import does not backup by default", test_chat_bridge_cli_droid_to_codex_import_does_not_backup_by_default)
+    test("chat bridge CLI Droid to Codex import backs up when requested", test_chat_bridge_cli_droid_to_codex_import_backs_up_when_requested)
+    test("chat bridge CLI mirror plan is read-only and does not require session", test_chat_bridge_cli_mirror_plan_is_read_only_and_does_not_require_session)
+    test("chat bridge CLI doctor is read-only and reports pair differences", test_chat_bridge_cli_doctor_is_read_only_and_reports_pair_differences)
+    test("chat bridge mapping plan classifies stale and reexport read-only", test_chat_bridge_mapping_plan_classifies_stale_and_reexport_read_only)
+    test("chat bridge CLI mapping plan is read-only", test_chat_bridge_cli_mapping_plan_is_read_only)
+    test("chat bridge CLI mirror apply preview does not write or backup", test_chat_bridge_cli_mirror_apply_preview_does_not_write_or_backup)
+    test("chat bridge CLI mirror apply preview honors session status and limit filters", test_chat_bridge_cli_mirror_apply_preview_honors_session_status_and_limit_filters)
+    test("chat bridge CLI mirror apply confirm exports Codex copy to Droid", test_chat_bridge_cli_mirror_apply_confirm_exports_codex_copy_to_droid)
+    test("chat bridge CLI mirror apply confirm imports Droid copy to Codex without backup by default", test_chat_bridge_cli_mirror_apply_confirm_imports_droid_copy_to_codex_without_backup_by_default)
+    test("chat bridge CLI mirror apply confirm imports Droid copy to Codex with backup when requested", test_chat_bridge_cli_mirror_apply_confirm_imports_droid_copy_to_codex_with_backup_when_requested)
+    test("chat bridge CLI mirror apply stale Droid source does not backup and records error", test_chat_bridge_cli_mirror_apply_stale_droid_source_does_not_backup_and_records_error)
     test("droid history redacts keys", test_droid_history_redacts_key)
     test("droid doctor ignores legacy model issues", test_droid_doctor_ignores_legacy_model_issues)
     test("droid JSONC parser respects strings", test_droid_jsonc_parser_respects_strings)

@@ -13,6 +13,7 @@ from pathlib import Path
 BRIDGE_FORMAT = "codex-droid-chat-bridge"
 BRIDGE_VERSION = 1
 MAPPING_FILE = "chat_bridge_mappings.json"
+CHAT_COMPACTION_MODES = ("inline", "native", "archived", "raw")
 
 
 def _utc_now():
@@ -68,6 +69,21 @@ def _safe_id_piece(value):
 
 def _new_id(prefix):
     return f"{prefix}-{uuid.uuid4()}"
+
+
+def _new_codex_thread_id():
+    value = uuid.uuid4().int
+    timestamp_ms = int(_utc_now().timestamp() * 1000) & ((1 << 48) - 1)
+    rand_a = (value >> 64) & 0x0FFF
+    rand_b = value & ((1 << 62) - 1)
+    generated = (
+        (timestamp_ms << 80)
+        | (0x7 << 76)
+        | (rand_a << 64)
+        | (0x2 << 62)
+        | rand_b
+    )
+    return str(uuid.UUID(int=generated))
 
 
 def _read_jsonl(path):
@@ -128,6 +144,262 @@ def _first_text(parts):
     return ""
 
 
+_CODEX_INTERNAL_TEXT_PREFIXES = (
+    "<permissions instructions>",
+    "<app-context>",
+    "<skills_instructions>",
+    "<plugins_instructions>",
+    "<collaboration_mode>",
+    "<environment_context>",
+    "<system-reminder>",
+)
+
+
+def _is_codex_internal_text(text):
+    stripped = str(text or "").lstrip().lower()
+    return any(stripped.startswith(prefix) for prefix in _CODEX_INTERNAL_TEXT_PREFIXES)
+
+
+def _is_codex_internal_part(part):
+    return isinstance(part, dict) and part.get("type") == "text" and _is_codex_internal_text(part.get("text"))
+
+
+def _filter_codex_message_parts(role, parts, include_system):
+    visible_parts = [part for part in parts or [] if not _is_codex_internal_part(part)]
+    if include_system:
+        return visible_parts
+    if role in ("system", "developer"):
+        return []
+    if role not in ("user", "assistant", "tool"):
+        return []
+    return visible_parts
+
+
+def _strip_encrypted_content(value):
+    if isinstance(value, dict):
+        return {
+            key: _strip_encrypted_content(item)
+            for key, item in value.items()
+            if key != "encrypted_content"
+        }
+    if isinstance(value, list):
+        return [_strip_encrypted_content(item) for item in value]
+    return value
+
+
+def _json_object_from_string(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _reasoning_summary_text(summary):
+    if isinstance(summary, str):
+        return summary
+    if not isinstance(summary, list):
+        return ""
+    texts = []
+    for item in summary:
+        if isinstance(item, dict) and item.get("text"):
+            texts.append(str(item.get("text") or ""))
+        elif isinstance(item, str):
+            texts.append(item)
+    return "\n".join(text for text in texts if text)
+
+
+def _reasoning_summary_list(part):
+    summary = part.get("summary") if isinstance(part, dict) else None
+    if isinstance(summary, list):
+        return summary
+    summary_text = str((part or {}).get("summary_text") or "")
+    return [{"type": "summary_text", "text": summary_text}] if summary_text else []
+
+
+def _droid_thinking_to_bridge(part):
+    part = part if isinstance(part, dict) else {}
+    signature = part.get("signature") if isinstance(part.get("signature"), str) else ""
+    signature_payload = _json_object_from_string(signature)
+    summary = signature_payload.get("summary") if isinstance(signature_payload.get("summary"), list) else []
+    summary_text = str(part.get("openaiReasoningSummary") or _reasoning_summary_text(summary) or "")
+    result = {
+        "type": "reasoning",
+        "text": str(part.get("thinking") or ""),
+    }
+    encrypted_content = part.get("openaiEncryptedContent") or signature_payload.get("encrypted_content") or part.get("encrypted_content")
+    reasoning_id = part.get("openaiReasoningId") or signature_payload.get("id") or part.get("id")
+    if encrypted_content:
+        result["encrypted_content"] = str(encrypted_content)
+    if reasoning_id:
+        result["reasoning_id"] = str(reasoning_id)
+    if summary:
+        result["summary"] = summary
+    if summary_text:
+        result["summary_text"] = summary_text
+    if signature:
+        result["signature"] = signature
+    if part.get("signatureProvider"):
+        result["signature_provider"] = str(part.get("signatureProvider"))
+    if part.get("durationMs") is not None:
+        result["duration_ms"] = _int_or_default(part.get("durationMs"), 0)
+    return result
+
+
+def _codex_reasoning_to_bridge(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), list) else []
+    summary_text = _reasoning_summary_text(summary)
+    result = {
+        "type": "reasoning",
+        "text": str(payload.get("content") or payload.get("text") or ""),
+    }
+    encrypted_content = payload.get("encrypted_content") or payload.get("openaiEncryptedContent")
+    reasoning_id = payload.get("id") or payload.get("reasoning_id") or payload.get("openaiReasoningId")
+    if encrypted_content:
+        result["encrypted_content"] = str(encrypted_content)
+    if reasoning_id:
+        result["reasoning_id"] = str(reasoning_id)
+    if summary:
+        result["summary"] = summary
+    if summary_text:
+        result["summary_text"] = summary_text
+    return result
+
+
+def _bridge_source_event(event, event_index, timestamp_default, represented_by=""):
+    event = event if isinstance(event, dict) else {}
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    timestamp = event.get("timestamp") or payload.get("timestamp") or timestamp_default
+    return {
+        "index": int(event_index),
+        "timestamp": _iso(_parse_datetime(timestamp) or _parse_datetime(timestamp_default) or _utc_now()),
+        "outer_type": str(event.get("type") or ""),
+        "payload_type": str(payload.get("type") or event.get("type") or ""),
+        "represented_by": str(represented_by or ""),
+        "raw": event,
+    }
+
+
+def _int_or_default(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _normalize_compaction_mode(mode):
+    text = str(mode or "archived").strip().lower()
+    if text not in CHAT_COMPACTION_MODES:
+        raise ValueError(f"unsupported chat compaction mode: {mode}")
+    return text
+
+
+def _is_archived_compaction_mode(mode):
+    return str(mode or "").strip().lower() in ("archived", "raw")
+
+
+def _codex_token_count_payload(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    result = {}
+    info = payload.get("info")
+    if isinstance(info, dict):
+        result["info"] = info
+    if "rate_limits" in payload:
+        result["rate_limits"] = payload.get("rate_limits")
+    for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens", "model_context_window"):
+        if key in payload:
+            result[key] = payload.get(key)
+    return result
+
+
+def _filter_replacement_history(history, include_system=True):
+    if not isinstance(history, list):
+        return []
+    if include_system:
+        return list(history)
+    filtered = []
+    for item in history:
+        if not isinstance(item, dict):
+            filtered.append(item)
+            continue
+        role = str(item.get("role") or "").lower()
+        if role in ("system", "developer"):
+            continue
+        content = item.get("content")
+        if isinstance(content, list) and any(_is_codex_internal_part(part) for part in content):
+            continue
+        if isinstance(content, str) and _is_codex_internal_text(content):
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def _codex_compaction_from_event(event, event_index, timestamp, messages, include_system, last_token_count):
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    payload_anchor = payload.get("anchor_message") if isinstance(payload.get("anchor_message"), dict) else {}
+    payload_anchor_index = _int_or_default(payload_anchor.get("index"), -1)
+    fallback_anchor_index = len(messages) - 1
+    anchor_index = payload_anchor_index if payload_anchor_index >= 0 else fallback_anchor_index
+    fallback_anchor = messages[fallback_anchor_index] if fallback_anchor_index >= 0 else {}
+    replacement_history = _filter_replacement_history(payload.get("replacement_history"), include_system=include_system)
+    compaction = {
+        "source": "codex",
+        "id": str(payload.get("id") or event.get("id") or f"codex-compaction-{event_index}"),
+        "timestamp": _iso(_parse_datetime(timestamp) or _utc_now()),
+        "summary_text": str(payload.get("message") or payload.get("summary") or ""),
+        "summary_tokens": _int_or_default(payload.get("summary_tokens"), 0),
+        "summary_kind": str(payload.get("summary_kind") or "llm_summary"),
+        "removed_count": _int_or_default(payload.get("removed_count"), len(replacement_history)),
+        "source_event_index": int(event_index),
+        "context_compacted_event_index": -1,
+        "anchor_message_id": str(payload_anchor.get("id") or fallback_anchor.get("id") or ""),
+        "anchor_message_index": int(anchor_index),
+        "parent_session_id": str(payload.get("parent_session_id") or ""),
+        "replacement_history": replacement_history,
+    }
+    if last_token_count:
+        compaction["token_count_before"] = last_token_count
+    if isinstance(payload.get("token_count_before"), dict):
+        compaction["token_count_before"] = payload.get("token_count_before")
+    if isinstance(payload.get("token_count_after"), dict):
+        compaction["token_count_after"] = payload.get("token_count_after")
+    if isinstance(payload.get("system_info"), dict):
+        compaction["system_info"] = payload.get("system_info")
+    if payload.get("ui_render_cutoff_message_id"):
+        compaction["ui_render_cutoff_message_id"] = str(payload.get("ui_render_cutoff_message_id"))
+    return compaction
+
+
+def _droid_compaction_from_event(event, event_index, session_start):
+    event = event if isinstance(event, dict) else {}
+    anchor = event.get("anchorMessage") if isinstance(event.get("anchorMessage"), dict) else {}
+    compaction = {
+        "source": "droid",
+        "id": str(event.get("id") or f"droid-compaction-{event_index}"),
+        "timestamp": _iso(_parse_datetime(event.get("timestamp")) or _utc_now()),
+        "summary_text": str(event.get("summaryText") or ""),
+        "summary_tokens": _int_or_default(event.get("summaryTokens"), 0),
+        "summary_kind": str(event.get("summaryKind") or "llm_summary"),
+        "removed_count": _int_or_default(event.get("removedCount"), 0),
+        "source_event_index": int(event_index),
+        "context_compacted_event_index": -1,
+        "anchor_message_id": str(anchor.get("id") or ""),
+        "anchor_message_index": _int_or_default(anchor.get("index"), -1),
+        "parent_session_id": str(session_start.get("parent") or ""),
+        "replacement_history": [],
+    }
+    if isinstance(event.get("systemInfo"), dict):
+        compaction["system_info"] = event.get("systemInfo")
+    if event.get("uiRenderCutoffMessageId"):
+        compaction["ui_render_cutoff_message_id"] = str(event.get("uiRenderCutoffMessageId"))
+    return compaction
+
+
 def _message_has_tool_result(parts):
     return parts and all(part.get("type") == "tool_result" for part in parts)
 
@@ -138,6 +410,8 @@ def _droid_part_to_bridge(part):
     part_type = part.get("type")
     if part_type == "text":
         return {"type": "text", "text": str(part.get("text") or "")}
+    if part_type == "thinking":
+        return _droid_thinking_to_bridge(part)
     if part_type == "tool_use":
         return {
             "type": "tool_call",
@@ -146,11 +420,14 @@ def _droid_part_to_bridge(part):
             "input": part.get("input"),
         }
     if part_type == "tool_result":
-        return {
+        result = {
             "type": "tool_result",
             "tool_call_id": str(part.get("tool_use_id") or part.get("id") or ""),
             "content": part.get("content"),
         }
+        if "is_error" in part:
+            result["is_error"] = bool(part.get("is_error"))
+        return result
     return {"type": "unknown", "source_type": str(part_type or ""), "keys": sorted(part.keys())}
 
 
@@ -162,9 +439,15 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
     session_id = str(session_start.get("id") or jsonl_path.stem)
     title = str(session_start.get("sessionTitle") or session_start.get("title") or session_id)
     cwd = _normalize_droid_cwd(session_start.get("cwd") or "")
+    settings_model = str(settings.get("model") or settings.get("providerLock") or "")
+    settings_provider = str(settings.get("providerLock") or "")
+    bridge_provider = settings_provider if settings.get("model") and settings_provider else "droid"
     messages = []
     timestamps = []
     raw_event_refs = []
+    native_source_events = []
+    archived_source_events = []
+    compactions = []
 
     for event_index, event in enumerate(events):
         event_type = event.get("type")
@@ -172,6 +455,19 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
         event_ts = event.get("timestamp")
         if event_ts:
             timestamps.append(_ms(event_ts))
+        if event_type == "bridge_source_event":
+            raw = event.get("raw") if isinstance(event.get("raw"), dict) else event
+            archived_source_events.append({
+                "index": _int_or_default(event.get("sourceIndex"), event_index),
+                "timestamp": _iso(_parse_datetime(event_ts) or _utc_now()),
+                "outer_type": str(event.get("outerType") or ""),
+                "payload_type": str(event.get("payloadType") or ""),
+                "represented_by": str(event.get("representedBy") or ""),
+                "raw": raw,
+            })
+            continue
+        source_event = _bridge_source_event(event, event_index, event_ts or _iso(_utc_now()))
+        native_source_events.append(source_event)
 
         if event_type == "message":
             msg = event.get("message") if isinstance(event.get("message"), dict) else {}
@@ -179,17 +475,18 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
             parts = [_droid_part_to_bridge(part) for part in content]
             if not parts:
                 parts = [{"type": "unknown", "summary": "empty Droid message content"}]
-            role = str(msg.get("role") or "unknown")
+            role = str(event.get("bridgeRole") or msg.get("role") or "unknown")
             if _message_has_tool_result(parts):
                 role = "tool"
             messages.append({
                 "id": str(event.get("id") or msg.get("id") or f"droid-message-{event_index}"),
                 "parent_id": str(event.get("parentId") or ""),
-                "role": role if role in ("user", "assistant", "system", "tool") else "unknown",
+                "role": role if role in ("user", "assistant", "system", "tool", "unknown") else "unknown",
                 "created_at": _iso(_parse_datetime(event_ts) or _utc_now()),
                 "parts": parts,
                 "raw_source_ref": f"{jsonl_path}:{event_index + 1}",
             })
+            source_event["represented_by"] = messages[-1]["id"]
         elif event_type == "todo_state":
             messages.append({
                 "id": str(event.get("id") or f"droid-todo-{event_index}"),
@@ -199,10 +496,12 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
                 "parts": [{"type": "todo_state", "summary": {"count": len(event.get("todos") or [])}}],
                 "raw_source_ref": f"{jsonl_path}:{event_index + 1}",
             })
+            source_event["represented_by"] = messages[-1]["id"]
+        elif event_type == "compaction_state":
+            compactions.append(_droid_compaction_from_event(event, event_index, session_start))
 
     created_ms = min(timestamps) if timestamps else int(_utc_now().timestamp() * 1000)
     updated_ms = max(timestamps) if timestamps else created_ms
-    model = str(settings.get("providerLock") or "")
     work_context = _unknown_work_context()
     if cwd:
         work_context["primary_cwd"] = cwd
@@ -223,8 +522,9 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
             "title": title,
             "created_at": _iso(_dt_from_ms(created_ms)),
             "updated_at": _iso(_dt_from_ms(updated_ms)),
-            "provider": "droid",
-            "model": model,
+            "provider": bridge_provider,
+            "model": settings_model,
+            "reasoning_effort": settings.get("reasoningEffort") or "",
         },
         "work_context": work_context,
         "messages": messages,
@@ -236,12 +536,16 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
                 "hostId": session_start.get("hostId") or "",
             },
             "droid_settings": {
-                "providerLock": model,
+                "model": settings_model,
+                "reasoningEffort": settings.get("reasoningEffort") or "",
+                "providerLock": settings_provider,
                 "providerLockTimestamp": settings.get("providerLockTimestamp") or "",
                 "tokenUsage": settings.get("tokenUsage") if isinstance(settings.get("tokenUsage"), dict) else {},
             }
         },
         "raw_event_refs": raw_event_refs,
+        "source_events": archived_source_events if archived_source_events else native_source_events,
+        "compactions": compactions,
     }
     validate_bridge(bridge)
     return bridge
@@ -253,6 +557,8 @@ def _codex_content_part_to_bridge(part):
     part_type = part.get("type")
     if part_type in ("input_text", "output_text", "text"):
         return {"type": "text", "text": str(part.get("text") or "")}
+    if part_type == "reasoning":
+        return _codex_reasoning_to_bridge(part)
     if part_type == "tool_call":
         return {
             "type": "tool_call",
@@ -261,14 +567,74 @@ def _codex_content_part_to_bridge(part):
             "input": part.get("input"),
         }
     if part_type == "tool_result":
-        return {
+        result = {
             "type": "tool_result",
             "tool_call_id": str(part.get("tool_call_id") or part.get("tool_use_id") or ""),
             "content": part.get("content"),
         }
+        if "is_error" in part:
+            result["is_error"] = bool(part.get("is_error"))
+        return result
     if part_type in ("input_image", "image"):
         return {"type": "image", "summary": "image content"}
     return {"type": "unknown", "source_type": str(part_type or ""), "keys": sorted(part.keys())}
+
+
+def _bridge_message_part_types(message):
+    return [part.get("type") for part in (message.get("parts") or []) if isinstance(part, dict)]
+
+
+def _append_codex_reasoning(messages, part, message_id, timestamp, event_index, rollout_path, snapshots):
+    if messages and messages[-1].get("role") == "assistant":
+        part_types = _bridge_message_part_types(messages[-1])
+        if part_types and all(part_type in ("text", "tool_call", "reasoning") for part_type in part_types):
+            messages[-1]["parts"].append(part)
+            return messages[-1]
+    messages.append({
+        "id": str(message_id or f"codex-reasoning-{event_index}"),
+        "parent_id": "",
+        "role": "assistant",
+        "created_at": timestamp,
+        "work_snapshot_id": snapshots[-1]["id"] if snapshots else "",
+        "parts": [part],
+        "raw_source_ref": f"{rollout_path}:{event_index + 1}",
+    })
+    return messages[-1]
+
+
+def _append_codex_tool_call(messages, part, message_id, timestamp, event_index, rollout_path, snapshots):
+    if messages and messages[-1].get("role") == "assistant":
+        part_types = _bridge_message_part_types(messages[-1])
+        if part_types and all(part_type in ("text", "tool_call", "reasoning") for part_type in part_types):
+            messages[-1]["parts"].append(part)
+            return messages[-1]
+    messages.append({
+        "id": str(message_id or f"codex-tool-{event_index}"),
+        "parent_id": "",
+        "role": "assistant",
+        "created_at": timestamp,
+        "work_snapshot_id": snapshots[-1]["id"] if snapshots else "",
+        "parts": [part],
+        "raw_source_ref": f"{rollout_path}:{event_index + 1}",
+    })
+    return messages[-1]
+
+
+def _append_codex_tool_result(messages, part, message_id, timestamp, event_index, rollout_path):
+    if messages and messages[-1].get("role") == "tool":
+        part_types = _bridge_message_part_types(messages[-1])
+        if part_types and all(part_type == "tool_result" for part_type in part_types):
+            messages[-1]["parts"].append(part)
+            return messages[-1]
+    messages.append({
+        "id": str(message_id or f"codex-tool-result-{event_index}"),
+        "parent_id": "",
+        "role": "tool",
+        "created_at": timestamp,
+        "parts": [part],
+        "raw_source_ref": f"{rollout_path}:{event_index + 1}",
+    })
+    return messages[-1]
 
 
 def _git_from_payload(payload):
@@ -292,12 +658,38 @@ def codex_session_to_bridge(row, rollout_path, include_system=True):
     messages = []
     snapshots = []
     raw_event_refs = []
+    source_events = []
+    compactions = []
+    last_token_count = None
+    pending_compaction_index = None
 
     for event_index, event in enumerate(events):
         raw_event_refs.append(f"{rollout_path}:{event_index + 1}")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         payload_type = payload.get("type") or event.get("type")
         timestamp = event.get("timestamp") or payload.get("timestamp") or _iso(_dt_from_ms(created_ms))
+        source_event = _bridge_source_event(event, event_index, timestamp)
+
+        if payload_type == "token_count":
+            token_count = _codex_token_count_payload(payload)
+            if pending_compaction_index is not None and "token_count_after" not in compactions[pending_compaction_index]:
+                compactions[pending_compaction_index]["token_count_after"] = token_count
+            last_token_count = token_count
+            source_events.append(source_event)
+            continue
+
+        if event.get("type") == "compacted":
+            compactions.append(_codex_compaction_from_event(event, event_index, timestamp, messages, include_system, last_token_count))
+            pending_compaction_index = len(compactions) - 1
+            source_events.append(source_event)
+            continue
+
+        if payload_type == "context_compacted":
+            if pending_compaction_index is not None:
+                compactions[pending_compaction_index]["context_compacted_event_index"] = int(event_index)
+                compactions[pending_compaction_index]["context_compacted_at"] = _iso(_parse_datetime(timestamp) or _utc_now())
+            source_events.append(source_event)
+            continue
 
         if event.get("type") == "session_meta":
             git_data = _git_from_payload(payload)
@@ -315,20 +707,35 @@ def codex_session_to_bridge(row, rollout_path, include_system=True):
                     "source": "codex_session_meta",
                     "confidence": "observed",
                 })
+            source_events.append(source_event)
+            continue
+
+        if payload_type == "reasoning":
+            part = _codex_reasoning_to_bridge(payload)
+            message = _append_codex_reasoning(
+                messages,
+                part,
+                payload.get("id") or event.get("id") or f"codex-reasoning-{event_index}",
+                _iso(_parse_datetime(timestamp) or _dt_from_ms(created_ms)),
+                event_index,
+                rollout_path,
+                snapshots,
+            )
+            source_event["represented_by"] = message["id"]
+            source_events.append(source_event)
             continue
 
         if payload_type in ("message", "user_message", "agent_message"):
             role = payload.get("role")
             if not role:
                 role = "user" if payload_type == "user_message" else "assistant" if payload_type == "agent_message" else "unknown"
-            if role == "system" and not include_system:
-                continue
             content = payload.get("content")
             parts = []
             if isinstance(content, list):
                 parts = [_codex_content_part_to_bridge(part) for part in content]
             elif payload.get("text"):
                 parts = [{"type": "text", "text": str(payload.get("text") or "")}]
+            parts = _filter_codex_message_parts(role, parts, include_system)
             if parts:
                 messages.append({
                     "id": str(payload.get("id") or event.get("id") or f"codex-message-{event_index}"),
@@ -339,24 +746,44 @@ def codex_session_to_bridge(row, rollout_path, include_system=True):
                     "parts": parts,
                     "raw_source_ref": f"{rollout_path}:{event_index + 1}",
                 })
+                source_event["represented_by"] = messages[-1]["id"]
+                source_events.append(source_event)
+            elif include_system:
+                source_events.append(source_event)
         elif payload_type in ("function_call", "custom_tool_call"):
-            messages.append({
-                "id": str(payload.get("call_id") or payload.get("id") or f"codex-tool-{event_index}"),
-                "parent_id": "",
-                "role": "assistant",
-                "created_at": _iso(_parse_datetime(timestamp) or _dt_from_ms(created_ms)),
-                "parts": [{"type": "tool_call", "id": str(payload.get("call_id") or payload.get("id") or ""), "name": str(payload.get("name") or ""), "input": payload.get("arguments") or payload.get("input")}],
-                "raw_source_ref": f"{rollout_path}:{event_index + 1}",
-            })
+            part = {
+                "type": "tool_call",
+                "id": str(payload.get("call_id") or payload.get("id") or ""),
+                "name": str(payload.get("name") or ""),
+                "input": payload.get("arguments") or payload.get("input"),
+            }
+            message = _append_codex_tool_call(
+                messages,
+                part,
+                payload.get("id"),
+                _iso(_parse_datetime(timestamp) or _dt_from_ms(created_ms)),
+                event_index,
+                rollout_path,
+                snapshots,
+            )
+            source_event["represented_by"] = message["id"]
+            source_events.append(source_event)
         elif payload_type in ("function_call_output", "custom_tool_call_output"):
-            messages.append({
-                "id": str(payload.get("call_id") or payload.get("id") or f"codex-tool-result-{event_index}"),
-                "parent_id": "",
-                "role": "tool",
-                "created_at": _iso(_parse_datetime(timestamp) or _dt_from_ms(created_ms)),
-                "parts": [{"type": "tool_result", "tool_call_id": str(payload.get("call_id") or payload.get("id") or ""), "content": payload.get("output")}],
-                "raw_source_ref": f"{rollout_path}:{event_index + 1}",
-            })
+            part = {"type": "tool_result", "tool_call_id": str(payload.get("call_id") or payload.get("id") or ""), "content": payload.get("output")}
+            if "is_error" in payload:
+                part["is_error"] = bool(payload.get("is_error"))
+            message = _append_codex_tool_result(
+                messages,
+                part,
+                payload.get("id"),
+                _iso(_parse_datetime(timestamp) or _dt_from_ms(created_ms)),
+                event_index,
+                rollout_path,
+            )
+            source_event["represented_by"] = message["id"]
+            source_events.append(source_event)
+        else:
+            source_events.append(source_event)
 
     work_context = {
         "primary_cwd": row.get("cwd") or "",
@@ -388,11 +815,14 @@ def codex_session_to_bridge(row, rollout_path, include_system=True):
             "updated_at": _iso(_dt_from_ms(updated_ms)),
             "provider": row.get("model_provider") or "",
             "model": row.get("model") or "",
+            "reasoning_effort": row.get("reasoning_effort") or "",
         },
         "work_context": work_context,
         "messages": messages,
         "extras": {},
         "raw_event_refs": raw_event_refs,
+        "source_events": source_events,
+        "compactions": compactions,
     }
     validate_bridge(bridge)
     return bridge
@@ -423,6 +853,28 @@ def validate_bridge(bridge):
         for part in parts:
             if not isinstance(part, dict) or not part.get("type"):
                 raise ValueError(f"bridge message {index} has invalid part")
+    source_events = bridge.get("source_events", [])
+    if source_events is None:
+        source_events = []
+    if not isinstance(source_events, list):
+        raise ValueError("bridge source_events must be a list")
+    for index, source_event in enumerate(source_events):
+        if not isinstance(source_event, dict):
+            raise ValueError(f"bridge source_event {index} must be an object")
+        if "raw" not in source_event or not isinstance(source_event.get("raw"), dict):
+            raise ValueError(f"bridge source_event {index} must include raw object")
+    compactions = bridge.get("compactions", [])
+    if compactions is None:
+        compactions = []
+    if not isinstance(compactions, list):
+        raise ValueError("bridge compactions must be a list")
+    for index, compaction in enumerate(compactions):
+        if not isinstance(compaction, dict):
+            raise ValueError(f"bridge compaction {index} must be an object")
+        if "summary_text" not in compaction:
+            raise ValueError(f"bridge compaction {index} must include summary_text")
+        if "timestamp" in compaction and _parse_datetime(compaction.get("timestamp")) is None:
+            raise ValueError(f"bridge compaction {index} has invalid timestamp")
     return True
 
 
@@ -433,10 +885,82 @@ def _rollout_message_part(part):
     return {"type": "metadata", "text": json.dumps({"part_type": part_type}, ensure_ascii=True)}
 
 
-def _render_codex_rollout(bridge, codex_id, created_ms, updated_ms, preserve_message_timestamps=True):
+def _codex_reasoning_payload(part):
+    part = part if isinstance(part, dict) else {}
+    payload = {"type": "reasoning"}
+    if part.get("reasoning_id"):
+        payload["id"] = str(part.get("reasoning_id"))
+    if part.get("encrypted_content"):
+        payload["encrypted_content"] = str(part.get("encrypted_content"))
+    summary = _reasoning_summary_list(part)
+    if summary or "summary" in part or part.get("summary_text"):
+        payload["summary"] = summary
+    if part.get("text"):
+        payload["content"] = str(part.get("text"))
+    return payload
+
+
+def _compaction_anchor_index(compaction, messages):
+    anchor_id = str(compaction.get("anchor_message_id") or "")
+    if anchor_id:
+        for index, message in enumerate(messages or []):
+            if str(message.get("id") or "") == anchor_id:
+                return index
+    index = _int_or_default(compaction.get("anchor_message_index"), -1)
+    if 0 <= index < len(messages or []):
+        return index
+    return -1
+
+
+def _codex_compaction_events(compaction, default_timestamp):
+    compaction = compaction if isinstance(compaction, dict) else {}
+    timestamp = _iso(_parse_datetime(compaction.get("timestamp")) or _parse_datetime(default_timestamp) or _utc_now())
+    replacement_history = compaction.get("replacement_history") if isinstance(compaction.get("replacement_history"), list) else []
+    payload = {
+        "message": str(compaction.get("summary_text") or ""),
+        "replacement_history": replacement_history,
+        "source": str(compaction.get("source") or "chat_bridge"),
+        "summary_tokens": _int_or_default(compaction.get("summary_tokens"), 0),
+        "summary_kind": str(compaction.get("summary_kind") or "llm_summary"),
+        "removed_count": _int_or_default(compaction.get("removed_count"), len(replacement_history)),
+    }
+    if compaction.get("parent_session_id"):
+        payload["parent_session_id"] = str(compaction.get("parent_session_id"))
+    anchor_index = _int_or_default(compaction.get("anchor_message_index"), -1)
+    anchor_id = str(compaction.get("anchor_message_id") or "")
+    if anchor_id or anchor_index >= 0:
+        payload["anchor_message"] = {"id": anchor_id, "index": anchor_index}
+    if isinstance(compaction.get("system_info"), dict):
+        payload["system_info"] = compaction.get("system_info")
+    if compaction.get("ui_render_cutoff_message_id"):
+        payload["ui_render_cutoff_message_id"] = str(compaction.get("ui_render_cutoff_message_id"))
+    if isinstance(compaction.get("token_count_before"), dict):
+        payload["token_count_before"] = compaction.get("token_count_before")
+    if isinstance(compaction.get("token_count_after"), dict):
+        payload["token_count_after"] = compaction.get("token_count_after")
+    context_timestamp = _iso(_parse_datetime(compaction.get("context_compacted_at")) or _parse_datetime(timestamp) or _utc_now())
+    return [
+        {"timestamp": timestamp, "type": "compacted", "payload": payload},
+        {"timestamp": context_timestamp, "type": "event_msg", "payload": {"type": "context_compacted"}},
+    ]
+
+
+def _render_codex_rollout(
+    bridge,
+    codex_id,
+    created_ms,
+    updated_ms,
+    preserve_message_timestamps=True,
+    compaction_mode="archived",
+    target_provider=None,
+    target_model=None,
+):
+    compaction_mode = _normalize_compaction_mode(compaction_mode)
     session = bridge["session"]
     work = bridge.get("work_context") if isinstance(bridge.get("work_context"), dict) else {}
     current = work.get("current") if isinstance(work.get("current"), dict) else {}
+    model_provider = target_provider or session.get("provider") or ""
+    model = target_model or session.get("model") or ""
     created_iso = _iso(_dt_from_ms(created_ms))
     events = [{
         "timestamp": created_iso,
@@ -447,8 +971,8 @@ def _render_codex_rollout(bridge, codex_id, created_ms, updated_ms, preserve_mes
             "cwd": work.get("primary_cwd") or current.get("cwd") or "",
             "originator": "chat_bridge",
             "source": "chat_bridge",
-            "model_provider": session.get("provider") or "",
-            "model": session.get("model") or "",
+            "model_provider": model_provider,
+            "model": model,
             "git": {
                 "branch": current.get("git_branch") or "",
                 "commit_hash": current.get("git_sha") or "",
@@ -457,6 +981,17 @@ def _render_codex_rollout(bridge, codex_id, created_ms, updated_ms, preserve_mes
         },
     }]
     messages = bridge.get("messages", [])
+    compactions = [] if _is_archived_compaction_mode(compaction_mode) else (bridge.get("compactions") or [])
+    compactions_before_messages = []
+    compactions_after_message = {}
+    for compaction in compactions:
+        anchor_index = _compaction_anchor_index(compaction, messages)
+        if anchor_index >= 0:
+            compactions_after_message.setdefault(anchor_index, []).append(compaction)
+        else:
+            compactions_before_messages.append(compaction)
+    for compaction in compactions_before_messages:
+        events.extend(_codex_compaction_events(compaction, created_iso))
     for message_index, message in enumerate(messages):
         role = message.get("role") if message.get("role") in ("user", "assistant", "system", "tool") else "unknown"
         if preserve_message_timestamps:
@@ -465,9 +1000,31 @@ def _render_codex_rollout(bridge, codex_id, created_ms, updated_ms, preserve_mes
             timestamp_ms = min(updated_ms, created_ms + message_index + 1)
             timestamp = _iso(_dt_from_ms(timestamp_ms))
         message_content = []
+        def flush_message_content():
+            if not message_content:
+                return
+            events.append({
+                "timestamp": timestamp,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": role,
+                    "content": list(message_content),
+                },
+            })
+            message_content.clear()
+
         for part in message.get("parts", []):
             part_type = part.get("type")
-            if part_type == "tool_call":
+            if part_type == "reasoning":
+                flush_message_content()
+                events.append({
+                    "timestamp": timestamp,
+                    "type": "response_item",
+                    "payload": _codex_reasoning_payload(part),
+                })
+            elif part_type == "tool_call":
+                flush_message_content()
                 events.append({
                     "timestamp": timestamp,
                     "type": "response_item",
@@ -479,27 +1036,24 @@ def _render_codex_rollout(bridge, codex_id, created_ms, updated_ms, preserve_mes
                     },
                 })
             elif part_type == "tool_result":
+                flush_message_content()
+                payload = {
+                    "type": "function_call_output",
+                    "call_id": part.get("tool_call_id") or "",
+                    "output": part.get("content"),
+                }
+                if "is_error" in part:
+                    payload["is_error"] = bool(part.get("is_error"))
                 events.append({
                     "timestamp": timestamp,
                     "type": "response_item",
-                    "payload": {
-                        "type": "function_call_output",
-                        "call_id": part.get("tool_call_id") or "",
-                        "output": part.get("content"),
-                    },
+                    "payload": payload,
                 })
             else:
                 message_content.append(_rollout_message_part(part))
-        if message_content:
-            events.append({
-                "timestamp": timestamp,
-                "type": "response_item",
-                "payload": {
-                    "type": "message",
-                    "role": role,
-                    "content": message_content,
-                },
-            })
+        flush_message_content()
+        for compaction in compactions_after_message.get(message_index, []):
+            events.extend(_codex_compaction_events(compaction, timestamp))
     return "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events)
 
 
@@ -530,6 +1084,33 @@ def _insert_thread_row(conn, row):
     placeholders = ", ".join("?" for _ in names)
     sql = f"INSERT INTO threads ({', '.join(names)}) VALUES ({placeholders})"
     conn.execute(sql, [insert[name] for name in names])
+
+
+def _upsert_codex_session_index(codex_dir, session_id, title, updated_ms):
+    path = Path(codex_dir) / "session_index.jsonl"
+    entry = {
+        "id": session_id,
+        "thread_name": title or session_id,
+        "updated_at": _iso(_dt_from_ms(updated_ms)),
+    }
+    entries = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                existing = json.loads(line)
+            except Exception:
+                entries.append(None)
+                continue
+            if existing.get("id") != session_id:
+                entries.append(existing)
+    entries.append(entry)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for item in entries:
+            if item is not None:
+                handle.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def _first_user_text(messages):
@@ -670,6 +1251,447 @@ def _upsert_mapping(root, pair):
     return _save_mapping(root, data)
 
 
+def _mapping_roots_key(root):
+    try:
+        return str(Path(root))
+    except Exception:
+        return str(root or "")
+
+
+def _merge_mapping_pairs(*roots):
+    merged = []
+    by_import_id = {}
+    by_pair = {}
+
+    def mark_conflict(index, import_id):
+        pair = merged[index]
+        pair["mapping_conflict"] = True
+        pair["mapping_conflict_reason"] = "same import_id has different session IDs"
+        ids = pair.setdefault("mapping_conflict_import_ids", [])
+        if import_id and import_id not in ids:
+            ids.append(import_id)
+
+    for root in roots:
+        root_text = _mapping_roots_key(root)
+        for raw_pair in _load_mapping(root).get("pairs", []):
+            if not isinstance(raw_pair, dict):
+                continue
+            codex_id = str(raw_pair.get("codex_session_id") or "")
+            droid_id = str(raw_pair.get("droid_session_id") or "")
+            if not codex_id and not droid_id:
+                continue
+            import_id = str(raw_pair.get("import_id") or "")
+            pair_key = (codex_id, droid_id)
+            import_indexes = by_import_id.get(import_id, []) if import_id else []
+            index = None
+            for candidate in import_indexes:
+                candidate_pair = merged[candidate]
+                candidate_key = (candidate_pair.get("codex_session_id") or "", candidate_pair.get("droid_session_id") or "")
+                if candidate_key == pair_key:
+                    index = candidate
+                    break
+            conflict_indexes = []
+            if index is None and import_indexes:
+                conflict_indexes = list(import_indexes)
+            if index is None:
+                index = by_pair.get(pair_key)
+            if index is None:
+                pair = dict(raw_pair)
+                pair["codex_session_id"] = codex_id
+                pair["droid_session_id"] = droid_id
+                pair["mapping_roots"] = [root_text]
+                index = len(merged)
+                if conflict_indexes:
+                    pair["mapping_conflict"] = True
+                    pair["mapping_conflict_reason"] = "same import_id has different session IDs"
+                    pair["mapping_conflict_import_ids"] = [import_id]
+                    for conflict_index in conflict_indexes:
+                        mark_conflict(conflict_index, import_id)
+                merged.append(pair)
+            else:
+                pair = merged[index]
+                if import_id and not pair.get("import_id"):
+                    pair["import_id"] = import_id
+                if raw_pair.get("bridge_id") and not pair.get("bridge_id"):
+                    pair["bridge_id"] = raw_pair.get("bridge_id")
+                if raw_pair.get("source_app") and not pair.get("source_app"):
+                    pair["source_app"] = raw_pair.get("source_app")
+                roots_seen = pair.setdefault("mapping_roots", [])
+                if root_text not in roots_seen:
+                    roots_seen.append(root_text)
+
+            if import_id:
+                indexes = by_import_id.setdefault(import_id, [])
+                if index not in indexes:
+                    indexes.append(index)
+            by_pair[pair_key] = index
+
+    return merged
+
+
+def _raw_int(value, default=0):
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        return int(default)
+    if raw <= 0:
+        return int(default)
+    return int(raw)
+
+
+def _seconds_or_ms(value, default=0):
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        return int(default)
+    if raw <= 0:
+        return int(default)
+    if raw > 100000000000:
+        return int(raw)
+    return int(raw * 1000)
+
+
+def _codex_row_updated_ms(row):
+    if not isinstance(row, dict):
+        return 0
+    if row.get("updated_at_ms") is not None:
+        return _raw_int(row.get("updated_at_ms"), 0)
+    return _seconds_or_ms(row.get("updated_at"), 0)
+
+
+def _droid_session_updated_ms(session):
+    if not isinstance(session, dict):
+        return 0
+    if session.get("updated_at_ms") is not None:
+        return _raw_int(session.get("updated_at_ms"), 0)
+    return _seconds_or_ms(session.get("mtime"), 0)
+
+
+def _mirror_action(status):
+    return {
+        "mapping_conflict": "none",
+        "codex_newer": "would_export_to_droid",
+        "droid_newer": "would_import_to_codex",
+        "missing_droid": "would_create_droid",
+        "missing_codex": "would_create_codex",
+        "in_sync": "none",
+        "stale_pair": "none",
+    }.get(status, "none")
+
+
+def _row_matches_project(row, project):
+    if not project:
+        return True
+    if not isinstance(row, dict):
+        return False
+    needle = str(project or "").lower()
+    haystack = " ".join(str(row.get(key) or "") for key in ("cwd", "project", "rollout_path")).lower()
+    return needle in haystack
+
+
+def build_mirror_plan(codex_root, factory_home, codex_rows, droid_sessions, timestamp_tolerance_ms=1000, project=None):
+    codex_index = {str(row.get("id") or ""): row for row in (codex_rows or []) if isinstance(row, dict) and row.get("id")}
+    droid_index = {str(session.get("id") or ""): session for session in (droid_sessions or []) if isinstance(session, dict) and session.get("id")}
+    items = []
+    statuses = {}
+
+    for pair in _merge_mapping_pairs(codex_root, factory_home):
+        codex_id = str(pair.get("codex_session_id") or "")
+        droid_id = str(pair.get("droid_session_id") or "")
+        codex_row = codex_index.get(codex_id)
+        droid_session = droid_index.get(droid_id)
+        codex_updated_ms = _codex_row_updated_ms(codex_row)
+        droid_updated_ms = _droid_session_updated_ms(droid_session)
+
+        if project and not _row_matches_project(codex_row, project):
+            continue
+
+        if pair.get("mapping_conflict"):
+            status = "mapping_conflict"
+        elif not codex_row and not droid_session:
+            status = "stale_pair"
+        elif not codex_row:
+            status = "missing_codex"
+        elif not droid_session:
+            status = "missing_droid"
+        else:
+            delta_ms = codex_updated_ms - droid_updated_ms
+            if abs(delta_ms) <= int(timestamp_tolerance_ms):
+                status = "in_sync"
+            elif delta_ms > 0:
+                status = "codex_newer"
+            else:
+                status = "droid_newer"
+
+        delta_ms = codex_updated_ms - droid_updated_ms if codex_updated_ms and droid_updated_ms else None
+        statuses[status] = statuses.get(status, 0) + 1
+        items.append({
+            "import_id": pair.get("import_id") or "",
+            "bridge_id": pair.get("bridge_id") or "",
+            "source_app": pair.get("source_app") or "",
+            "codex_session_id": codex_id,
+            "droid_session_id": droid_id,
+            "status": status,
+            "action": _mirror_action(status),
+            "read_only": True,
+            "codex_present": bool(codex_row),
+            "droid_present": bool(droid_session),
+            "codex_updated_at_ms": codex_updated_ms,
+            "droid_updated_at_ms": droid_updated_ms,
+            "delta_ms": delta_ms,
+            "codex_title": (codex_row or {}).get("title") or "",
+            "droid_title": (droid_session or {}).get("title") or "",
+            "codex_cwd": (codex_row or {}).get("cwd") or "",
+            "codex_rollout_path": (codex_row or {}).get("rollout_path") or "",
+            "droid_jsonl_path": (droid_session or {}).get("jsonl_path") or "",
+            "mapping_roots": list(pair.get("mapping_roots") or []),
+            "mapping_conflict": bool(pair.get("mapping_conflict")),
+            "mapping_conflict_reason": pair.get("mapping_conflict_reason") or "",
+            "mapping_conflict_import_ids": list(pair.get("mapping_conflict_import_ids") or []),
+        })
+
+    return {
+        "version": 1,
+        "kind": "chat_bridge_mirror_plan",
+        "read_only": True,
+        "generated_at": _iso(_utc_now()),
+        "summary": {
+            "total_pairs": len(items),
+            "statuses": statuses,
+            "codex_root": str(Path(codex_root)),
+            "factory_home": str(Path(factory_home)),
+            "project": str(project or ""),
+        },
+        "items": items,
+    }
+
+
+def _mirror_direction_for_status(status, direction):
+    normalized = str(direction or "newer").replace("_", "-").lower()
+    status = str(status or "")
+    if normalized == "newer":
+        if status in ("codex_newer", "missing_droid"):
+            return "codex_to_droid"
+        if status in ("droid_newer", "missing_codex"):
+            return "droid_to_codex"
+        return ""
+    if normalized == "codex-to-droid":
+        return "codex_to_droid" if status in ("codex_newer", "missing_droid") else ""
+    if normalized == "droid-to-codex":
+        return "droid_to_codex" if status in ("droid_newer", "missing_codex") else ""
+    raise ValueError(f"unsupported mirror direction: {direction}")
+
+
+def _normal_set(values):
+    if not values:
+        return set()
+    if isinstance(values, str):
+        values = [item.strip() for item in values.split(",")]
+    return {str(value).strip() for value in values if str(value).strip()}
+
+
+def _ambiguous_mirror_ids(items):
+    codex_counts = {}
+    droid_counts = {}
+    for item in items:
+        codex_id = str(item.get("codex_session_id") or "")
+        droid_id = str(item.get("droid_session_id") or "")
+        if codex_id:
+            codex_counts[codex_id] = codex_counts.get(codex_id, 0) + 1
+        if droid_id:
+            droid_counts[droid_id] = droid_counts.get(droid_id, 0) + 1
+    return {
+        "codex": {session_id for session_id, count in codex_counts.items() if count > 1},
+        "droid": {session_id for session_id, count in droid_counts.items() if count > 1},
+    }
+
+
+def _already_applied_mirror_items(items):
+    applied_codex_ids = set()
+    applied_droid_ids = set()
+    for item in items:
+        source_app = str(item.get("source_app") or "")
+        bridge_id = str(item.get("bridge_id") or "")
+        codex_id = str(item.get("codex_session_id") or "")
+        droid_id = str(item.get("droid_session_id") or "")
+        if source_app == "codex" and codex_id and bridge_id == _bridge_id("codex", codex_id):
+            applied_codex_ids.add(codex_id)
+        if source_app == "droid" and droid_id and bridge_id == _bridge_id("droid", droid_id):
+            applied_droid_ids.add(droid_id)
+    return {"codex": applied_codex_ids, "droid": applied_droid_ids}
+
+
+def select_mirror_actions(plan, direction="newer", session_ids=None, statuses=None, limit=None):
+    items = [item for item in (plan.get("items") if isinstance(plan, dict) else []) or [] if isinstance(item, dict)]
+    ambiguous = _ambiguous_mirror_ids(items)
+    already_applied = _already_applied_mirror_items(items)
+    session_filter = _normal_set(session_ids)
+    status_filter = _normal_set(statuses)
+    limit = int(limit) if limit not in (None, "") else None
+    selected = []
+    skipped = []
+    for item in items:
+        action = _mirror_direction_for_status(item.get("status"), direction)
+        codex_id = str(item.get("codex_session_id") or "")
+        droid_id = str(item.get("droid_session_id") or "")
+        if session_filter and codex_id not in session_filter and droid_id not in session_filter:
+            skipped_item = dict(item)
+            skipped_item["skip_reason"] = "session_filter"
+            skipped.append(skipped_item)
+            continue
+        if status_filter and str(item.get("status") or "") not in status_filter:
+            skipped_item = dict(item)
+            skipped_item["skip_reason"] = "status_filter"
+            skipped.append(skipped_item)
+            continue
+        if (action == "codex_to_droid" and codex_id in already_applied["codex"]) or (action == "droid_to_codex" and droid_id in already_applied["droid"]):
+            skipped_item = dict(item)
+            skipped_item["skip_reason"] = "already_applied"
+            skipped.append(skipped_item)
+            continue
+        if codex_id in ambiguous["codex"] or droid_id in ambiguous["droid"]:
+            skipped_item = dict(item)
+            skipped_item["skip_reason"] = "ambiguous_mapping"
+            skipped.append(skipped_item)
+            continue
+        if not action:
+            skipped_item = dict(item)
+            skipped_item["skip_reason"] = "not_actionable"
+            skipped.append(skipped_item)
+            continue
+        if limit is not None and len(selected) >= limit:
+            skipped_item = dict(item)
+            skipped_item["skip_reason"] = "limit"
+            skipped.append(skipped_item)
+            continue
+        selected_item = dict(item)
+        selected_item["apply_direction"] = action
+        selected.append(selected_item)
+    return {
+        "version": 1,
+        "kind": "chat_bridge_mirror_actions",
+        "read_only": True,
+        "direction": str(direction or "newer"),
+        "summary": {
+            "selected": len(selected),
+            "skipped": len(skipped),
+        },
+        "items": selected,
+        "skipped": skipped,
+    }
+
+
+def _bridge_current_context(bridge):
+    work = bridge.get("work_context") if isinstance(bridge.get("work_context"), dict) else {}
+    current = work.get("current") if isinstance(work.get("current"), dict) else {}
+    return work, current
+
+
+def _bridge_message_signature(messages):
+    signature = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        parts = message.get("parts") if isinstance(message.get("parts"), list) else []
+        signature.append({
+            "role": str(message.get("role") or ""),
+            "parts": [str(part.get("type") or "") for part in parts if isinstance(part, dict)],
+        })
+    return signature
+
+
+def _bridge_metric_counts(bridge):
+    bridge = bridge if isinstance(bridge, dict) else {}
+    messages = bridge.get("messages") if isinstance(bridge.get("messages"), list) else []
+    compactions = bridge.get("compactions") if isinstance(bridge.get("compactions"), list) else []
+    source_events = bridge.get("source_events") if isinstance(bridge.get("source_events"), list) else []
+    work, current = _bridge_current_context(bridge)
+    session = bridge.get("session") if isinstance(bridge.get("session"), dict) else {}
+    part_counts = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for part in message.get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "")
+            part_counts[part_type] = part_counts.get(part_type, 0) + 1
+    return {
+        "message_count": len(messages),
+        "role_sequence": [item["role"] for item in _bridge_message_signature(messages)],
+        "part_type_sequence": [item["parts"] for item in _bridge_message_signature(messages)],
+        "part_counts": part_counts,
+        "tool_call_count": part_counts.get("tool_call", 0),
+        "tool_result_count": part_counts.get("tool_result", 0),
+        "compaction_count": len(compactions),
+        "source_event_count": len(source_events),
+        "primary_cwd": _normalize_droid_cwd(work.get("primary_cwd") or current.get("cwd") or ""),
+        "git_branch": str(current.get("git_branch") or ""),
+        "git_sha": str(current.get("git_sha") or ""),
+        "provider": str(session.get("provider") or ""),
+        "model": str(session.get("model") or ""),
+    }
+
+
+def _doctor_issue(code, message, codex_value, droid_value, severity="warn"):
+    return {
+        "code": code,
+        "severity": severity,
+        "message": message,
+        "codex": codex_value,
+        "droid": droid_value,
+    }
+
+
+def diagnose_bridge_pair(codex_bridge, droid_bridge, codex_session_id="", droid_session_id=""):
+    codex_metrics = _bridge_metric_counts(codex_bridge)
+    droid_metrics = _bridge_metric_counts(droid_bridge)
+    issues = []
+    comparisons = [
+        ("message_count", "Message count differs"),
+        ("role_sequence", "Message role sequence differs"),
+        ("part_type_sequence", "Message part type sequence differs"),
+        ("tool_call_count", "Tool call count differs"),
+        ("tool_result_count", "Tool result count differs"),
+        ("compaction_count", "Compaction count differs"),
+        ("source_event_count", "Source event count differs"),
+    ]
+    for key, message in comparisons:
+        if codex_metrics.get(key) != droid_metrics.get(key):
+            issues.append(_doctor_issue(key, message, codex_metrics.get(key), droid_metrics.get(key)))
+    for key, message in (
+        ("primary_cwd", "Primary cwd differs"),
+        ("git_branch", "Git branch differs"),
+        ("git_sha", "Git sha differs"),
+        ("provider", "Provider differs"),
+        ("model", "Model differs"),
+    ):
+        codex_value = codex_metrics.get(key)
+        droid_value = droid_metrics.get(key)
+        if (
+            key == "provider"
+            and codex_value
+            and droid_value
+            and _canonical_droid_provider(codex_value, codex_metrics.get("model")) == _canonical_droid_provider(droid_value, droid_metrics.get("model"))
+        ):
+            continue
+        if (codex_value or droid_value) and codex_value != droid_value:
+            issues.append(_doctor_issue(key, message, codex_value, droid_value))
+    return {
+        "version": 1,
+        "kind": "chat_bridge_doctor_pair",
+        "read_only": True,
+        "codex_session_id": str(codex_session_id or ""),
+        "droid_session_id": str(droid_session_id or ""),
+        "status": "ok" if not issues else "warn",
+        "metrics": {
+            "codex": codex_metrics,
+            "droid": droid_metrics,
+        },
+        "issues": issues,
+    }
+
+
 def _pin_session(global_state_path, session_id):
     path = Path(global_state_path)
     try:
@@ -695,13 +1717,19 @@ def import_bridge_to_codex(
     preserve_timestamps=True,
     pin_old=False,
     old_before_ms=None,
+    compaction_mode="archived",
+    target_provider=None,
+    target_model=None,
 ):
     validate_bridge(bridge)
+    compaction_mode = _normalize_compaction_mode(compaction_mode)
     codex_dir = Path(codex_dir)
     state_db = Path(state_db)
     sessions_dir = Path(sessions_dir)
     source = bridge["source"]
     session = bridge["session"]
+    model_provider = target_provider or session.get("provider") or ""
+    model = target_model or session.get("model") or ""
     work = bridge.get("work_context") if isinstance(bridge.get("work_context"), dict) else {}
     current = work.get("current") if isinstance(work.get("current"), dict) else {}
     now_ms = int(_utc_now().timestamp() * 1000)
@@ -714,7 +1742,7 @@ def import_bridge_to_codex(
         created_ms = now_ms
         updated_ms = created_ms + max(len(bridge.get("messages", [])), 0)
 
-    codex_id = _new_id("bridge-codex")
+    codex_id = _new_codex_thread_id()
     date_dir = sessions_dir / f"{_dt_from_ms(created_ms).year:04d}" / f"{_dt_from_ms(created_ms).month:02d}" / f"{_dt_from_ms(created_ms).day:02d}"
     date_dir.mkdir(parents=True, exist_ok=True)
     final_path = date_dir / f"rollout-{codex_id}.jsonl"
@@ -729,6 +1757,9 @@ def import_bridge_to_codex(
             created_ms,
             updated_ms,
             preserve_message_timestamps=preserve_timestamps,
+            compaction_mode=compaction_mode,
+            target_provider=model_provider,
+            target_model=model,
         )
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(rollout_text)
@@ -741,7 +1772,7 @@ def import_bridge_to_codex(
             "created_at": created_ms // 1000,
             "updated_at": updated_ms // 1000,
             "source": "chat_bridge",
-            "model_provider": session.get("provider") or "",
+            "model_provider": model_provider,
             "cwd": work.get("primary_cwd") or current.get("cwd") or "",
             "title": session.get("title") or codex_id,
             "sandbox_policy": "{}",
@@ -758,8 +1789,8 @@ def import_bridge_to_codex(
             "agent_nickname": None,
             "agent_role": None,
             "memory_mode": "enabled",
-            "model": session.get("model") or "",
-            "reasoning_effort": None,
+            "model": model,
+            "reasoning_effort": session.get("reasoning_effort") or None,
             "agent_path": None,
             "created_at_ms": created_ms,
             "updated_at_ms": updated_ms,
@@ -791,6 +1822,7 @@ def import_bridge_to_codex(
         payload = meta.get("payload") or {}
         if payload.get("model_provider") != verified["model_provider"] or payload.get("model") != verified["model"]:
             raise ValueError("Codex import verification failed: provider/model mismatch")
+        _upsert_codex_session_index(codex_dir, codex_id, row["title"], updated_ms)
 
         warnings = []
         should_pin = bool(pin_old) and (old_before_ms is None or source_updated_ms < int(old_before_ms))
@@ -844,11 +1876,138 @@ def _droid_content_part(part):
     part_type = part.get("type")
     if part_type == "text":
         return {"type": "text", "text": str(part.get("text") or "")}
+    if part_type == "reasoning":
+        return _droid_thinking_part(part)
     if part_type == "tool_call":
         return {"type": "tool_use", "id": part.get("id") or "", "name": part.get("name") or "", "input": _droid_tool_input(part.get("input"))}
     if part_type == "tool_result":
-        return {"type": "tool_result", "tool_use_id": part.get("tool_call_id") or "", "content": part.get("content")}
+        result = {"type": "tool_result", "tool_use_id": part.get("tool_call_id") or "", "content": part.get("content")}
+        if "is_error" in part:
+            result["is_error"] = bool(part.get("is_error"))
+        return result
     return {"type": "text", "text": f"[unsupported bridge part: {part_type}]"}
+
+
+def _droid_thinking_part(part):
+    part = part if isinstance(part, dict) else {}
+    summary = _reasoning_summary_list(part)
+    summary_text = str(part.get("summary_text") or _reasoning_summary_text(summary) or "")
+    encrypted_content = str(part.get("encrypted_content") or "")
+    reasoning_id = str(part.get("reasoning_id") or "")
+    result = {
+        "type": "thinking",
+        "thinking": str(part.get("text") or summary_text or ""),
+    }
+    signature = part.get("signature") if isinstance(part.get("signature"), str) else ""
+    if not signature and (encrypted_content or summary or reasoning_id):
+        signature_payload = {"type": "reasoning"}
+        if reasoning_id:
+            signature_payload["id"] = reasoning_id
+        if encrypted_content:
+            signature_payload["encrypted_content"] = encrypted_content
+        if summary:
+            signature_payload["summary"] = summary
+        signature = json.dumps(signature_payload, ensure_ascii=False)
+    if signature:
+        result["signature"] = signature
+    if part.get("signature_provider") or encrypted_content:
+        result["signatureProvider"] = str(part.get("signature_provider") or "openai")
+    if part.get("duration_ms") is not None:
+        result["durationMs"] = _int_or_default(part.get("duration_ms"), 0)
+    if encrypted_content:
+        result["openaiEncryptedContent"] = encrypted_content
+    if reasoning_id:
+        result["openaiReasoningId"] = reasoning_id
+    if summary_text:
+        result["openaiReasoningSummary"] = summary_text
+    return result
+
+
+def _droid_bridge_source_event(source_event, index, source_app):
+    source_event = source_event if isinstance(source_event, dict) else {}
+    raw = source_event.get("raw") if isinstance(source_event.get("raw"), dict) else {}
+    timestamp = source_event.get("timestamp") or raw.get("timestamp") or _iso(_utc_now())
+    source_index = _int_or_default(source_event.get("index"), index)
+    return {
+        "type": "bridge_source_event",
+        "id": f"bridge-source-event-{source_index:06d}",
+        "timestamp": _iso(_parse_datetime(timestamp) or _utc_now()),
+        "source": str(source_app or ""),
+        "sourceIndex": source_index,
+        "outerType": str(source_event.get("outer_type") or ""),
+        "payloadType": str(source_event.get("payload_type") or ""),
+        "representedBy": str(source_event.get("represented_by") or ""),
+        "raw": raw,
+    }
+
+
+def _droid_compaction_state_event(compaction, index):
+    compaction = compaction if isinstance(compaction, dict) else {}
+    timestamp = _iso(_parse_datetime(compaction.get("timestamp")) or _utc_now())
+    event = {
+        "type": "compaction_state",
+        "id": str(compaction.get("id") or f"bridge-compaction-{index:06d}"),
+        "timestamp": timestamp,
+        "summaryText": str(compaction.get("summary_text") or ""),
+        "summaryTokens": _int_or_default(compaction.get("summary_tokens"), 0),
+        "summaryKind": str(compaction.get("summary_kind") or "llm_summary"),
+        "removedCount": _int_or_default(
+            compaction.get("removed_count"),
+            len(compaction.get("replacement_history") or []) if isinstance(compaction.get("replacement_history"), list) else 0,
+        ),
+    }
+    anchor_id = str(compaction.get("anchor_message_id") or "")
+    anchor_index = _int_or_default(compaction.get("anchor_message_index"), -1)
+    if anchor_id or anchor_index >= 0:
+        anchor = {}
+        if anchor_id:
+            anchor["id"] = anchor_id
+        if anchor_index >= 0:
+            anchor["index"] = anchor_index
+        event["anchorMessage"] = anchor
+    if isinstance(compaction.get("system_info"), dict):
+        event["systemInfo"] = compaction.get("system_info")
+    if compaction.get("ui_render_cutoff_message_id"):
+        event["uiRenderCutoffMessageId"] = str(compaction.get("ui_render_cutoff_message_id"))
+    return event
+
+
+def _message_is_droid_tool_result(message):
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") == "tool":
+        return True
+    parts = message.get("parts")
+    return bool(parts) and all(isinstance(part, dict) and part.get("type") == "tool_result" for part in parts)
+
+
+def _latest_compaction(compactions):
+    best = None
+    best_key = (-1, "")
+    for index, compaction in enumerate(compactions or []):
+        if not isinstance(compaction, dict):
+            continue
+        key = (_int_or_default(compaction.get("source_event_index"), index), str(compaction.get("timestamp") or ""))
+        if key >= best_key:
+            best = compaction
+            best_key = key
+    return best
+
+
+def _droid_native_suffix_messages(messages, compaction):
+    messages = list(messages or [])
+    anchor = _compaction_anchor_index(compaction or {}, messages)
+    start = max(0, anchor + 1)
+    while start < len(messages) and _message_is_droid_tool_result(messages[start]):
+        start += 1
+    return messages[start:]
+
+
+def _droid_anchorless_compaction(compaction):
+    result = dict(compaction or {})
+    result["anchor_message_id"] = ""
+    result["anchor_message_index"] = -1
+    return result
 
 
 def _droid_tool_input(value):
@@ -906,6 +2065,88 @@ def _droid_session_dir(factory_home, cwd):
 def _droid_host_id(factory_home):
     data = _read_json_file(Path(factory_home) / "host.json")
     return str(data.get("hostId") or "")
+
+
+def _canonical_droid_provider(provider, model):
+    text = str(provider or "").strip()
+    lower = text.lower().replace("-", "_")
+    known = {
+        "openai": "openai",
+        "anthropic": "anthropic",
+        "google": "google",
+        "gemini": "google",
+        "xai": "xai",
+        "groq": "groq",
+        "mistral": "mistral",
+        "deepseek": "deepseek",
+        "openrouter": "openrouter",
+        "ollama": "ollama",
+    }
+    if lower in known:
+        return known[lower]
+    if "anthropic" in lower or "claude" in lower:
+        return "anthropic"
+    if "openai" in lower or "neurogate" in lower:
+        return "openai"
+
+    model_text = str(model or "").strip().lower()
+    if model_text.startswith(("gpt-", "o1", "o3", "o4", "o5")):
+        return "openai"
+    if model_text.startswith("claude"):
+        return "anthropic"
+    if model_text.startswith("gemini"):
+        return "google"
+    return text
+
+
+def _resolve_droid_session_settings(factory_home, session, timestamp):
+    session = session if isinstance(session, dict) else {}
+    session_model = str(session.get("model") or "")
+    session_provider = str(session.get("provider") or "")
+    session_reasoning = str(session.get("reasoning_effort") or session.get("reasoningEffort") or "")
+    models = []
+    effective_settings = {}
+    try:
+        import droid_provider_adapter as droid
+
+        ctx = droid.load_factory_context(factory_home)
+        models = ctx.get("models") or []
+        effective_settings = ctx.get("settings") if isinstance(ctx.get("settings"), dict) else {}
+    except Exception:
+        models = []
+        effective_settings = {}
+
+    match = None
+    for model in models:
+        if str(model.get("id") or "") == session_model:
+            match = model
+            break
+    if match is None and session_model:
+        for model in models:
+            if str(model.get("model") or "") != session_model:
+                continue
+            model_provider = str(model.get("provider") or "")
+            if not session_provider or not model_provider or model_provider == session_provider:
+                match = model
+                break
+
+    defaults = effective_settings.get("sessionDefaultSettings") if isinstance(effective_settings.get("sessionDefaultSettings"), dict) else {}
+    selected_model = str((match or {}).get("id") or session_model)
+    selected_model_name = str((match or {}).get("model") or session_model)
+    provider_lock = str((match or {}).get("provider") or _canonical_droid_provider(session_provider, selected_model_name) or "")
+    reasoning = str(session_reasoning or (match or {}).get("reasoningEffort") or defaults.get("reasoningEffort") or effective_settings.get("reasoningEffort") or "")
+    settings = {
+        "assistantActiveTimeMs": 0,
+        "providerLockTimestamp": timestamp,
+        "tokenUsage": {},
+    }
+    if selected_model:
+        settings["model"] = selected_model
+    if reasoning:
+        settings["reasoningEffort"] = reasoning
+    if provider_lock:
+        settings["providerLock"] = provider_lock
+    return settings
 
 
 def _file_mtime_ms(path):
@@ -1027,8 +2268,9 @@ def _update_droid_index(
     )
 
 
-def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True):
+def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compaction_mode="archived"):
     validate_bridge(bridge)
+    compaction_mode = _normalize_compaction_mode(compaction_mode)
     factory_home = Path(factory_home)
     work = bridge.get("work_context") if isinstance(bridge.get("work_context"), dict) else {}
     current = work.get("current") if isinstance(work.get("current"), dict) else {}
@@ -1055,6 +2297,9 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True):
         updated_ms = created_ms + max(len(bridge.get("messages", [])), 0)
     try:
         title = session.get("title") or droid_id
+        compactions = bridge.get("compactions") or []
+        native_compaction = _latest_compaction(compactions) if compaction_mode == "native" else None
+        active_messages = _droid_native_suffix_messages(bridge.get("messages", []), native_compaction) if native_compaction else list(bridge.get("messages", []))
         session_start = {
             "type": "session_start",
             "id": droid_id,
@@ -1062,6 +2307,8 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True):
             "sessionTitle": title,
             "owner": "codex-provider-manager",
         }
+        if native_compaction and native_compaction.get("parent_session_id"):
+            session_start["parent"] = str(native_compaction.get("parent_session_id"))
         if cwd:
             session_start.update({
                 "version": 2,
@@ -1074,7 +2321,10 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True):
         events = [session_start]
 
         parent_id = ""
-        for index, message in enumerate(bridge.get("messages", [])):
+        if native_compaction:
+            events.append(_droid_compaction_state_event(_droid_anchorless_compaction(native_compaction), 0))
+
+        for index, message in enumerate(active_messages):
             role = message.get("role") if message.get("role") in ("user", "assistant") else "user"
             if preserve_timestamps:
                 timestamp = message.get("created_at") or session.get("created_at") or _iso(now)
@@ -1090,21 +2340,25 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True):
                     "content": [_droid_content_part(part) for part in message.get("parts", [])],
                 },
             }
+            if message.get("role") not in ("user", "assistant"):
+                event["bridgeRole"] = str(message.get("role") or "unknown")
             if parent_id:
                 event["parentId"] = parent_id
             events.append(event)
             parent_id = event_id
 
+        if compaction_mode == "inline":
+            for compaction_index, compaction in enumerate(compactions):
+                events.append(_droid_compaction_state_event(compaction, compaction_index))
+
+        for source_index, source_event in enumerate(bridge.get("source_events") or []):
+            events.append(_droid_bridge_source_event(source_event, source_index, source.get("app") or ""))
+
         jsonl_fd, jsonl_tmp_name = tempfile.mkstemp(prefix=f"{droid_id}.", suffix=".jsonl.tmp", dir=str(sessions_dir))
         jsonl_tmp = Path(jsonl_tmp_name)
         with os.fdopen(jsonl_fd, "w", encoding="utf-8") as handle:
             handle.write("".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events))
-        settings = {
-            "assistantActiveTimeMs": 0,
-            "providerLock": session.get("model") or "",
-            "providerLockTimestamp": session.get("updated_at") or _iso(now),
-            "tokenUsage": {},
-        }
+        settings = _resolve_droid_session_settings(factory_home, session, session.get("updated_at") or _iso(now))
         settings_fd, settings_tmp_name = tempfile.mkstemp(prefix=f"{droid_id}.", suffix=".settings.json.tmp", dir=str(sessions_dir))
         settings_tmp = Path(settings_tmp_name)
         with os.fdopen(settings_fd, "w", encoding="utf-8") as handle:
@@ -1119,7 +2373,7 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True):
             title,
             jsonl_path,
             settings_path,
-            len(bridge.get("messages", [])),
+            len(active_messages),
             cwd=cwd,
             host_id=host_id,
             created_ms=created_ms,

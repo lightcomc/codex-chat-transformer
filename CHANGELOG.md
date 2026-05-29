@@ -22,18 +22,21 @@
 - Droid doctor reports legacy `config.json` model count without failing healthy current `customModels` because legacy BYOK configs can still work.
 
 ### Chat Bridge
-- Added first-slice Codex <-> Droid chat transfer helpers and CLI flags: `--droid-sessions`, `--codex-sessions`, `--droid-to-codex`, `--codex-to-droid`, `--chat-session`, `--chat-fresh-timestamps`, `--chat-skip-system`, and `--chat-pin-old`.
+- Added first-slice Codex <-> Droid chat transfer helpers and CLI flags: `--droid-sessions`, `--codex-sessions`, `--droid-to-codex`, `--codex-to-droid`, `--chat-session`, `--chat-fresh-timestamps`, `--chat-backup`, `--chat-skip-system`, and `--chat-pin-old`.
 - GUI now exposes a Chat Bridge panel for refreshing Droid/Codex session lists and launching Droid -> Codex or Codex -> Droid transfers with confirmation.
-- Droid -> Codex imports create a verified `threads` row + rollout JSONL pair and create a full `.codex` backup before writing.
+- Droid -> Codex imports create a verified `threads` row + rollout JSONL pair; a full `.codex` backup is now opt-in via `--chat-backup`.
 - Chat transfers preserve source timestamps by default, can import as fresh, can omit Codex system messages for Droid export, and record session pairs in `chat_bridge_mappings.json` for future mirror sync.
+- Added read-only `--chat-mapping-plan` to classify stale mappings, metadata drift, and pairs that need a fresh re-export without editing mappings or creating sessions.
 - Codex -> Droid now preserves project `cwd` in Droid project folders and `session-discovery-index.json`; Droid session lookup scans nested project folders for reverse imports.
 - Codex -> Droid timestamp preservation now updates Droid index/file mtimes from the source session instead of making preserved imports look freshly modified.
 - Windows extended path prefixes such as `\\?\C:\...` are normalized before writing Droid project `cwd` values.
 - Codex -> Droid now writes Droid-valid tool calls by converting JSON-string tool inputs into objects and linking messages with `parentId`.
 - Droid -> Codex now preserves Droid `sessionTitle` and project `cwd` from `session_start`.
+- `--chat-compaction-mode archived` is now the default: full visible tool history is transferred while compaction state is archived instead of activated; `raw` remains a legacy alias, and `inline`/`native` opt into active compaction behavior.
+- Codex `reasoning` and Droid `thinking` parts are preserved across Chat Bridge transfers, including OpenAI encrypted reasoning payloads required for native continuation.
 
 ### Tests
-- 109 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, provider health checks, Droid provider management, GUI wiring, and Chat Bridge transfer.
+- 159 smoke tests (was 47), covering sync preview/conflicts, pack import/export, search, history redaction, provider health checks, Droid provider management, GUI wiring, and Chat Bridge transfer.
 
 ## [1.3.0] — 2026-05-25
 

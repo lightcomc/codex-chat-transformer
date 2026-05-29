@@ -161,9 +161,14 @@ python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_I
 python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID
 python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID --chat-skip-system
 python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-fresh-timestamps
+python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-backup
+python codex_chat_transformer.py --chat-mapping-plan --project C:\Research\my_project
+python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID --chat-compaction-mode inline
 ```
 
-Timestamps are preserved by default, including Droid index/file mtimes for Codex -> Droid imports. `--chat-fresh-timestamps` imports the chat as fresh. Droid -> Codex creates a full Codex backup first, then writes the rollout JSONL and `threads` row as a verified pair.
+Timestamps are preserved by default, including Droid index/file mtimes for Codex -> Droid imports. `--chat-fresh-timestamps` imports the chat as fresh. Droid -> Codex writes the rollout JSONL and `threads` row as a verified pair; a full `.codex` backup is created only when `--chat-backup` is passed.
+`--chat-compaction-mode archived` is the default: full visible history, including tool calls and tool results, is transferred while compaction/source events stay only as bridge archive metadata. `raw` is a legacy alias for `archived`. Use `inline` or `native` only when native compaction/continuation state should be active in the destination chat. Codex `reasoning` and Droid `thinking` parts are preserved, including OpenAI encrypted reasoning payloads needed for native continuation.
+`--chat-mapping-plan` is read-only: it classifies mapped pairs as stale, metadata drift, or needing a fresh re-export, prints suggested commands, and does not edit mappings or create sessions.
 
 ### 固定聊天
 

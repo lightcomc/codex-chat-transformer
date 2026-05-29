@@ -143,10 +143,15 @@ T = {
     "codex_to_droid": {"ru": "Codex → Droid", "en": "Codex → Droid"},
     "chat_fresh_timestamps": {"ru": "Импортировать как свежий чат", "en": "Import as fresh chat"},
     "chat_pin_old": {"ru": "Pin старые Droid-чаты", "en": "Pin old Droid chats"},
+    "chat_skip_system": {"ru": "Skip Codex system context", "en": "Skip Codex system context"},
+    "chat_compaction_mode": {"ru": "Compaction", "en": "Compaction"},
+    "chat_mirror_plan": {"ru": "Mirror plan", "en": "Mirror plan"},
+    "chat_mirror_running": {"ru": "Building mirror plan...", "en": "Building mirror plan..."},
+    "chat_mirror_ready": {"ru": "Mirror plan: {pairs} pairs | {statuses}", "en": "Mirror plan: {pairs} pairs | {statuses}"},
     "chat_lists_ready": {"ru": "Droid: {droid}, Codex: {codex}", "en": "Droid: {droid}, Codex: {codex}"},
     "chat_no_droid": {"ru": "Выберите Droid-сессию.", "en": "Select a Droid session."},
     "chat_no_codex": {"ru": "Выберите Codex-сессию.", "en": "Select a Codex session."},
-    "chat_confirm_droid_to_codex": {"ru": "Импортировать Droid-сессию в Codex?\n\nПеред записью будет создан полный backup .codex.", "en": "Import the Droid session into Codex?\n\nA full .codex backup will be created before writing."},
+    "chat_confirm_droid_to_codex": {"ru": "Импортировать Droid-сессию в Codex?\n\nБудет создана новая Codex-сессия.", "en": "Import the Droid session into Codex?\n\nA new Codex session will be created."},
     "chat_confirm_codex_to_droid": {"ru": "Экспортировать Codex-сессию в Droid?\n\nБудет создана новая Droid-сессия.", "en": "Export the Codex session into Droid?\n\nA new Droid session will be created."},
     "chat_transfer_running": {"ru": "Перенос чата...", "en": "Transferring chat..."},
     "chat_imported_codex": {"ru": "Droid → Codex: {session}", "en": "Droid → Codex: {session}"},
@@ -224,7 +229,7 @@ def _get_chat_stats():
 
 def _get_config_info():
     """Read model, reasoning effort, subagent config from config.toml."""
-    info = {"model": "?", "reasoning": "?", "subagent_model": None}
+    info = {"provider": "?", "model": "?", "reasoning": "?", "subagent_model": None}
     cfg = CODEX_DIR / "config.toml"
     if not cfg.exists():
         return info
@@ -232,7 +237,9 @@ def _get_config_info():
         in_multi_agent = False
         for line in f:
             s = line.strip()
-            if s.startswith("model") and "=" in s and not s.startswith("model_"):
+            if s.startswith("model_provider") and "=" in s:
+                info["provider"] = s.split("=", 1)[1].strip().strip('"').strip("'")
+            elif s.startswith("model") and "=" in s and not s.startswith("model_"):
                 info["model"] = s.split("=", 1)[1].strip().strip('"').strip("'")
             elif s.startswith("model_reasoning_effort"):
                 info["reasoning"] = s.split("=", 1)[1].strip().strip('"').strip("'")
@@ -542,6 +549,8 @@ class CodexManagerApp:
         self.chat_codex_var = tk.StringVar()
         self.chat_fresh_var = tk.BooleanVar(value=False)
         self.chat_pin_old_var = tk.BooleanVar(value=True)
+        self.chat_skip_system_var = tk.BooleanVar(value=True)
+        self.chat_compaction_mode_var = tk.StringVar(value="archived")
 
         chat_top = tk.Frame(chat_frame, bg=BG2)
         chat_top.pack(fill="x")
@@ -570,13 +579,27 @@ class CodexManagerApp:
         self.chk_chat_fresh.pack(side="left")
         self.chk_chat_pin_old = ttk.Checkbutton(chat_opts, text=t("chat_pin_old"), variable=self.chat_pin_old_var)
         self.chk_chat_pin_old.pack(side="left", padx=(14, 0))
+        self.chk_chat_skip_system = ttk.Checkbutton(chat_opts, text=t("chat_skip_system"), variable=self.chat_skip_system_var)
+        self.chk_chat_skip_system.pack(side="left", padx=(14, 0))
+        self.lbl_chat_compaction_mode = ttk.Label(chat_opts, text=t("chat_compaction_mode"), style="Stats.TLabel")
+        self.lbl_chat_compaction_mode.pack(side="left", padx=(14, 4))
+        self.chat_compaction_mode_combo = ttk.Combobox(
+            chat_opts,
+            textvariable=self.chat_compaction_mode_var,
+            state="readonly",
+            values=("archived", "inline", "native", "raw"),
+            width=8,
+        )
+        self.chat_compaction_mode_combo.pack(side="left")
 
         chat_buttons = tk.Frame(chat_frame, bg=BG2)
         chat_buttons.pack(fill="x", pady=(6, 0))
         self.btn_droid_to_codex = ttk.Button(chat_buttons, text=t("droid_to_codex"), command=self._chat_droid_to_codex)
         self.btn_droid_to_codex.pack(side="left", expand=True, fill="x", padx=(0, 4))
         self.btn_codex_to_droid = ttk.Button(chat_buttons, text=t("codex_to_droid"), command=self._chat_codex_to_droid)
-        self.btn_codex_to_droid.pack(side="left", expand=True, fill="x")
+        self.btn_codex_to_droid.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self.btn_chat_mirror_plan = ttk.Button(chat_buttons, text=t("chat_mirror_plan"), command=self._chat_mirror_plan)
+        self.btn_chat_mirror_plan.pack(side="left", expand=True, fill="x")
 
         self.chat_status = ttk.Label(chat_frame, text="", style="Stats.TLabel")
         self.chat_status.pack(anchor="w", pady=(6, 0))
@@ -621,8 +644,11 @@ class CodexManagerApp:
         self.lbl_chat_codex.config(text=t("chat_codex_session"))
         self.chk_chat_fresh.config(text=t("chat_fresh_timestamps"))
         self.chk_chat_pin_old.config(text=t("chat_pin_old"))
+        self.chk_chat_skip_system.config(text=t("chat_skip_system"))
+        self.lbl_chat_compaction_mode.config(text=t("chat_compaction_mode"))
         self.btn_droid_to_codex.config(text=t("droid_to_codex"))
         self.btn_codex_to_droid.config(text=t("codex_to_droid"))
+        self.btn_chat_mirror_plan.config(text=t("chat_mirror_plan"))
         self.btn_fixdates.config(text=t("fix_dates"))
         self.btn_edit.config(text=t("edit_provider"))
         self.ctx_menu.entryconfig(0, label=t("ctx_switch"))
@@ -840,25 +866,68 @@ class CodexManagerApp:
             return
         self._start_chat_transfer("codex_to_droid", row)
 
+    def _format_chat_mirror_plan_summary(self, plan):
+        summary = plan.get("summary") or {}
+        statuses = summary.get("statuses") or {}
+        status_text = ", ".join(f"{name}={count}" for name, count in sorted(statuses.items())) or "none"
+        return t("chat_mirror_ready").format(pairs=summary.get("total_pairs", 0), statuses=status_text)
+
+    def _chat_mirror_plan(self):
+        self.status_var.set(t("chat_mirror_running"))
+        self.chat_status.config(text=t("chat_mirror_running"))
+        self._set_buttons_state("disabled")
+        threading.Thread(target=self._chat_mirror_plan_thread, daemon=True).start()
+
+    def _chat_mirror_plan_thread(self):
+        try:
+            factory_home = droid.factory_home_from_settings(None)
+            droid_sessions = chat_bridge.list_droid_sessions(factory_home)
+            codex_sessions = ct._fetch_session_rows()
+            plan = chat_bridge.build_mirror_plan(ct.CODEX_DIR, factory_home, codex_sessions, droid_sessions)
+            selection = chat_bridge.select_mirror_actions(plan, direction="newer")
+            message = self._format_chat_mirror_plan_summary(plan)
+            lines = [
+                message,
+                f"Apply preview: selected={selection.get('summary', {}).get('selected', 0)} skipped={selection.get('summary', {}).get('skipped', 0)}",
+            ]
+            for item in (plan.get("items") or [])[:12]:
+                lines.append(
+                    f"{item.get('status')} | {item.get('action')} | "
+                    f"codex={item.get('codex_session_id') or '-'} | droid={item.get('droid_session_id') or '-'}"
+                )
+            detail = "\n".join(lines)
+            self.root.after(0, lambda: self._chat_mirror_plan_done(message, detail))
+        except Exception as e:
+            error = str(e)
+            self.root.after(0, lambda: self._chat_transfer_failed(error))
+
+    def _chat_mirror_plan_done(self, message, detail):
+        self._set_buttons_state("normal")
+        self.status_var.set(message)
+        self.chat_status.config(text=message)
+        messagebox.showinfo(t("info"), detail)
+
     def _start_chat_transfer(self, direction, item):
         self.status_var.set(t("chat_transfer_running"))
         self.chat_status.config(text=t("chat_transfer_running"))
         self._set_buttons_state("disabled")
         preserve_timestamps = not self.chat_fresh_var.get()
         pin_old = self.chat_pin_old_var.get()
+        skip_system = self.chat_skip_system_var.get()
+        compaction_mode = self.chat_compaction_mode_var.get() or "archived"
         threading.Thread(
             target=self._chat_transfer_thread,
-            args=(direction, item, preserve_timestamps, pin_old),
+            args=(direction, item, preserve_timestamps, pin_old, skip_system, compaction_mode),
             daemon=True,
         ).start()
 
-    def _chat_transfer_thread(self, direction, item, preserve_timestamps=True, pin_old=False):
+    def _chat_transfer_thread(self, direction, item, preserve_timestamps=True, pin_old=False, skip_system=True, compaction_mode="archived"):
         try:
             if direction == "droid_to_codex":
-                summary = self._run_droid_to_codex_transfer(item, preserve_timestamps, pin_old)
+                summary = self._run_droid_to_codex_transfer(item, preserve_timestamps, pin_old, compaction_mode)
                 message = t("chat_imported_codex").format(session=summary["codex_session_id"])
             else:
-                summary = self._run_codex_to_droid_transfer(item, preserve_timestamps)
+                summary = self._run_codex_to_droid_transfer(item, preserve_timestamps, skip_system, compaction_mode)
                 message = t("chat_imported_droid").format(session=summary["droid_session_id"])
             warnings = summary.get("warnings") or []
             detail = message
@@ -869,7 +938,7 @@ class CodexManagerApp:
             error = str(e)
             self.root.after(0, lambda: self._chat_transfer_failed(error))
 
-    def _run_droid_to_codex_transfer(self, session, preserve_timestamps=True, pin_old=False):
+    def _run_droid_to_codex_transfer(self, session, preserve_timestamps=True, pin_old=False, compaction_mode="archived"):
         session_id = session.get("id") or ""
         jsonl_path = Path(session.get("jsonl_path") or (droid.factory_home_from_settings(None) / "sessions" / f"{session_id}.jsonl"))
         settings_path = Path(session.get("settings_path") or jsonl_path.with_suffix(".settings.json"))
@@ -877,7 +946,7 @@ class CodexManagerApp:
             raise ValueError(f"Droid session JSONL not found: {jsonl_path}")
 
         bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path if settings_path.exists() else None)
-        backup_path = ct.full_backup()
+        target_config = ct._chat_import_target_config()
         old_before = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=180)
         summary = chat_bridge.import_bridge_to_codex(
             bridge,
@@ -888,21 +957,24 @@ class CodexManagerApp:
             preserve_timestamps=preserve_timestamps,
             pin_old=pin_old,
             old_before_ms=int(old_before.timestamp() * 1000),
+            compaction_mode=compaction_mode,
+            target_provider=target_config.get("provider"),
+            target_model=target_config.get("model"),
         )
         ct.record_history(
             "chat_bridge_droid_to_codex",
             source="gui",
-            backup_path=str(backup_path),
             details={
                 "sessions": 1,
                 "droid_session_id": session_id,
                 "codex_session_id": summary.get("codex_session_id"),
                 "preserve_timestamps": preserve_timestamps,
+                "compaction_mode": compaction_mode,
             },
         )
         return summary
 
-    def _run_codex_to_droid_transfer(self, row, preserve_timestamps=True):
+    def _run_codex_to_droid_transfer(self, row, preserve_timestamps=True, skip_system=True, compaction_mode="archived"):
         session_id = row.get("id") or ""
         rows = ct._fetch_session_rows(session_ids=[session_id])
         if not rows:
@@ -911,12 +983,13 @@ class CodexManagerApp:
         rollout_path = ct._normalize_rollout_path(row.get("rollout_path"))
         if not rollout_path or not os.path.exists(rollout_path):
             raise ValueError(f"Codex rollout not found: {rollout_path or session_id}")
-        bridge = chat_bridge.codex_session_to_bridge(row, rollout_path)
+        bridge = chat_bridge.codex_session_to_bridge(row, rollout_path, include_system=not skip_system)
         factory_home = droid.factory_home_from_settings(None)
         summary = chat_bridge.import_bridge_to_droid(
             bridge,
             factory_home=factory_home,
             preserve_timestamps=preserve_timestamps,
+            compaction_mode=compaction_mode,
         )
         ct.record_history(
             "chat_bridge_codex_to_droid",
@@ -926,6 +999,8 @@ class CodexManagerApp:
                 "codex_session_id": session_id,
                 "droid_session_id": summary.get("droid_session_id"),
                 "preserve_timestamps": preserve_timestamps,
+                "include_system": not skip_system,
+                "compaction_mode": compaction_mode,
                 "factory_home": str(factory_home),
             },
         )
@@ -1132,7 +1207,8 @@ class CodexManagerApp:
     def _set_buttons_state(self, state):
         for btn in [self.btn_use, self.btn_edit, self.btn_save, self.btn_remove,
                     self.btn_json, self.btn_create, self.btn_backup, self.btn_restore,
-                    self.btn_chat_refresh, self.btn_droid_to_codex, self.btn_codex_to_droid]:
+                    self.btn_chat_refresh, self.btn_droid_to_codex, self.btn_codex_to_droid,
+                    self.btn_chat_mirror_plan]:
             try:
                 btn.config(state=state)
             except Exception:

@@ -161,9 +161,14 @@ python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_I
 python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID
 python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID --chat-skip-system
 python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-fresh-timestamps
+python codex_chat_transformer.py --droid-to-codex --chat-session DROID_SESSION_ID --chat-backup
+python codex_chat_transformer.py --chat-mapping-plan --project C:\Research\my_project
+python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_ID --chat-compaction-mode inline
 ```
 
-Timestamp preservation is the default, including Droid index/file mtimes for Codex -> Droid imports. `--chat-fresh-timestamps` makes the imported chat look new. `--chat-skip-system` omits Codex system messages when exporting to Droid. Droid -> Codex creates a full Codex backup first, then writes the Codex rollout JSONL and `threads` row as a verified pair.
+Timestamp preservation is the default, including Droid index/file mtimes for Codex -> Droid imports. `--chat-fresh-timestamps` makes the imported chat look new. `--chat-skip-system` omits Codex system messages when exporting to Droid. Droid -> Codex writes the Codex rollout JSONL and `threads` row as a verified pair; a full `.codex` backup is created only when `--chat-backup` is passed.
+`--chat-compaction-mode archived` is the default: full visible history, including tool calls and tool results, is transferred while compaction/source events are kept only as bridge archive metadata. `raw` is a legacy alias for `archived`. Use `inline` or `native` only when you explicitly want native compaction/continuation state in the destination chat. Codex `reasoning` and Droid `thinking` parts are preserved, including OpenAI encrypted reasoning payloads needed for native continuation.
+`--chat-mapping-plan` is read-only and classifies mapped pairs as stale, metadata drift, or needing a fresh re-export; it prints suggested commands but does not edit mappings or create sessions.
 
 ### Pin Chats
 
