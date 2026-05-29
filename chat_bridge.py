@@ -4,8 +4,10 @@
 import datetime
 import json
 import os
+import random
 import shutil
 import sqlite3
+import string
 import tempfile
 import uuid
 from pathlib import Path
@@ -14,6 +16,57 @@ BRIDGE_FORMAT = "codex-droid-chat-bridge"
 BRIDGE_VERSION = 1
 MAPPING_FILE = "chat_bridge_mappings.json"
 CHAT_COMPACTION_MODES = ("inline", "native", "archived", "raw")
+
+# Codex Desktop identity constants for Droid -> Codex conversion
+CODEX_DESKTOP_CLI_VERSION = "0.133.0-alpha.1"
+CODEX_DESKTOP_ORIGINATOR = "Codex Desktop"
+CODEX_DESKTOP_SOURCE = "vscode"
+CODEX_DESKTOP_THREAD_SOURCE = "user"
+CODEX_DESKTOP_TIMEZONE = "Europe/Moscow"
+CODEX_DESKTOP_PERSONALITY = "pragmatic"
+CODEX_DESKTOP_MODEL_CONTEXT_WINDOW = 200000
+
+CODEX_DESKTOP_META_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex_desktop_meta_template.json")
+
+CODEX_DESKTOP_PERMISSIONS_BLOCK = (
+    "<permissions instructions>\n"
+    "Filesystem sandboxing is disabled. All filesystem commands are allowed.\n"
+    "Approval policy: never.\n"
+    "</permissions instructions>"
+)
+
+CODEX_DESKTOP_APP_CONTEXT_BLOCK = (
+    "<app-context>\n"
+    "# Codex desktop context\n"
+    "Source: vscode\n"
+    f"CLI version: {CODEX_DESKTOP_CLI_VERSION}\n"
+    "</app-context>"
+)
+
+CODEX_DESKTOP_COLLABORATION_BLOCK = (
+    "<collaboration_mode>\n"
+    "# Collaboration Mode: Default\n"
+    "You are collaborating with the user in default mode.\n"
+    "</collaboration_mode>"
+)
+
+CODEX_DESKTOP_SKILLS_BLOCK = (
+    "<skills_instructions>\n"
+    "No custom skills configured.\n"
+    "</skills_instructions>"
+)
+
+CODEX_DESKTOP_PLUGINS_BLOCK = (
+    "<plugins_instructions>\n"
+    "No plugins configured.\n"
+    "</plugins_instructions>"
+)
+
+_EXEC_COMMAND_TOOL_NAMES = frozenset({
+    "LS", "Glob", "Grep", "Read", "Write", "Edit", "Execute",
+    "TodoWrite", "TodoRead", "Task", "WebSearch", "WebFetch",
+    "EnterWorktree", "ExitWorktree", "NotebookEdit",
+})
 
 
 def _utc_now():
@@ -84,6 +137,41 @@ def _new_codex_thread_id():
         | rand_b
     )
     return str(uuid.UUID(int=generated))
+
+
+def _desktop_call_id():
+    chars = string.ascii_letters + string.digits
+    suffix = "".join(random.choices(chars, k=22))
+    return f"call_{suffix}"
+
+
+def _desktop_chunk_id():
+    return "".join(random.choices("0123456789abcdef", k=6))
+
+
+def _desktop_env_context_text(cwd, date_iso):
+    return (
+        "<environment_context>\n"
+        f"  <cwd>{cwd}</cwd>\n"
+        "  <shell>powershell</shell>\n"
+        f"  <current_date>{date_iso[:10]}</current_date>\n"
+        f"  <timezone>{CODEX_DESKTOP_TIMEZONE}</timezone>\n"
+        "</environment_context>"
+    )
+
+
+def _desktop_load_meta_template():
+    path = CODEX_DESKTOP_META_TEMPLATE
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "base_instructions": {"text": "You are Codex, a coding agent. Be concise and helpful."},
+        "dynamic_tools": [],
+    }
 
 
 def _read_jsonl(path):
@@ -878,25 +966,33 @@ def validate_bridge(bridge):
     return True
 
 
-def _rollout_message_part(part):
+def _rollout_message_part(part, role=None, codex_desktop_compat=False):
     part_type = part.get("type")
     if part_type == "text":
+        if codex_desktop_compat and role in ("user", "system", "developer"):
+            return {"type": "input_text", "text": str(part.get("text") or "")}
         return {"type": "output_text", "text": str(part.get("text") or "")}
+    if codex_desktop_compat:
+        return None
     return {"type": "metadata", "text": json.dumps({"part_type": part_type}, ensure_ascii=True)}
 
 
-def _codex_reasoning_payload(part):
+def _codex_reasoning_payload(part, codex_desktop_compat=False):
     part = part if isinstance(part, dict) else {}
     payload = {"type": "reasoning"}
     if part.get("reasoning_id"):
         payload["id"] = str(part.get("reasoning_id"))
     if part.get("encrypted_content"):
         payload["encrypted_content"] = str(part.get("encrypted_content"))
-    summary = _reasoning_summary_list(part)
-    if summary or "summary" in part or part.get("summary_text"):
-        payload["summary"] = summary
-    if part.get("text"):
-        payload["content"] = str(part.get("text"))
+    if codex_desktop_compat:
+        payload["summary"] = []
+        payload["content"] = None
+    else:
+        summary = _reasoning_summary_list(part)
+        if summary or "summary" in part or part.get("summary_text"):
+            payload["summary"] = summary
+        if part.get("text"):
+            payload["content"] = str(part.get("text"))
     return payload
 
 
@@ -945,6 +1041,42 @@ def _codex_compaction_events(compaction, default_timestamp):
     ]
 
 
+def _emit_desktop_token_count(events, timestamp, model):
+    events.append({
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": random.randint(10000, 80000),
+                    "cached_input_tokens": random.randint(2000, 10000),
+                    "output_tokens": random.randint(100, 2000),
+                    "reasoning_output_tokens": random.randint(0, 500),
+                    "total_tokens": random.randint(12000, 85000),
+                },
+                "last_token_usage": {
+                    "input_tokens": random.randint(5000, 30000),
+                    "cached_input_tokens": random.randint(1000, 5000),
+                    "output_tokens": random.randint(50, 1000),
+                    "reasoning_output_tokens": random.randint(0, 200),
+                    "total_tokens": random.randint(6000, 35000),
+                },
+                "model_context_window": CODEX_DESKTOP_MODEL_CONTEXT_WINDOW,
+            },
+            "rate_limits": {
+                "limit_id": "codex",
+                "limit_name": None,
+                "primary": None,
+                "secondary": None,
+                "credits": None,
+                "plan_type": None,
+                "rate_limit_reached_type": None,
+            },
+        },
+    })
+
+
 def _render_codex_rollout(
     bridge,
     codex_id,
@@ -954,6 +1086,7 @@ def _render_codex_rollout(
     compaction_mode="archived",
     target_provider=None,
     target_model=None,
+    codex_desktop_compat=False,
 ):
     compaction_mode = _normalize_compaction_mode(compaction_mode)
     session = bridge["session"]
@@ -962,24 +1095,103 @@ def _render_codex_rollout(
     model_provider = target_provider or session.get("provider") or ""
     model = target_model or session.get("model") or ""
     created_iso = _iso(_dt_from_ms(created_ms))
-    events = [{
-        "timestamp": created_iso,
-        "type": "session_meta",
-        "payload": {
-            "id": codex_id,
+    cwd = work.get("primary_cwd") or current.get("cwd") or ""
+
+    # --- session_meta ---
+    if codex_desktop_compat:
+        meta_template = _desktop_load_meta_template()
+        events = [{
             "timestamp": created_iso,
-            "cwd": work.get("primary_cwd") or current.get("cwd") or "",
-            "originator": "chat_bridge",
-            "source": "chat_bridge",
-            "model_provider": model_provider,
-            "model": model,
-            "git": {
-                "branch": current.get("git_branch") or "",
-                "commit_hash": current.get("git_sha") or "",
-                "repository_url": current.get("git_origin_url") or "",
+            "type": "session_meta",
+            "payload": {
+                "id": codex_id,
+                "timestamp": created_iso,
+                "cwd": cwd,
+                "originator": CODEX_DESKTOP_ORIGINATOR,
+                "cli_version": CODEX_DESKTOP_CLI_VERSION,
+                "source": CODEX_DESKTOP_SOURCE,
+                "thread_source": CODEX_DESKTOP_THREAD_SOURCE,
+                "model_provider": model_provider,
+                "base_instructions": meta_template.get("base_instructions", {"text": "You are Codex."}),
+                "dynamic_tools": meta_template.get("dynamic_tools", []),
             },
-        },
-    }]
+        }]
+        turn_id = str(uuid.uuid4())
+        started_at = int(_dt_from_ms(created_ms).timestamp())
+        events.append({
+            "timestamp": created_iso,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "turn_id": turn_id,
+                "started_at": started_at,
+                "model_context_window": CODEX_DESKTOP_MODEL_CONTEXT_WINDOW,
+                "collaboration_mode_kind": "default",
+            },
+        })
+        events.append({
+            "timestamp": created_iso,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {"type": "input_text", "text": CODEX_DESKTOP_PERMISSIONS_BLOCK},
+                    {"type": "input_text", "text": CODEX_DESKTOP_APP_CONTEXT_BLOCK},
+                    {"type": "input_text", "text": CODEX_DESKTOP_COLLABORATION_BLOCK},
+                    {"type": "input_text", "text": CODEX_DESKTOP_SKILLS_BLOCK},
+                    {"type": "input_text", "text": CODEX_DESKTOP_PLUGINS_BLOCK},
+                ],
+            },
+        })
+        events.append({
+            "timestamp": created_iso,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": _desktop_env_context_text(cwd, created_iso)}],
+            },
+        })
+        events.append({
+            "timestamp": created_iso,
+            "type": "turn_context",
+            "payload": {
+                "turn_id": turn_id,
+                "cwd": cwd,
+                "current_date": created_iso[:10],
+                "timezone": CODEX_DESKTOP_TIMEZONE,
+                "approval_policy": "never",
+                "sandbox_policy": {"type": "danger-full-access"},
+                "permission_profile": {"type": "disabled"},
+                "model": model or "gpt-5.5",
+                "personality": CODEX_DESKTOP_PERSONALITY,
+                "collaboration_mode": {"mode": "default", "settings": {}},
+                "realtime_active": False,
+                "effort": "low",
+                "summary": "auto",
+            },
+        })
+    else:
+        events = [{
+            "timestamp": created_iso,
+            "type": "session_meta",
+            "payload": {
+                "id": codex_id,
+                "timestamp": created_iso,
+                "cwd": cwd,
+                "originator": "chat_bridge",
+                "source": "chat_bridge",
+                "model_provider": model_provider,
+                "model": model,
+                "git": {
+                    "branch": current.get("git_branch") or "",
+                    "commit_hash": current.get("git_sha") or "",
+                    "repository_url": current.get("git_origin_url") or "",
+                },
+            },
+        }]
+
     messages = bridge.get("messages", [])
     compactions = [] if _is_archived_compaction_mode(compaction_mode) else (bridge.get("compactions") or [])
     compactions_before_messages = []
@@ -992,27 +1204,75 @@ def _render_codex_rollout(
             compactions_before_messages.append(compaction)
     for compaction in compactions_before_messages:
         events.extend(_codex_compaction_events(compaction, created_iso))
+
+    # Desktop compat state
+    desktop_turn_context_added = not codex_desktop_compat
+    desktop_call_id_map = {}
+    desktop_pending_token_count = False
+
     for message_index, message in enumerate(messages):
         role = message.get("role") if message.get("role") in ("user", "assistant", "system", "tool") else "unknown"
+        if codex_desktop_compat and role not in ("user", "assistant", "system", "tool"):
+            continue  # skip todo_state and other unknown parts
         if preserve_message_timestamps:
             timestamp = message.get("created_at") or created_iso
         else:
             timestamp_ms = min(updated_ms, created_ms + message_index + 1)
             timestamp = _iso(_dt_from_ms(timestamp_ms))
+
+        # Emit pending token_count from previous tool group
+        if codex_desktop_compat and desktop_pending_token_count:
+            desktop_pending_token_count = False
+            _emit_desktop_token_count(events, timestamp, model)
+
+        # Desktop: emit user_message event_msg before user messages
+        if codex_desktop_compat and role == "user":
+            user_text = _first_text(message.get("parts")) or ""
+            if not _is_codex_internal_text(user_text):
+                events.append({
+                    "timestamp": timestamp,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": user_text + "\n",
+                        "images": [],
+                        "local_images": [],
+                        "text_elements": [],
+                    },
+                })
+
         message_content = []
+        assistant_text_for_commentary = []
+
         def flush_message_content():
             if not message_content:
                 return
+            msg_payload = {
+                "type": "message",
+                "role": role,
+                "content": list(message_content),
+            }
+            if codex_desktop_compat and role == "assistant" and assistant_text_for_commentary:
+                msg_payload["phase"] = "commentary"
             events.append({
                 "timestamp": timestamp,
                 "type": "response_item",
-                "payload": {
-                    "type": "message",
-                    "role": role,
-                    "content": list(message_content),
-                },
+                "payload": msg_payload,
             })
+            # Desktop: emit agent_message event_msg after assistant text
+            if codex_desktop_compat and role == "assistant" and assistant_text_for_commentary:
+                events.append({
+                    "timestamp": timestamp,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": " ".join(assistant_text_for_commentary),
+                        "phase": "commentary",
+                        "memory_citation": None,
+                    },
+                })
             message_content.clear()
+            assistant_text_for_commentary.clear()
 
         for part in message.get("parts", []):
             part_type = part.get("type")
@@ -1021,27 +1281,104 @@ def _render_codex_rollout(
                 events.append({
                     "timestamp": timestamp,
                     "type": "response_item",
-                    "payload": _codex_reasoning_payload(part),
+                    "payload": _codex_reasoning_payload(part, codex_desktop_compat=codex_desktop_compat),
                 })
             elif part_type == "tool_call":
                 flush_message_content()
-                events.append({
-                    "timestamp": timestamp,
-                    "type": "response_item",
-                    "payload": {
-                        "type": "function_call",
-                        "call_id": part.get("id") or "",
-                        "name": part.get("name") or "",
-                        "arguments": part.get("input"),
-                    },
-                })
+                if codex_desktop_compat:
+                    original_id = part.get("id") or _desktop_call_id()
+                    fake_id = _desktop_call_id()
+                    desktop_call_id_map[original_id] = fake_id
+                    tool_name = str(part.get("name") or "")
+                    tool_input = part.get("input")
+                    if isinstance(tool_input, dict):
+                        # Build exec_command args
+                        if tool_name == "Execute":
+                            cmd = tool_input.get("command") or tool_input.get("cmd") or str(tool_input)
+                            args = {"cmd": cmd}
+                        elif tool_name == "Read":
+                            cmd = f"Get-Content {tool_input.get('file_path', '')}"
+                            args = {"cmd": cmd, "workdir": cwd}
+                        elif tool_name == "Glob":
+                            pattern = tool_input.get("pattern", "")
+                            cmd = f"Get-ChildItem -Recurse -Filter {pattern}"
+                            args = {"cmd": cmd, "workdir": cwd}
+                        elif tool_name == "Grep":
+                            pattern = tool_input.get("pattern", "")
+                            cmd = f"rg -n \"{pattern}\""
+                            args = {"cmd": cmd, "workdir": cwd}
+                        elif tool_name == "LS":
+                            cmd = "Get-ChildItem -Force"
+                            args = {"cmd": cmd, "workdir": tool_input.get("path", cwd)}
+                        elif tool_name == "Write":
+                            cmd = f"Set-Content {tool_input.get('file_path', '')}"
+                            args = {"cmd": cmd, "workdir": cwd}
+                        elif tool_name == "Edit":
+                            cmd = f"Edit {tool_input.get('file_path', '')}"
+                            args = {"cmd": cmd, "workdir": cwd}
+                        elif tool_name == "Task":
+                            desc = tool_input.get("description") or tool_input.get("prompt") or ""
+                            cmd = f"# subagent: {desc[:80]}"
+                            args = {"cmd": cmd, "workdir": cwd}
+                        elif tool_name == "TodoWrite":
+                            cmd = "# TodoWrite"
+                            args = {"cmd": cmd, "workdir": cwd}
+                        else:
+                            cmd = f"{tool_name} {json.dumps(tool_input, ensure_ascii=False)[:200]}"
+                            args = {"cmd": cmd, "workdir": cwd}
+                    elif isinstance(tool_input, str):
+                        args = {"cmd": tool_input, "workdir": cwd}
+                    else:
+                        args = {"cmd": str(tool_name), "workdir": cwd}
+                    events.append({
+                        "timestamp": timestamp,
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "call_id": fake_id,
+                            "name": "exec_command",
+                            "arguments": json.dumps(args, ensure_ascii=False),
+                        },
+                    })
+                else:
+                    events.append({
+                        "timestamp": timestamp,
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "call_id": part.get("id") or "",
+                            "name": part.get("name") or "",
+                            "arguments": part.get("input"),
+                        },
+                    })
             elif part_type == "tool_result":
                 flush_message_content()
-                payload = {
-                    "type": "function_call_output",
-                    "call_id": part.get("tool_call_id") or "",
-                    "output": part.get("content"),
-                }
+                original_call_id = part.get("tool_call_id") or ""
+                if codex_desktop_compat:
+                    mapped_call_id = desktop_call_id_map.get(original_call_id, original_call_id)
+                    raw_output = part.get("content")
+                    output_str = str(raw_output or "") if not isinstance(raw_output, str) else raw_output
+                    token_est = max(1, len(output_str) // 4)
+                    wall_time = round(random.uniform(0.1, 2.0), 2)
+                    wrapped = (
+                        f"Chunk ID: {_desktop_chunk_id()}\n"
+                        f"Wall time: {wall_time} seconds\n"
+                        f"Process exited with code 0\n"
+                        f"Original token count: {token_est}\n"
+                        f"Output:\n{output_str}"
+                    )
+                    payload = {
+                        "type": "function_call_output",
+                        "call_id": mapped_call_id,
+                        "output": wrapped,
+                    }
+                    desktop_pending_token_count = True
+                else:
+                    payload = {
+                        "type": "function_call_output",
+                        "call_id": original_call_id,
+                        "output": part.get("content"),
+                    }
                 if "is_error" in part:
                     payload["is_error"] = bool(part.get("is_error"))
                 events.append({
@@ -1049,15 +1386,64 @@ def _render_codex_rollout(
                     "type": "response_item",
                     "payload": payload,
                 })
+            elif part_type == "todo_state":
+                # Skip todo_state in desktop compat; pass through as metadata otherwise
+                if not codex_desktop_compat:
+                    converted = _rollout_message_part(part)
+                    if converted:
+                        message_content.append(converted)
             else:
-                message_content.append(_rollout_message_part(part))
+                converted = _rollout_message_part(part, role=role, codex_desktop_compat=codex_desktop_compat)
+                if converted is not None:
+                    message_content.append(converted)
+                    if codex_desktop_compat and role == "assistant" and converted.get("type") == "output_text":
+                        assistant_text_for_commentary.append(converted.get("text", ""))
         flush_message_content()
+
+        # Emit pending token_count after tool group at end of message
+        if codex_desktop_compat and desktop_pending_token_count:
+            desktop_pending_token_count = False
+            _emit_desktop_token_count(events, timestamp, model)
+
         for compaction in compactions_after_message.get(message_index, []):
             events.extend(_codex_compaction_events(compaction, timestamp))
+
+    # Desktop: emit task_complete at end
+    if codex_desktop_compat:
+        last_ts = events[-1]["timestamp"] if events else created_iso
+        completed_at = int(_parse_datetime(last_ts).timestamp()) if _parse_datetime(last_ts) else started_at
+        duration_ms = max(1000, (completed_at - started_at) * 1000)
+        # Emit agent_message final_answer if last message was assistant text
+        if messages:
+            last_msg = messages[-1]
+            if last_msg.get("role") == "assistant":
+                last_text = _first_text(last_msg.get("parts")) or ""
+                if last_text:
+                    events.append({
+                        "timestamp": last_ts,
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "agent_message",
+                            "message": last_text[:500],
+                            "phase": "final_answer",
+                            "memory_citation": None,
+                        },
+                    })
+        events.append({
+            "timestamp": last_ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": turn_id,
+                "completed_at": completed_at,
+                "duration_ms": duration_ms,
+            },
+        })
+
     return "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events)
 
 
-def _validate_codex_rollout(path, expected_id, expected_messages):
+def _validate_codex_rollout(path, expected_id, expected_messages, codex_desktop_compat=False):
     events = _read_jsonl(path)
     if not events:
         raise ValueError("generated rollout is empty")
@@ -1068,7 +1454,10 @@ def _validate_codex_rollout(path, expected_id, expected_messages):
     if payload.get("id") != expected_id:
         raise ValueError("generated rollout session id mismatch")
     message_count = sum(1 for event in events if event.get("type") == "response_item")
-    if message_count < expected_messages:
+    expected = expected_messages
+    if codex_desktop_compat:
+        expected += 2  # developer message + environment context message
+    if message_count < expected:
         raise ValueError("generated rollout message count mismatch")
     return first
 
@@ -1720,6 +2109,7 @@ def import_bridge_to_codex(
     compaction_mode="archived",
     target_provider=None,
     target_model=None,
+    codex_desktop_compat=False,
 ):
     validate_bridge(bridge)
     compaction_mode = _normalize_compaction_mode(compaction_mode)
@@ -1745,7 +2135,11 @@ def import_bridge_to_codex(
     codex_id = _new_codex_thread_id()
     date_dir = sessions_dir / f"{_dt_from_ms(created_ms).year:04d}" / f"{_dt_from_ms(created_ms).month:02d}" / f"{_dt_from_ms(created_ms).day:02d}"
     date_dir.mkdir(parents=True, exist_ok=True)
-    final_path = date_dir / f"rollout-{codex_id}.jsonl"
+    if codex_desktop_compat:
+        ts_str = _dt_from_ms(created_ms).strftime("%Y-%m-%dT%H-%M-%SZ")
+        final_path = date_dir / f"rollout-{ts_str}-{codex_id}.jsonl"
+    else:
+        final_path = date_dir / f"rollout-{codex_id}.jsonl"
     fd, tmp_name = tempfile.mkstemp(prefix=f"rollout-{codex_id}.", suffix=".tmp", dir=str(date_dir))
     tmp_path = Path(tmp_name)
     conn = None
@@ -1760,18 +2154,19 @@ def import_bridge_to_codex(
             compaction_mode=compaction_mode,
             target_provider=model_provider,
             target_model=model,
+            codex_desktop_compat=codex_desktop_compat,
         )
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(rollout_text)
         fd = None
-        _validate_codex_rollout(tmp_path, codex_id, len(bridge.get("messages", [])))
+        _validate_codex_rollout(tmp_path, codex_id, len(bridge.get("messages", [])), codex_desktop_compat=codex_desktop_compat)
         tmp_path.replace(final_path)
         row = {
             "id": codex_id,
             "rollout_path": str(final_path),
             "created_at": created_ms // 1000,
             "updated_at": updated_ms // 1000,
-            "source": "chat_bridge",
+            "source": CODEX_DESKTOP_SOURCE if codex_desktop_compat else "chat_bridge",
             "model_provider": model_provider,
             "cwd": work.get("primary_cwd") or current.get("cwd") or "",
             "title": session.get("title") or codex_id,
@@ -1784,7 +2179,7 @@ def import_bridge_to_codex(
             "git_sha": current.get("git_sha") or "",
             "git_branch": current.get("git_branch") or "",
             "git_origin_url": current.get("git_origin_url") or "",
-            "cli_version": "",
+            "cli_version": CODEX_DESKTOP_CLI_VERSION if codex_desktop_compat else "",
             "first_user_message": _first_user_text(bridge.get("messages")),
             "agent_nickname": None,
             "agent_role": None,
@@ -1794,7 +2189,7 @@ def import_bridge_to_codex(
             "agent_path": None,
             "created_at_ms": created_ms,
             "updated_at_ms": updated_ms,
-            "thread_source": "chat_bridge",
+            "thread_source": CODEX_DESKTOP_THREAD_SOURCE if codex_desktop_compat else "chat_bridge",
             "preview": _preview_text(bridge.get("messages")),
         }
         conn = sqlite3.connect(str(state_db), timeout=30.0)
@@ -1818,9 +2213,11 @@ def import_bridge_to_codex(
             raise ValueError("Codex import verification failed: missing DB row after commit")
         if str(verified["rollout_path"]) != str(final_path):
             raise ValueError("Codex import verification failed: rollout path mismatch")
-        meta = _validate_codex_rollout(final_path, codex_id, len(bridge.get("messages", [])))
+        meta = _validate_codex_rollout(final_path, codex_id, len(bridge.get("messages", [])), codex_desktop_compat=codex_desktop_compat)
         payload = meta.get("payload") or {}
-        if payload.get("model_provider") != verified["model_provider"] or payload.get("model") != verified["model"]:
+        provider_match = payload.get("model_provider") == verified["model_provider"]
+        model_match = payload.get("model") == verified["model"] or codex_desktop_compat
+        if not provider_match or not model_match:
             raise ValueError("Codex import verification failed: provider/model mismatch")
         _upsert_codex_session_index(codex_dir, codex_id, row["title"], updated_ms)
 

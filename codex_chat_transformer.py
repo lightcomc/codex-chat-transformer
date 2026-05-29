@@ -2764,6 +2764,7 @@ def _apply_chat_mirror_actions(
                 compaction_mode=compaction_mode,
                 target_provider=target_config.get("provider"),
                 target_model=target_config.get("model"),
+                codex_desktop_compat=True,
             )
             result = {"direction": direction, "source_id": session_id, "target_id": summary.get("codex_session_id"), "summary": summary}
             results.append(result)
@@ -2916,6 +2917,7 @@ def handle_chat_bridge_command(args):
                     compaction_mode=compaction_mode,
                     target_provider=target_config.get("provider"),
                     target_model=target_config.get("model"),
+                    codex_desktop_compat=True,
                 )
                 imported.append(summary)
                 print(f"  {session_id} -> {summary['codex_session_id']} | pinned={summary['pinned']}")

@@ -960,6 +960,7 @@ class CodexManagerApp:
             compaction_mode=compaction_mode,
             target_provider=target_config.get("provider"),
             target_model=target_config.get("model"),
+            codex_desktop_compat=True,
         )
         ct.record_history(
             "chat_bridge_droid_to_codex",
