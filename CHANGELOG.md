@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.0] - 2026-05-29
+
+### Codex Desktop Identity
+- Droid -> Codex conversion now produces structurally identical Codex Desktop rollouts (`codex_desktop_compat`): `session_meta`, `task_started`/`task_complete` lifecycle, `turn_context`, developer environment message, `exec_command` tool wrapping, Chunk ID/Wall time output, and `encrypted_content`-only reasoning.
+- Subagent (Droid "Task" tool) calls are converted to `multi_agent_v1` namespace: `tool_search_call` -> `spawn_agent` -> `wait_agent` -> `close_agent` with synthetic agent IDs and commentary.
+- Provider/model from active `config.toml` is used in both the Codex rollout `session_meta` and `threads` database row for Droid -> Codex, and in Droid `providerLock`/model for Codex -> Droid.
+- `codex_desktop_meta_template.json` provides real `base_instructions` and `dynamic_tools`; falls back to a minimal prompt when the file is absent.
+
 ## [1.4.0] - 2026-05-25
 
 ### Sync hardening

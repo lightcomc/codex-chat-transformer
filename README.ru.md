@@ -170,6 +170,29 @@ python codex_chat_transformer.py --codex-to-droid --chat-session CODEX_SESSION_I
 `--chat-compaction-mode archived` теперь режим по умолчанию: переносится вся видимая история, включая tool calls и tool results, а compaction/source events остаются только архивными bridge-метаданными. `raw` - legacy alias для `archived`. `inline` и `native` стоит включать только когда нужно явно создать native compaction/continuation state в целевом чате. Codex `reasoning` и Droid `thinking` теперь сохраняются, включая OpenAI encrypted reasoning payloads, которые нужны для native continuation.
 `--chat-mapping-plan` работает только на чтение: классифицирует пары как stale, metadata drift или requiring fresh re-export, печатает рекомендованные команды, но не меняет mapping и не создает сессии.
 
+#### Режим идентификации Codex Desktop
+
+При конвертации Droid -> Codex мост создаёт rollout, структурно идентичные реальным сессиям Codex Desktop (`codex_desktop_compat`). Этот режим включён по умолчанию для всех трансферов Droid -> Codex.
+
+**Что конвертируется:**
+- `session_meta` с корректными `originator`, `cli_version`, `source`, `model_provider`, `base_instructions`, `dynamic_tools`
+- Полный жизненный цикл событий: `task_started` -> `user_message` / `agent_message` / `token_count` -> `task_complete`
+- `turn_context` перед каждым ответом ассистента
+- Developer-сообщение с контекстом окружения (CWD, дата, часовой пояс)
+- Все вызовы инструментов обёрнуты в `exec_command` с JSON-аргументами
+- Вывод инструментов обёрнут в `Chunk ID` / `Wall time` / `Process exited with code 0`
+- Reasoning как `encrypted_content`-only с `summary: []`, `content: null`
+- Сабагенты (Droid "Task") конвертируются в пространство имён `multi_agent_v1`: `tool_search_call` -> `spawn_agent` -> `wait_agent` -> `close_agent`
+
+**Привязка провайдера/модели:**
+- Droid -> Codex: использует активный провайдер/модель из `config.toml` как `model_provider` в rollout `session_meta` и строке БД `threads`
+- Codex -> Droid: использует активный провайдер/модель из `config.toml` для `providerLock` и выбора модели Droid-сессии
+
+**Известные ограничения:**
+- `base_instructions` и `dynamic_tools` берутся из `codex_desktop_meta_template.json` (при наличии) или из минимального fallback-промпта
+- `encrypted_content` в reasoning — синтетический (base64-заполнитель), не настоящий зашифрованный reasoning
+- Результаты сабагентов приблизительны — prompt Droid Task становится `spawn_agent` message, результат Task становится `wait_agent` output
+
 ### Закрепление чатов
 
 Делает чаты видимыми при **любом** подключении. Pinned-чаты показываются всегда, независимо от провайдера. Используется для реактивации чатов при переходе между провайдерами.

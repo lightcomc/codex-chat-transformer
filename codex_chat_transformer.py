@@ -1234,7 +1234,7 @@ def export_pack(zip_file, scope="all", provider_names=None, session_ids=None, wi
         "version": 1,
         "scope": scope,
         "without_keys": bool(without_keys),
-        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         "provider_count": len(provider_entries),
         "session_count": len(session_entries),
     }
@@ -2499,6 +2499,15 @@ _CHAT_MAPPING_STRUCTURAL_CODES = {
 }
 
 
+def _chat_mapping_has_error_structural_issue(issues):
+    return any(
+        issue.get("code") in _CHAT_MAPPING_STRUCTURAL_CODES
+        and issue.get("severity") == "error"
+        for issue in issues or []
+        if isinstance(issue, dict)
+    )
+
+
 def _build_chat_mapping_plan(chat_bridge, factory_home, session_ids=None, project=None, include_system=True, compaction_mode="archived"):
     mirror_plan = _build_chat_mirror_plan(chat_bridge, factory_home, project=project)
     doctor = _build_chat_bridge_doctor_report(
@@ -2540,7 +2549,7 @@ def _build_chat_mapping_plan(chat_bridge, factory_home, session_ids=None, projec
         elif any(str(code or "").endswith("_unreadable") for code in issue_set):
             status = "source_unreadable"
             recommended_action = "inspect_source_files"
-        elif issue_set & _CHAT_MAPPING_STRUCTURAL_CODES:
+        elif _chat_mapping_has_error_structural_issue(issues):
             status = "needs_reexport"
             if source_app == "droid":
                 recommended_action = "create_fresh_codex_copy"
@@ -2737,6 +2746,8 @@ def _apply_chat_mirror_actions(
                 factory_home=factory_home,
                 preserve_timestamps=preserve_timestamps,
                 compaction_mode=compaction_mode,
+                target_provider=target_config.get("provider"),
+                target_model=target_config.get("model"),
             )
             result = {"direction": direction, "source_id": session_id, "target_id": summary.get("droid_session_id"), "summary": summary}
             results.append(result)
@@ -2932,6 +2943,7 @@ def handle_chat_bridge_command(args):
             rows = _fetch_session_rows(session_ids=ids)
             row_map = {row.get("id"): row for row in rows}
             imported = []
+            target_config = _chat_import_target_config()
             for session_id in ids:
                 row = row_map.get(session_id)
                 if not row:
@@ -2947,6 +2959,8 @@ def handle_chat_bridge_command(args):
                     factory_home=factory_home,
                     preserve_timestamps=preserve_timestamps,
                     compaction_mode=compaction_mode,
+                    target_provider=target_config.get("provider"),
+                    target_model=target_config.get("model"),
                 )
                 imported.append(summary)
                 print(f"  {session_id} -> {summary['droid_session_id']}")

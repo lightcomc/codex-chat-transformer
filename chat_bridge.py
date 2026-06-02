@@ -5,6 +5,7 @@ import datetime
 import json
 import os
 import random
+import re
 import shutil
 import sqlite3
 import string
@@ -373,6 +374,39 @@ def _bridge_source_event(event, event_index, timestamp_default, represented_by="
     }
 
 
+def _bridge_source_app(source_event, fallback=""):
+    source_event = source_event if isinstance(source_event, dict) else {}
+    return str(source_event.get("source_app") or source_event.get("source") or fallback or "")
+
+
+def _source_events_for_replay(bridge, target_app):
+    bridge = bridge if isinstance(bridge, dict) else {}
+    source = bridge.get("source") if isinstance(bridge.get("source"), dict) else {}
+    bridge_source_app = str(source.get("app") or "")
+    target_app = str(target_app or "")
+    replay = []
+    for order, source_event in enumerate(bridge.get("source_events") or []):
+        if not isinstance(source_event, dict) or not isinstance(source_event.get("raw"), dict):
+            continue
+        event_source_app = _bridge_source_app(source_event, bridge_source_app if bridge_source_app == target_app else "")
+        if event_source_app != target_app:
+            continue
+        replay.append((order, source_event))
+    return [source_event for _, source_event in sorted(replay, key=lambda item: (_int_or_default(item[1].get("index"), item[0]), item[0]))]
+
+
+def _copy_raw_events_for_replay(bridge, target_app, first_type):
+    raw_events = []
+    for source_event in _source_events_for_replay(bridge, target_app):
+        raw = source_event.get("raw")
+        if not isinstance(raw, dict):
+            continue
+        raw_events.append(json.loads(json.dumps(raw)))
+    if not raw_events or raw_events[0].get("type") != first_type:
+        return []
+    return raw_events
+
+
 def _int_or_default(value, default):
     try:
         return int(value)
@@ -548,6 +582,7 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
             archived_source_events.append({
                 "index": _int_or_default(event.get("sourceIndex"), event_index),
                 "timestamp": _iso(_parse_datetime(event_ts) or _utc_now()),
+                "source_app": str(event.get("source") or ""),
                 "outer_type": str(event.get("outerType") or ""),
                 "payload_type": str(event.get("payloadType") or ""),
                 "represented_by": str(event.get("representedBy") or ""),
@@ -747,6 +782,7 @@ def codex_session_to_bridge(row, rollout_path, include_system=True):
     snapshots = []
     raw_event_refs = []
     source_events = []
+    archived_source_events = []
     compactions = []
     last_token_count = None
     pending_compaction_index = None
@@ -757,6 +793,18 @@ def codex_session_to_bridge(row, rollout_path, include_system=True):
         payload_type = payload.get("type") or event.get("type")
         timestamp = event.get("timestamp") or payload.get("timestamp") or _iso(_dt_from_ms(created_ms))
         source_event = _bridge_source_event(event, event_index, timestamp)
+
+        if payload_type == "bridge_source_events":
+            archive_source_app = str(payload.get("source_app") or payload.get("source") or "")
+            archived = payload.get("events") if isinstance(payload.get("events"), list) else []
+            for archived_event in archived:
+                if not isinstance(archived_event, dict):
+                    continue
+                restored = json.loads(json.dumps(archived_event))
+                if archive_source_app and not _bridge_source_app(restored):
+                    restored["source_app"] = archive_source_app
+                archived_source_events.append(restored)
+            continue
 
         if payload_type == "token_count":
             token_count = _codex_token_count_payload(payload)
@@ -909,7 +957,7 @@ def codex_session_to_bridge(row, rollout_path, include_system=True):
         "messages": messages,
         "extras": {},
         "raw_event_refs": raw_event_refs,
-        "source_events": source_events,
+        "source_events": archived_source_events if archived_source_events else source_events,
         "compactions": compactions,
     }
     validate_bridge(bridge)
@@ -1041,6 +1089,37 @@ def _codex_compaction_events(compaction, default_timestamp):
     ]
 
 
+def _codex_bridge_source_events_event(source_events, timestamp, source_app):
+    archived = [event for event in (source_events or []) if isinstance(event, dict)]
+    if not archived:
+        return None
+    return {
+        "timestamp": _iso(_parse_datetime(timestamp) or _utc_now()),
+        "type": "event_msg",
+        "payload": {
+            "type": "bridge_source_events",
+            "source": str(source_app or ""),
+            "events": archived,
+        },
+    }
+
+
+def _render_codex_raw_replay(bridge, codex_id, created_ms, target_provider=None, target_model=None):
+    events = _copy_raw_events_for_replay(bridge, "codex", "session_meta")
+    if not events:
+        return ""
+    created_iso = _iso(_dt_from_ms(created_ms))
+    first = events[0]
+    payload = first.get("payload") if isinstance(first.get("payload"), dict) else {}
+    first["payload"] = payload
+    payload["id"] = codex_id
+    payload.setdefault("timestamp", created_iso)
+    first.setdefault("timestamp", payload.get("timestamp") or created_iso)
+    payload["model_provider"] = str(target_provider or payload.get("model_provider") or "")
+    payload["model"] = str(target_model or payload.get("model") or "")
+    return "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events)
+
+
 def _emit_desktop_token_count(events, timestamp, model):
     events.append({
         "timestamp": timestamp,
@@ -1089,6 +1168,7 @@ def _render_codex_rollout(
     codex_desktop_compat=False,
 ):
     compaction_mode = _normalize_compaction_mode(compaction_mode)
+    source = bridge.get("source") if isinstance(bridge.get("source"), dict) else {}
     session = bridge["session"]
     work = bridge.get("work_context") if isinstance(bridge.get("work_context"), dict) else {}
     current = work.get("current") if isinstance(work.get("current"), dict) else {}
@@ -1112,6 +1192,7 @@ def _render_codex_rollout(
                 "source": CODEX_DESKTOP_SOURCE,
                 "thread_source": CODEX_DESKTOP_THREAD_SOURCE,
                 "model_provider": model_provider,
+                "model": model or "gpt-5.5",
                 "base_instructions": meta_template.get("base_instructions", {"text": "You are Codex."}),
                 "dynamic_tools": meta_template.get("dynamic_tools", []),
             },
@@ -1209,6 +1290,9 @@ def _render_codex_rollout(
     desktop_turn_context_added = not codex_desktop_compat
     desktop_call_id_map = {}
     desktop_pending_token_count = False
+    desktop_tool_search_emitted = False
+    desktop_task_agents = {}  # original_call_id -> {agent_id, nickname, call_id}
+    desktop_apply_patch_calls = {}  # mapped_call_id -> patch_input (str)
 
     for message_index, message in enumerate(messages):
         role = message.get("role") if message.get("role") in ("user", "assistant", "system", "tool") else "unknown"
@@ -1295,17 +1379,45 @@ def _render_codex_rollout(
                         # Build exec_command args
                         if tool_name == "Execute":
                             cmd = tool_input.get("command") or tool_input.get("cmd") or str(tool_input)
-                            args = {"cmd": cmd}
+                            summary_text = str(tool_input.get("summary") or "").strip()
+                            if summary_text:
+                                events.append({
+                                    "timestamp": timestamp,
+                                    "type": "event_msg",
+                                    "payload": {
+                                        "type": "agent_message",
+                                        "message": summary_text,
+                                        "phase": "commentary",
+                                        "memory_citation": None,
+                                    },
+                                })
+                                events.append({
+                                    "timestamp": timestamp,
+                                    "type": "response_item",
+                                    "payload": {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": summary_text}],
+                                        "phase": "commentary",
+                                    },
+                                })
+                            args = {"cmd": cmd, "workdir": cwd}
                         elif tool_name == "Read":
                             cmd = f"Get-Content {tool_input.get('file_path', '')}"
                             args = {"cmd": cmd, "workdir": cwd}
                         elif tool_name == "Glob":
                             pattern = tool_input.get("pattern", "")
+                            glob_path = tool_input.get("path", "")
                             cmd = f"Get-ChildItem -Recurse -Filter {pattern}"
+                            if glob_path:
+                                cmd += f" {glob_path}"
                             args = {"cmd": cmd, "workdir": cwd}
                         elif tool_name == "Grep":
                             pattern = tool_input.get("pattern", "")
+                            grep_path = tool_input.get("path", "")
                             cmd = f"rg -n \"{pattern}\""
+                            if grep_path:
+                                cmd += f" {grep_path}"
                             args = {"cmd": cmd, "workdir": cwd}
                         elif tool_name == "LS":
                             cmd = "Get-ChildItem -Force"
@@ -1318,11 +1430,163 @@ def _render_codex_rollout(
                             args = {"cmd": cmd, "workdir": cwd}
                         elif tool_name == "Task":
                             desc = tool_input.get("description") or tool_input.get("prompt") or ""
-                            cmd = f"# subagent: {desc[:80]}"
-                            args = {"cmd": cmd, "workdir": cwd}
+                            agent_nickname = random.choice(["Averroes", "Maimonides", "Avicenna", "Alhazen", "Rhazes"])
+                            agent_id = str(uuid.uuid4())
+                            # Emit tool_search_call + tool_search_output once
+                            if not desktop_tool_search_emitted:
+                                desktop_tool_search_emitted = True
+                                search_call_id = _desktop_call_id()
+                                events.append({
+                                    "timestamp": timestamp,
+                                    "type": "response_item",
+                                    "payload": {
+                                        "type": "tool_search_call",
+                                        "call_id": search_call_id,
+                                        "status": "completed",
+                                        "execution": "client",
+                                        "arguments": {
+                                            "query": "subagent spawn manage agents parallel",
+                                            "limit": 5,
+                                        },
+                                    },
+                                })
+                                events.append({
+                                    "timestamp": timestamp,
+                                    "type": "response_item",
+                                    "payload": {
+                                        "type": "tool_search_output",
+                                        "call_id": search_call_id,
+                                        "status": "completed",
+                                        "execution": "client",
+                                        "tools": [{
+                                            "type": "namespace",
+                                            "name": "multi_agent_v1",
+                                            "description": "Tools for spawning and managing sub-agents.",
+                                            "tools": [
+                                                {"type": "function", "name": "spawn_agent", "description": "Spawn a sub-agent."},
+                                                {"type": "function", "name": "wait_agent", "description": "Wait for sub-agent completion."},
+                                                {"type": "function", "name": "close_agent", "description": "Close a sub-agent."},
+                                            ],
+                                        }],
+                                    },
+                                })
+                                _emit_desktop_token_count(events, timestamp, model)
+                            # Emit commentary
+                            commentary_text = f"Запускаю сабагента `{agent_nickname}` для: {desc[:120]}"
+                            events.append({
+                                "timestamp": timestamp,
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "agent_message",
+                                    "message": commentary_text,
+                                    "phase": "commentary",
+                                    "memory_citation": None,
+                                },
+                            })
+                            events.append({
+                                "timestamp": timestamp,
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": commentary_text}],
+                                    "phase": "commentary",
+                                },
+                            })
+                            # spawn_agent call
+                            spawn_call_id = _desktop_call_id()
+                            desktop_call_id_map[original_id] = spawn_call_id
+                            spawn_args = {
+                                "agent_type": "explorer",
+                                "fork_context": False,
+                                "message": desc,
+                            }
+                            events.append({
+                                "timestamp": timestamp,
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "function_call",
+                                    "call_id": spawn_call_id,
+                                    "name": "spawn_agent",
+                                    "namespace": "multi_agent_v1",
+                                    "arguments": json.dumps(spawn_args, ensure_ascii=False),
+                                },
+                            })
+                            # spawn_agent output with agent_id
+                            spawn_output = json.dumps({"agent_id": agent_id, "nickname": agent_nickname})
+                            events.append({
+                                "timestamp": timestamp,
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "function_call_output",
+                                    "call_id": spawn_call_id,
+                                    "output": spawn_output,
+                                },
+                            })
+                            _emit_desktop_token_count(events, timestamp, model)
+                            desktop_task_agents[original_id] = {
+                                "agent_id": agent_id,
+                                "nickname": agent_nickname,
+                                "call_id": spawn_call_id,
+                            }
+                            continue
                         elif tool_name == "TodoWrite":
                             cmd = "# TodoWrite"
                             args = {"cmd": cmd, "workdir": cwd}
+                        elif tool_name == "exec_command":
+                            # Pass through original exec_command args without re-wrapping
+                            args = tool_input
+                        elif tool_name in ("spawn_agent", "wait_agent", "close_agent"):
+                            # Re-emit multi_agent_v1 namespace calls
+                            multi_call_id = _desktop_call_id()
+                            desktop_call_id_map[original_id] = multi_call_id
+                            events.append({
+                                "timestamp": timestamp,
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "function_call",
+                                    "call_id": multi_call_id,
+                                    "name": tool_name,
+                                    "namespace": "multi_agent_v1",
+                                    "arguments": json.dumps(tool_input, ensure_ascii=False),
+                                },
+                            })
+                            continue
+                        elif tool_name in ("apply_patch", "ApplyPatch"):
+                            # Emit as custom_tool_call for proper Codex UI rendering
+                            patch_call_id = _desktop_call_id()
+                            desktop_call_id_map[original_id] = patch_call_id
+                            patch_input = tool_input.get("raw", tool_input.get("input", ""))
+                            if isinstance(patch_input, dict):
+                                patch_input = json.dumps(patch_input, ensure_ascii=False)
+                            desktop_apply_patch_calls[patch_call_id] = str(patch_input)
+                            events.append({
+                                "timestamp": timestamp,
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "custom_tool_call",
+                                    "status": "completed",
+                                    "call_id": patch_call_id,
+                                    "name": "apply_patch",
+                                    "input": str(patch_input),
+                                },
+                            })
+                            continue
+                        elif tool_name in ("write_stdin", "update_plan", "request_user_input", "read_thread_terminal"):
+                            # Pass through as native function_call (not exec_command)
+                            native_call_id = _desktop_call_id()
+                            desktop_call_id_map[original_id] = native_call_id
+                            events.append({
+                                "timestamp": timestamp,
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "function_call",
+                                    "call_id": native_call_id,
+                                    "name": tool_name,
+                                    "arguments": json.dumps(tool_input, ensure_ascii=False),
+                                },
+                            })
+                            continue
                         else:
                             cmd = f"{tool_name} {json.dumps(tool_input, ensure_ascii=False)[:200]}"
                             args = {"cmd": cmd, "workdir": cwd}
@@ -1354,38 +1618,169 @@ def _render_codex_rollout(
             elif part_type == "tool_result":
                 flush_message_content()
                 original_call_id = part.get("tool_call_id") or ""
+                payload = None
                 if codex_desktop_compat:
-                    mapped_call_id = desktop_call_id_map.get(original_call_id, original_call_id)
-                    raw_output = part.get("content")
-                    output_str = str(raw_output or "") if not isinstance(raw_output, str) else raw_output
-                    token_est = max(1, len(output_str) // 4)
-                    wall_time = round(random.uniform(0.1, 2.0), 2)
-                    wrapped = (
-                        f"Chunk ID: {_desktop_chunk_id()}\n"
-                        f"Wall time: {wall_time} seconds\n"
-                        f"Process exited with code 0\n"
-                        f"Original token count: {token_est}\n"
-                        f"Output:\n{output_str}"
-                    )
-                    payload = {
-                        "type": "function_call_output",
-                        "call_id": mapped_call_id,
-                        "output": wrapped,
-                    }
-                    desktop_pending_token_count = True
+                    task_agent = desktop_task_agents.pop(original_call_id, None)
+                    if task_agent:
+                        # Task tool result -> wait_agent + close_agent sequence
+                        raw_output = part.get("content")
+                        output_str = str(raw_output or "") if not isinstance(raw_output, str) else raw_output
+                        # Commentary about agent result
+                        nick = task_agent["nickname"]
+                        result_commentary = f"Сабагент `{nick}` завершил работу."
+                        events.append({
+                            "timestamp": timestamp,
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "agent_message",
+                                "message": result_commentary,
+                                "phase": "commentary",
+                                "memory_citation": None,
+                            },
+                        })
+                        events.append({
+                            "timestamp": timestamp,
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": result_commentary}],
+                                "phase": "commentary",
+                            },
+                        })
+                        # wait_agent call
+                        wait_call_id = _desktop_call_id()
+                        wait_args = {"targets": [task_agent["agent_id"]], "timeout_ms": 120000}
+                        events.append({
+                            "timestamp": timestamp,
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call",
+                                "call_id": wait_call_id,
+                                "name": "wait_agent",
+                                "namespace": "multi_agent_v1",
+                                "arguments": json.dumps(wait_args, ensure_ascii=False),
+                            },
+                        })
+                        # wait_agent output
+                        wait_output = json.dumps({"status": {task_agent["agent_id"]: {"completed": output_str}}})
+                        events.append({
+                            "timestamp": timestamp,
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call_output",
+                                "call_id": wait_call_id,
+                                "output": wait_output,
+                            },
+                        })
+                        _emit_desktop_token_count(events, timestamp, model)
+                        # close_agent call
+                        close_call_id = _desktop_call_id()
+                        close_args = {"target": task_agent["agent_id"]}
+                        events.append({
+                            "timestamp": timestamp,
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call",
+                                "call_id": close_call_id,
+                                "name": "close_agent",
+                                "namespace": "multi_agent_v1",
+                                "arguments": json.dumps(close_args, ensure_ascii=False),
+                            },
+                        })
+                        # close_agent output
+                        close_output = json.dumps({"previous_status": {"completed": output_str[:200]}})
+                        events.append({
+                            "timestamp": timestamp,
+                            "type": "response_item",
+                            "payload": {
+                                "type": "function_call_output",
+                                "call_id": close_call_id,
+                                "output": close_output,
+                            },
+                        })
+                        _emit_desktop_token_count(events, timestamp, model)
+                    else:
+                        mapped_call_id = desktop_call_id_map.get(original_call_id, original_call_id)
+                        # Check if this is an apply_patch result
+                        patch_content = desktop_apply_patch_calls.pop(mapped_call_id, None)
+                        if patch_content is not None:
+                            raw_output = part.get("content")
+                            output_str = str(raw_output or "") if not isinstance(raw_output, str) else raw_output
+                            is_error = bool(part.get("is_error"))
+                            success = not is_error
+                            # custom_tool_call_output
+                            events.append({
+                                "timestamp": timestamp,
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "custom_tool_call_output",
+                                    "call_id": mapped_call_id,
+                                    "output": output_str,
+                                },
+                            })
+                            # Parse file paths from patch for patch_apply_end
+                            patch_changes = {}
+                            for line in patch_content.split("\n"):
+                                if line.startswith("*** Update File: ") or line.startswith("*** Add File: "):
+                                    fpath = line.split(": ", 1)[-1].strip()
+                                    change_type = "update" if "Update" in line else "add"
+                                    patch_changes[fpath] = {"type": change_type, "unified_diff": "", "move_path": None}
+                            if not patch_changes:
+                                for line in patch_content.split("\n"):
+                                    if line.startswith("*** "):
+                                        parts = line.split(" ")
+                                        if len(parts) >= 3:
+                                            fpath = " ".join(parts[2:]).strip()
+                                            patch_changes[fpath] = {"type": "update", "unified_diff": "", "move_path": None}
+                            stdout_msg = output_str if success else ""
+                            events.append({
+                                "timestamp": timestamp,
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "patch_apply_end",
+                                    "call_id": mapped_call_id,
+                                    "turn_id": turn_id,
+                                    "stdout": stdout_msg,
+                                    "stderr": "" if success else output_str,
+                                    "success": success,
+                                    "changes": patch_changes,
+                                    "status": "completed" if success else "failed",
+                                },
+                            })
+                        else:
+                            mapped_call_id = desktop_call_id_map.get(original_call_id, original_call_id)
+                            raw_output = part.get("content")
+                            output_str = str(raw_output or "") if not isinstance(raw_output, str) else raw_output
+                            token_est = max(1, len(output_str) // 4)
+                            wall_time = round(random.uniform(0.1, 2.0), 2)
+                            wrapped = (
+                                f"Chunk ID: {_desktop_chunk_id()}\n"
+                                f"Wall time: {wall_time} seconds\n"
+                                f"Process exited with code 0\n"
+                                f"Original token count: {token_est}\n"
+                                f"Output:\n{output_str}"
+                            )
+                            payload = {
+                                "type": "function_call_output",
+                                "call_id": mapped_call_id,
+                                "output": wrapped,
+                            }
+                            desktop_pending_token_count = True
                 else:
                     payload = {
                         "type": "function_call_output",
                         "call_id": original_call_id,
                         "output": part.get("content"),
                     }
-                if "is_error" in part:
-                    payload["is_error"] = bool(part.get("is_error"))
-                events.append({
-                    "timestamp": timestamp,
-                    "type": "response_item",
-                    "payload": payload,
-                })
+                if payload is not None:
+                    if "is_error" in part:
+                        payload["is_error"] = bool(part.get("is_error"))
+                    events.append({
+                        "timestamp": timestamp,
+                        "type": "response_item",
+                        "payload": payload,
+                    })
             elif part_type == "todo_state":
                 # Skip todo_state in desktop compat; pass through as metadata otherwise
                 if not codex_desktop_compat:
@@ -1407,6 +1802,10 @@ def _render_codex_rollout(
 
         for compaction in compactions_after_message.get(message_index, []):
             events.extend(_codex_compaction_events(compaction, timestamp))
+
+    archive_event = _codex_bridge_source_events_event(bridge.get("source_events") or [], events[-1]["timestamp"] if events else created_iso, source.get("app") or "")
+    if archive_event:
+        events.append(archive_event)
 
     # Desktop: emit task_complete at end
     if codex_desktop_compat:
@@ -1982,9 +2381,17 @@ def _bridge_message_signature(messages):
         if not isinstance(message, dict):
             continue
         parts = message.get("parts") if isinstance(message.get("parts"), list) else []
+        parts = [
+            part for part in parts
+            if isinstance(part, dict)
+            and part.get("type") != "todo_state"
+            and not _is_codex_internal_part(part)
+        ]
+        if not parts:
+            continue
         signature.append({
             "role": str(message.get("role") or ""),
-            "parts": [str(part.get("type") or "") for part in parts if isinstance(part, dict)],
+            "parts": [str(part.get("type") or "") for part in parts],
         })
     return signature
 
@@ -2005,10 +2412,11 @@ def _bridge_metric_counts(bridge):
                 continue
             part_type = str(part.get("type") or "")
             part_counts[part_type] = part_counts.get(part_type, 0) + 1
+    signature = _bridge_message_signature(messages)
     return {
-        "message_count": len(messages),
-        "role_sequence": [item["role"] for item in _bridge_message_signature(messages)],
-        "part_type_sequence": [item["parts"] for item in _bridge_message_signature(messages)],
+        "message_count": len(signature),
+        "role_sequence": [item["role"] for item in signature],
+        "part_type_sequence": [item["parts"] for item in signature],
         "part_counts": part_counts,
         "tool_call_count": part_counts.get("tool_call", 0),
         "tool_result_count": part_counts.get("tool_result", 0),
@@ -2032,22 +2440,61 @@ def _doctor_issue(code, message, codex_value, droid_value, severity="warn"):
     }
 
 
+def _sequence_has_prefix(longer, shorter):
+    longer = longer if isinstance(longer, list) else []
+    shorter = shorter if isinstance(shorter, list) else []
+    return len(longer) >= len(shorter) and longer[:len(shorter)] == shorter
+
+
+def _doctor_tools_preserved(codex_metrics, droid_metrics):
+    return (
+        int(codex_metrics.get("tool_call_count") or 0) >= int(droid_metrics.get("tool_call_count") or 0)
+        and int(codex_metrics.get("tool_result_count") or 0) >= int(droid_metrics.get("tool_result_count") or 0)
+    )
+
+
 def diagnose_bridge_pair(codex_bridge, droid_bridge, codex_session_id="", droid_session_id=""):
     codex_metrics = _bridge_metric_counts(codex_bridge)
     droid_metrics = _bridge_metric_counts(droid_bridge)
     issues = []
-    comparisons = [
+    tools_preserved = _doctor_tools_preserved(codex_metrics, droid_metrics)
+
+    for key, message in (
         ("message_count", "Message count differs"),
-        ("role_sequence", "Message role sequence differs"),
-        ("part_type_sequence", "Message part type sequence differs"),
         ("tool_call_count", "Tool call count differs"),
         ("tool_result_count", "Tool result count differs"),
+    ):
+        codex_value = codex_metrics.get(key)
+        droid_value = droid_metrics.get(key)
+        if codex_value != droid_value:
+            is_loss = int(codex_value or 0) < int(droid_value or 0)
+            if key == "message_count" and is_loss and tools_preserved:
+                is_loss = False
+            severity = "error" if is_loss else "warn"
+            issues.append(_doctor_issue(key, message, codex_value, droid_value, severity=severity))
+
+    for key, message in (
+        ("role_sequence", "Message role sequence differs"),
+        ("part_type_sequence", "Message part type sequence differs"),
+    ):
+        codex_value = codex_metrics.get(key)
+        droid_value = droid_metrics.get(key)
+        if codex_value != droid_value and not _sequence_has_prefix(codex_value, droid_value):
+            has_codex_expansion = any(
+                int(codex_metrics.get(count_key) or 0) > int(droid_metrics.get(count_key) or 0)
+                for count_key in ("message_count", "tool_call_count", "tool_result_count")
+            )
+            has_message_split = codex_metrics.get("message_count") != droid_metrics.get("message_count") and tools_preserved
+            severity = "warn" if has_codex_expansion or has_message_split else "error"
+            issues.append(_doctor_issue(key, message, codex_value, droid_value, severity=severity))
+
+    for key, message in (
         ("compaction_count", "Compaction count differs"),
         ("source_event_count", "Source event count differs"),
-    ]
-    for key, message in comparisons:
+    ):
         if codex_metrics.get(key) != droid_metrics.get(key):
-            issues.append(_doctor_issue(key, message, codex_metrics.get(key), droid_metrics.get(key)))
+            issues.append(_doctor_issue(key, message, codex_metrics.get(key), droid_metrics.get(key), severity="expected"))
+
     for key, message in (
         ("primary_cwd", "Primary cwd differs"),
         ("git_branch", "Git branch differs"),
@@ -2064,15 +2511,24 @@ def diagnose_bridge_pair(codex_bridge, droid_bridge, codex_session_id="", droid_
             and _canonical_droid_provider(codex_value, codex_metrics.get("model")) == _canonical_droid_provider(droid_value, droid_metrics.get("model"))
         ):
             continue
+        if (
+            key == "model"
+            and codex_value
+            and droid_value
+            and _canonical_model(codex_value) == _canonical_model(droid_value)
+        ):
+            continue
         if (codex_value or droid_value) and codex_value != droid_value:
-            issues.append(_doctor_issue(key, message, codex_value, droid_value))
+            severity = "expected" if key == "git_branch" else "warn"
+            issues.append(_doctor_issue(key, message, codex_value, droid_value, severity=severity))
+    has_errors = any(issue.get("severity") == "error" for issue in issues)
     return {
         "version": 1,
         "kind": "chat_bridge_doctor_pair",
         "read_only": True,
         "codex_session_id": str(codex_session_id or ""),
         "droid_session_id": str(droid_session_id or ""),
-        "status": "ok" if not issues else "warn",
+        "status": "error" if has_errors else ("warn" if issues else "ok"),
         "metrics": {
             "codex": codex_metrics,
             "droid": droid_metrics,
@@ -2144,8 +2600,11 @@ def import_bridge_to_codex(
     tmp_path = Path(tmp_name)
     conn = None
     committed = False
+    raw_replay = ""
     try:
-        rollout_text = _render_codex_rollout(
+        if compaction_mode == "raw" and not codex_desktop_compat:
+            raw_replay = _render_codex_raw_replay(bridge, codex_id, created_ms, target_provider=model_provider, target_model=model)
+        rollout_text = raw_replay or _render_codex_rollout(
             bridge,
             codex_id,
             created_ms,
@@ -2159,7 +2618,7 @@ def import_bridge_to_codex(
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(rollout_text)
         fd = None
-        _validate_codex_rollout(tmp_path, codex_id, len(bridge.get("messages", [])), codex_desktop_compat=codex_desktop_compat)
+        _validate_codex_rollout(tmp_path, codex_id, 0 if raw_replay else len(bridge.get("messages", [])), codex_desktop_compat=codex_desktop_compat)
         tmp_path.replace(final_path)
         row = {
             "id": codex_id,
@@ -2213,7 +2672,7 @@ def import_bridge_to_codex(
             raise ValueError("Codex import verification failed: missing DB row after commit")
         if str(verified["rollout_path"]) != str(final_path):
             raise ValueError("Codex import verification failed: rollout path mismatch")
-        meta = _validate_codex_rollout(final_path, codex_id, len(bridge.get("messages", [])), codex_desktop_compat=codex_desktop_compat)
+        meta = _validate_codex_rollout(final_path, codex_id, 0 if raw_replay else len(bridge.get("messages", [])), codex_desktop_compat=codex_desktop_compat)
         payload = meta.get("payload") or {}
         provider_match = payload.get("model_provider") == verified["model_provider"]
         model_match = payload.get("model") == verified["model"] or codex_desktop_compat
@@ -2325,11 +2784,12 @@ def _droid_bridge_source_event(source_event, index, source_app):
     raw = source_event.get("raw") if isinstance(source_event.get("raw"), dict) else {}
     timestamp = source_event.get("timestamp") or raw.get("timestamp") or _iso(_utc_now())
     source_index = _int_or_default(source_event.get("index"), index)
+    event_source_app = _bridge_source_app(source_event, source_app)
     return {
         "type": "bridge_source_event",
         "id": f"bridge-source-event-{source_index:06d}",
         "timestamp": _iso(_parse_datetime(timestamp) or _utc_now()),
-        "source": str(source_app or ""),
+        "source": event_source_app,
         "sourceIndex": source_index,
         "outerType": str(source_event.get("outer_type") or ""),
         "payloadType": str(source_event.get("payload_type") or ""),
@@ -2407,6 +2867,24 @@ def _droid_anchorless_compaction(compaction):
     return result
 
 
+def _droid_raw_replay_events(bridge, droid_id, title, cwd="", host_id=""):
+    events = _copy_raw_events_for_replay(bridge, "droid", "session_start")
+    if not events:
+        return []
+    first = events[0]
+    first["id"] = droid_id
+    if title and not first.get("title"):
+        first["title"] = title
+    if title and not first.get("sessionTitle"):
+        first["sessionTitle"] = title
+    if cwd and not first.get("cwd"):
+        first["version"] = first.get("version") or 2
+        first["cwd"] = cwd
+    if host_id and not first.get("hostId"):
+        first["hostId"] = host_id
+    return events
+
+
 def _droid_tool_input(value):
     if isinstance(value, dict):
         return value
@@ -2464,6 +2942,17 @@ def _droid_host_id(factory_home):
     return str(data.get("hostId") or "")
 
 
+def _canonical_model(model):
+    text = str(model or "").strip()
+    if text.lower().startswith("custom:"):
+        text = text.split(":", 1)[1].strip()
+    normalized = re.sub(r"[\s_]+", "-", text.casefold())
+    match = re.search(r"(gpt-\d+(?:\.\d+)?(?:-[a-z]+)?)", normalized)
+    if match:
+        return match.group(1)
+    return normalized
+
+
 def _canonical_droid_provider(provider, model):
     text = str(provider or "").strip()
     lower = text.lower().replace("-", "_")
@@ -2496,7 +2985,7 @@ def _canonical_droid_provider(provider, model):
     return text
 
 
-def _resolve_droid_session_settings(factory_home, session, timestamp):
+def _resolve_droid_session_settings(factory_home, session, timestamp, target_provider=None, target_model=None):
     session = session if isinstance(session, dict) else {}
     session_model = str(session.get("model") or "")
     session_provider = str(session.get("provider") or "")
@@ -2513,24 +3002,41 @@ def _resolve_droid_session_settings(factory_home, session, timestamp):
         models = []
         effective_settings = {}
 
+    effective_model = target_model or session_model
     match = None
     for model in models:
-        if str(model.get("id") or "") == session_model:
+        if str(model.get("id") or "") == effective_model:
             match = model
             break
-    if match is None and session_model:
+    if match is None and effective_model:
         for model in models:
-            if str(model.get("model") or "") != session_model:
+            if str(model.get("model") or "") != effective_model:
                 continue
             model_provider = str(model.get("provider") or "")
             if not session_provider or not model_provider or model_provider == session_provider:
                 match = model
                 break
+    if match is None and not target_model and session_model:
+        for model in models:
+            if str(model.get("id") or "") == session_model:
+                match = model
+                break
+        if match is None:
+            for model in models:
+                if str(model.get("model") or "") != session_model:
+                    continue
+                model_provider = str(model.get("provider") or "")
+                if not session_provider or not model_provider or model_provider == session_provider:
+                    match = model
+                    break
 
     defaults = effective_settings.get("sessionDefaultSettings") if isinstance(effective_settings.get("sessionDefaultSettings"), dict) else {}
-    selected_model = str((match or {}).get("id") or session_model)
-    selected_model_name = str((match or {}).get("model") or session_model)
-    provider_lock = str((match or {}).get("provider") or _canonical_droid_provider(session_provider, selected_model_name) or "")
+    selected_model = str((match or {}).get("id") or effective_model)
+    selected_model_name = str((match or {}).get("model") or effective_model)
+    if target_provider:
+        provider_lock = _canonical_droid_provider(target_provider, target_model or selected_model_name)
+    else:
+        provider_lock = str((match or {}).get("provider") or _canonical_droid_provider(session_provider, selected_model_name) or "")
     reasoning = str(session_reasoning or (match or {}).get("reasoningEffort") or defaults.get("reasoningEffort") or effective_settings.get("reasoningEffort") or "")
     settings = {
         "assistantActiveTimeMs": 0,
@@ -2665,7 +3171,7 @@ def _update_droid_index(
     )
 
 
-def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compaction_mode="archived"):
+def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compaction_mode="archived", target_provider=None, target_model=None):
     validate_bridge(bridge)
     compaction_mode = _normalize_compaction_mode(compaction_mode)
     factory_home = Path(factory_home)
@@ -2695,67 +3201,72 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compa
     try:
         title = session.get("title") or droid_id
         compactions = bridge.get("compactions") or []
-        native_compaction = _latest_compaction(compactions) if compaction_mode == "native" else None
-        active_messages = _droid_native_suffix_messages(bridge.get("messages", []), native_compaction) if native_compaction else list(bridge.get("messages", []))
-        session_start = {
-            "type": "session_start",
-            "id": droid_id,
-            "title": title,
-            "sessionTitle": title,
-            "owner": "codex-provider-manager",
-        }
-        if native_compaction and native_compaction.get("parent_session_id"):
-            session_start["parent"] = str(native_compaction.get("parent_session_id"))
-        if cwd:
-            session_start.update({
-                "version": 2,
-                "cwd": cwd,
-                "isSessionTitleManuallySet": False,
-                "sessionTitleAutoStage": "first_message",
-            })
-            if host_id:
-                session_start["hostId"] = host_id
-        events = [session_start]
-
-        parent_id = ""
-        if native_compaction:
-            events.append(_droid_compaction_state_event(_droid_anchorless_compaction(native_compaction), 0))
-
-        for index, message in enumerate(active_messages):
-            role = message.get("role") if message.get("role") in ("user", "assistant") else "user"
-            if preserve_timestamps:
-                timestamp = message.get("created_at") or session.get("created_at") or _iso(now)
-            else:
-                timestamp = _iso(now + datetime.timedelta(milliseconds=index))
-            event_id = message.get("id") or f"message-{index}"
-            event = {
-                "type": "message",
-                "id": event_id,
-                "timestamp": timestamp,
-                "message": {
-                    "role": role,
-                    "content": [_droid_content_part(part) for part in message.get("parts", [])],
-                },
+        events = _droid_raw_replay_events(bridge, droid_id, title, cwd=cwd, host_id=host_id) if compaction_mode == "raw" else []
+        if events:
+            message_count = sum(1 for event in events if event.get("type") == "message")
+        else:
+            native_compaction = _latest_compaction(compactions) if compaction_mode == "native" else None
+            active_messages = _droid_native_suffix_messages(bridge.get("messages", []), native_compaction) if native_compaction else list(bridge.get("messages", []))
+            session_start = {
+                "type": "session_start",
+                "id": droid_id,
+                "title": title,
+                "sessionTitle": title,
+                "owner": "codex-provider-manager",
             }
-            if message.get("role") not in ("user", "assistant"):
-                event["bridgeRole"] = str(message.get("role") or "unknown")
-            if parent_id:
-                event["parentId"] = parent_id
-            events.append(event)
-            parent_id = event_id
+            if native_compaction and native_compaction.get("parent_session_id"):
+                session_start["parent"] = str(native_compaction.get("parent_session_id"))
+            if cwd:
+                session_start.update({
+                    "version": 2,
+                    "cwd": cwd,
+                    "isSessionTitleManuallySet": False,
+                    "sessionTitleAutoStage": "first_message",
+                })
+                if host_id:
+                    session_start["hostId"] = host_id
+            events = [session_start]
 
-        if compaction_mode == "inline":
-            for compaction_index, compaction in enumerate(compactions):
-                events.append(_droid_compaction_state_event(compaction, compaction_index))
+            parent_id = ""
+            if native_compaction:
+                events.append(_droid_compaction_state_event(_droid_anchorless_compaction(native_compaction), 0))
 
-        for source_index, source_event in enumerate(bridge.get("source_events") or []):
-            events.append(_droid_bridge_source_event(source_event, source_index, source.get("app") or ""))
+            for index, message in enumerate(active_messages):
+                role = message.get("role") if message.get("role") in ("user", "assistant") else "user"
+                if preserve_timestamps:
+                    timestamp = message.get("created_at") or session.get("created_at") or _iso(now)
+                else:
+                    timestamp = _iso(now + datetime.timedelta(milliseconds=index))
+                event_id = message.get("id") or f"message-{index}"
+                event = {
+                    "type": "message",
+                    "id": event_id,
+                    "timestamp": timestamp,
+                    "message": {
+                        "role": role,
+                        "content": [_droid_content_part(part) for part in message.get("parts", [])],
+                    },
+                }
+                if message.get("role") not in ("user", "assistant"):
+                    event["bridgeRole"] = str(message.get("role") or "unknown")
+                if parent_id:
+                    event["parentId"] = parent_id
+                events.append(event)
+                parent_id = event_id
+
+            if compaction_mode == "inline":
+                for compaction_index, compaction in enumerate(compactions):
+                    events.append(_droid_compaction_state_event(compaction, compaction_index))
+
+            for source_index, source_event in enumerate(bridge.get("source_events") or []):
+                events.append(_droid_bridge_source_event(source_event, source_index, source.get("app") or ""))
+            message_count = len(active_messages)
 
         jsonl_fd, jsonl_tmp_name = tempfile.mkstemp(prefix=f"{droid_id}.", suffix=".jsonl.tmp", dir=str(sessions_dir))
         jsonl_tmp = Path(jsonl_tmp_name)
         with os.fdopen(jsonl_fd, "w", encoding="utf-8") as handle:
             handle.write("".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events))
-        settings = _resolve_droid_session_settings(factory_home, session, session.get("updated_at") or _iso(now))
+        settings = _resolve_droid_session_settings(factory_home, session, session.get("updated_at") or _iso(now), target_provider=target_provider, target_model=target_model)
         settings_fd, settings_tmp_name = tempfile.mkstemp(prefix=f"{droid_id}.", suffix=".settings.json.tmp", dir=str(sessions_dir))
         settings_tmp = Path(settings_tmp_name)
         with os.fdopen(settings_fd, "w", encoding="utf-8") as handle:
@@ -2770,7 +3281,7 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compa
             title,
             jsonl_path,
             settings_path,
-            len(active_messages),
+            message_count,
             cwd=cwd,
             host_id=host_id,
             created_ms=created_ms,

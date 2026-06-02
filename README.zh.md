@@ -170,6 +170,29 @@ Timestamps are preserved by default, including Droid index/file mtimes for Codex
 `--chat-compaction-mode archived` is the default: full visible history, including tool calls and tool results, is transferred while compaction/source events stay only as bridge archive metadata. `raw` is a legacy alias for `archived`. Use `inline` or `native` only when native compaction/continuation state should be active in the destination chat. Codex `reasoning` and Droid `thinking` parts are preserved, including OpenAI encrypted reasoning payloads needed for native continuation.
 `--chat-mapping-plan` is read-only: it classifies mapped pairs as stale, metadata drift, or needing a fresh re-export, prints suggested commands, and does not edit mappings or create sessions.
 
+#### Codex Desktop Identity Mode
+
+When converting Droid -> Codex, the bridge produces rollouts structurally identical to real Codex Desktop sessions (`codex_desktop_compat`). This mode is enabled by default for all Droid -> Codex transfers.
+
+**What gets converted:**
+- `session_meta` with correct `originator`, `cli_version`, `source`, `model_provider`, `base_instructions`, `dynamic_tools`
+- Full event lifecycle: `task_started` -> `user_message` / `agent_message` / `token_count` -> `task_complete`
+- `turn_context` before each assistant turn
+- Developer message with environment context (CWD, date, timezone)
+- All tool calls wrapped as `exec_command` with JSON-string arguments
+- Tool output wrapped with `Chunk ID` / `Wall time` / `Process exited with code 0`
+- Reasoning as `encrypted_content`-only with `summary: []`, `content: null`
+- Subagent (Droid "Task" tool) calls converted to `multi_agent_v1` namespace: `tool_search_call` -> `spawn_agent` -> `wait_agent` -> `close_agent`
+
+**Provider/model mapping:**
+- Droid -> Codex: uses active provider/model from `config.toml` as `model_provider` in rollout `session_meta` and `threads` DB row
+- Codex -> Droid: uses active provider/model from `config.toml` for Droid session's `providerLock` and model selection
+
+**Known limitations:**
+- `base_instructions` and `dynamic_tools` from `codex_desktop_meta_template.json` (if present) or minimal fallback prompt
+- `encrypted_content` in reasoning is synthetic (base64 placeholder), not real encrypted reasoning
+- Subagent results are approximate — Droid Task prompt becomes `spawn_agent` message, Task result becomes `wait_agent` output
+
 ### 固定聊天
 
 使聊天在任何活跃提供商下都可见。固定的聊天始终显示在侧边栏中。用于在提供商之间切换时重新激活聊天。

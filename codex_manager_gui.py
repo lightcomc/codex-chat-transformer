@@ -986,11 +986,14 @@ class CodexManagerApp:
             raise ValueError(f"Codex rollout not found: {rollout_path or session_id}")
         bridge = chat_bridge.codex_session_to_bridge(row, rollout_path, include_system=not skip_system)
         factory_home = droid.factory_home_from_settings(None)
+        target_config = ct._chat_import_target_config()
         summary = chat_bridge.import_bridge_to_droid(
             bridge,
             factory_home=factory_home,
             preserve_timestamps=preserve_timestamps,
             compaction_mode=compaction_mode,
+            target_provider=target_config.get("provider"),
+            target_model=target_config.get("model"),
         )
         ct.record_history(
             "chat_bridge_codex_to_droid",

@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
@@ -1011,7 +1011,7 @@ def _record_sync_history(action, **fields):
         path = CODEX_DIR / "operation_history.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "ts": datetime.utcnow().isoformat() + "Z",
+            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "source": "sync",
             "action": action,
             "status": "ok",

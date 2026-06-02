@@ -170,6 +170,29 @@ Timestamp preservation is the default, including Droid index/file mtimes for Cod
 `--chat-compaction-mode archived` is the default: full visible history, including tool calls and tool results, is transferred while compaction/source events are kept only as bridge archive metadata. `raw` is a legacy alias for `archived`. Use `inline` or `native` only when you explicitly want native compaction/continuation state in the destination chat. Codex `reasoning` and Droid `thinking` parts are preserved, including OpenAI encrypted reasoning payloads needed for native continuation.
 `--chat-mapping-plan` is read-only and classifies mapped pairs as stale, metadata drift, or needing a fresh re-export; it prints suggested commands but does not edit mappings or create sessions.
 
+#### Codex Desktop Identity Mode
+
+When converting Droid -> Codex, the bridge can produce rollouts that are structurally identical to real Codex Desktop sessions (`codex_desktop_compat`). This mode is enabled by default for all Droid -> Codex transfers.
+
+**What gets converted:**
+- `session_meta` with correct `originator`, `cli_version`, `source`, `model_provider`, `base_instructions`, and `dynamic_tools`
+- Full event lifecycle: `task_started` -> `user_message` / `agent_message` / `token_count` -> `task_complete`
+- `turn_context` before each assistant turn
+- Developer message with environment context (CWD, date, timezone)
+- All tool calls wrapped as `exec_command` with JSON-string arguments
+- Tool output wrapped with `Chunk ID` / `Wall time` / `Process exited with code 0`
+- Reasoning as `encrypted_content`-only payloads with `summary: []`, `content: null`
+- Subagent (Droid "Task" tool) calls converted to `multi_agent_v1` namespace: `tool_search_call` -> `spawn_agent` -> `wait_agent` -> `close_agent`
+
+**Provider/model mapping:**
+- Droid -> Codex: uses the active provider/model from `config.toml` as `model_provider` in both the rollout `session_meta` and the `threads` database row
+- Codex -> Droid: uses the active provider/model from `config.toml` for the Droid session's `providerLock` and model selection
+
+**Known limitations:**
+- `base_instructions` and `dynamic_tools` come from `codex_desktop_meta_template.json` (if present) or a minimal fallback prompt
+- `encrypted_content` in reasoning is synthetic (base64 placeholder), not real encrypted reasoning
+- Subagent results are approximate — Droid Task tool's prompt becomes `spawn_agent` message, Task result becomes `wait_agent` output
+
 ### Pin Chats
 
 Makes chats visible regardless of the active provider. Pinned chats always appear in the sidebar. Used for reactivating chats when transitioning between providers.
