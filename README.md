@@ -134,6 +134,18 @@ Auto-detect:
 python codex_chat_transformer.py --detect-provider
 ```
 
+### Auth Sync
+
+Automatic OpenAI auth synchronization at startup. When the active provider uses `chatgpt` auth mode, the tool extracts the email from the current JWT token and compares it with stored profiles:
+
+- **Stale auth**: same email but outdated `last_refresh` → prompt to update
+- **New email**: different email detected → offer to update the existing profile or save as a new one (auto-generated name like `openai_username`)
+- **Unsaved provider**: active provider not in profiles → prompt to save
+
+Each profile now tracks `bound_at` (first save date) and `auth_email`. Multiple OpenAI profiles under different emails are supported.
+
+Works in both CLI (interactive prompt at startup) and GUI (dialog on launch). No flags needed — runs automatically.
+
 ### Factory Droid Models
 
 The tool can also manage Factory Droid custom models/endpoints without rewriting the commented `~/.factory/settings.json` or touching Factory auth files.
@@ -313,6 +325,7 @@ GUI is a thin wrapper over CLI (`import codex_chat_transformer as ct`), no code 
 - Auto-detection of JSON configs next to app
 - API key prompt on import if missing
 - Provider `openai` is read-only (auth via Codex)
+- Auth sync on launch: stale auth refresh, new email profile creation
 - Auto-migration of old `config.toml` format profiles
 - RU / EN interface
 
@@ -429,7 +442,7 @@ A: Yes: `--sync-pull IP:PORT --pin XXXXXX` opens an interactive CLI menu.
 | `.codex-global-state.json` → `pinned-thread-ids` | Pinned chats |
 | `config.toml` | All providers `[model_providers.*]` + settings |
 | `auth.json` | Current auth (API key or OAuth) |
-| `providers.json` | Provider profiles (`provider_section` + `model` + auth, b64 obfuscation) |
+| `providers.json` | Provider profiles (`provider_section` + `model` + auth + `auth_email` + `bound_at`, b64 obfuscation) |
 | `operation_history.jsonl` | Append-only operation log with secrets redacted |
 
 ---

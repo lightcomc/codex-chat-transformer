@@ -195,10 +195,31 @@ T = {
             "to continue."
         ),
     },
+    "auth_sync_title": {"ru": "Синхронизация OpenAI Auth", "en": "OpenAI Auth Sync"},
+    "auth_sync_stale": {
+        "ru": "Auth профиля '{name}' устарел.\n\nТекущий: {cur_email} (refreshed: {cur_date})\nСохранённый: {std_email} (refreshed: {std_date})\n\nОбновить авторизацию?",
+        "en": "Profile '{name}' auth is stale.\n\nCurrent: {cur_email} (refreshed: {cur_date})\nStored: {std_email} (refreshed: {std_date})\n\nUpdate auth?",
+    },
+    "auth_sync_new_email": {
+        "ru": "Обнаружена новая почта OpenAI!\n\nТекущий: {cur_email} (refreshed: {cur_date})\nСохранённый 'openai': {std_email} (refreshed: {std_date})\n\nЧто сделать?",
+        "en": "New OpenAI email detected!\n\nCurrent: {cur_email} (refreshed: {cur_date})\nStored 'openai': {std_email} (refreshed: {std_date})\n\nWhat to do?",
+    },
+    "auth_update_existing": {"ru": "Обновить существующий '{}'", "en": "Update existing '{}'"},
+    "auth_save_new": {"ru": "Сохранить как '{}'", "en": "Save as '{}'"},
+    "auth_skip": {"ru": "Пропустить", "en": "Skip"},
+    "auth_updated": {"ru": "Авторизация '{}' обновлена.", "en": "Auth for '{}' updated."},
+    "auth_created": {"ru": "Создан профиль '{}'.", "en": "Created profile '{}'."},
+    "not_saved_prompt": {
+        "ru": "Активный провайдер '{}' не сохранён в базе.\n\nДобавить?",
+        "en": "Active provider '{}' is not saved.\n\nAdd it?",
+    },
+    "not_saved_title": {"ru": "Сохранить провайдер", "en": "Save Provider"},
 }
 
-def t(key, *args):
+def t(key, *args, **kwargs):
     s = T.get(key, {}).get(LANG, key)
+    if kwargs:
+        return s.format(**kwargs)
     return s.format(*args) if args else s
 
 
@@ -374,6 +395,7 @@ class CodexManagerApp:
         self._build_ui()
         self._refresh()
         self._refresh_chat_bridge_sessions(silent=True)
+        self.root.after(500, self._check_auth_sync)
         self._auto_detect()
 
     def _setup_styles(self):
@@ -734,7 +756,12 @@ class CodexManagerApp:
             prefix = ">>> " if name == active else "    "
             auth = profiles[name].get("auth_mode", "?")
             saved = profiles[name].get("saved_at", "")[:10]
-            self.provider_listbox.insert(tk.END, f"{prefix}{name}  ({auth}, {saved})")
+            email = profiles[name].get("auth_email", "")
+            if not email and auth == "chatgpt":
+                stored_email, _ = ct._get_stored_auth_email(profiles[name])
+                email = stored_email or ""
+            email_part = f"  {email}" if email else ""
+            self.provider_listbox.insert(tk.END, f"{prefix}{name}  ({auth}, {saved}{email_part})")
 
         if active not in profiles:
             self.status_var.set(t("not_saved", active))
@@ -1024,6 +1051,118 @@ class CodexManagerApp:
         self.chat_status.config(text=error)
         messagebox.showerror(t("error"), error)
 
+    # ── Auth sync on startup ───────────────────────────────────────────────
+
+    def _check_auth_sync(self):
+        """Check OpenAI auth sync and unsaved active provider on startup."""
+        self._check_openai_auth_sync_gui()
+        self._check_active_provider_saved_gui()
+
+    def _check_openai_auth_sync_gui(self):
+        """GUI: check if any chatgpt profile auth is stale."""
+        auth_path = CODEX_DIR / "auth.json"
+        if not auth_path.exists():
+            return
+        try:
+            with open(str(auth_path), "r", encoding="utf-8") as f:
+                current_auth = json.load(f)
+        except Exception:
+            return
+        if current_auth.get("auth_mode") != "chatgpt":
+            return
+        current_email = ct._extract_email_from_jwt(current_auth.get("tokens", {}).get("id_token"))
+        current_refresh = current_auth.get("last_refresh", "")
+        if not current_email:
+            return
+
+        prov_data = _load_providers()
+        profiles = prov_data.get("profiles", {})
+        chatgpt_profs = ct._find_chatgpt_profiles(profiles)
+        if not chatgpt_profs:
+            return
+
+        cur_date = current_refresh[:10] if current_refresh else "?"
+
+        for name, prof in chatgpt_profs:
+            stored_email, stored_refresh = ct._get_stored_auth_email(prof)
+            if stored_email == current_email:
+                if current_refresh == stored_refresh:
+                    return
+                std_date = stored_refresh[:10] if stored_refresh else "?"
+                if messagebox.askyesno(
+                    t("auth_sync_title"),
+                    t("auth_sync_stale", name=name, cur_email=current_email,
+                      cur_date=cur_date, std_email=stored_email, std_date=std_date),
+                ):
+                    ct.save_provider(name)
+                    self._refresh()
+                    self.status_var.set(t("auth_updated", name))
+                return
+
+        existing_openai = None
+        for name, prof in chatgpt_profs:
+            if name == "openai":
+                existing_openai = (name, prof)
+                break
+        if not existing_openai:
+            return
+
+        _, openai_prof = existing_openai
+        stored_email, stored_refresh = ct._get_stored_auth_email(openai_prof)
+        std_date = stored_refresh[:10] if stored_refresh else "?"
+        new_name = ct._email_to_profile_name(current_email)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(t("auth_sync_title"))
+        dialog.configure(bg=BG)
+        dialog.geometry("440x320")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        msg = t("auth_sync_new_email", cur_email=current_email, cur_date=cur_date,
+                std_email=stored_email or "?", std_date=std_date)
+        ttk.Label(dialog, text=msg, style="Stats.TLabel", justify="left", wraplength=390).pack(padx=16, pady=(16, 8))
+
+        btn_frame = tk.Frame(dialog, bg=BG)
+        btn_frame.pack(pady=8)
+
+        def do_update():
+            dialog.destroy()
+            ct.save_provider("openai")
+            self._refresh()
+            self.status_var.set(t("auth_updated", "openai"))
+
+        def do_new():
+            dialog.destroy()
+            ct.save_provider(new_name)
+            self._refresh()
+            self.status_var.set(t("auth_created", new_name))
+
+        def do_skip():
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text=t("auth_update_existing", "openai"), command=do_update).pack(fill="x", pady=2)
+        ttk.Button(btn_frame, text=t("auth_save_new", new_name), command=do_new).pack(fill="x", pady=2)
+        ttk.Button(btn_frame, text=t("auth_skip"), command=do_skip).pack(fill="x", pady=2)
+
+    def _check_active_provider_saved_gui(self):
+        """GUI: prompt to save active provider if not in profiles."""
+        active = _get_active_provider()
+        if not active or active == "?":
+            return
+        prov_data = _load_providers()
+        profiles = prov_data.get("profiles", {})
+        if active in profiles:
+            return
+        if messagebox.askyesno(
+            t("not_saved_title"),
+            t("not_saved_prompt", active),
+        ):
+            ct.save_provider(active)
+            self._refresh()
+            self.status_var.set(t("save_done", active, active, "unknown"))
+
     # ── Auto-detect ────────────────────────────────────────────────────────
 
     def _auto_detect(self):
@@ -1249,13 +1388,24 @@ class CodexManagerApp:
 
         _, section, model_val = ct._extract_provider_config(cfg) if cfg else (None, None, None)
 
+        auth_email = None
+        if am == "chatgpt" and auth:
+            try:
+                auth_data = json.loads(auth)
+                auth_email = ct._extract_email_from_jwt(auth_data.get("tokens", {}).get("id_token"))
+            except Exception:
+                pass
+
         data = _load_providers()
+        existing = data.get("profiles", {}).get(name, {})
         data.setdefault("profiles", {})[name] = {
             "model_provider": active,
             "model": model_val,
             "auth_mode": am,
             "provider_section": section or "",
             "auth.json": auth,
+            "auth_email": auth_email,
+            "bound_at": existing.get("bound_at") or datetime.datetime.now().isoformat(),
             "saved_at": datetime.datetime.now().isoformat(),
         }
         data["active"] = active

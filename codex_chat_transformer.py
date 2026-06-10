@@ -446,6 +446,157 @@ def _read_auth_info():
         return {"mode": "error", "has_key": False}
 
 
+def _extract_email_from_jwt(token):
+    """Extract email from JWT id_token without external deps."""
+    if not token or "." not in token:
+        return None
+    try:
+        payload = token.split(".")[1]
+        padding = "=" * (4 - len(payload) % 4)
+        data = json.loads(base64.b64decode(payload + padding))
+        return data.get("email")
+    except Exception:
+        return None
+
+
+def _email_to_profile_name(email):
+    """Generate profile name from email: openai_userpart."""
+    if not email:
+        return "openai_unknown"
+    local = email.split("@")[0].lower()
+    return _sanitize_name(f"openai_{local}")
+
+
+def _find_chatgpt_profiles(profiles):
+    """Return list of (name, profile_dict) for all chatgpt auth_mode profiles."""
+    result = []
+    for name, prof in profiles.items():
+        if prof.get("auth_mode") == "chatgpt":
+            result.append((name, prof))
+    return result
+
+
+def _get_stored_auth_email(prof):
+    """Decode stored auth from profile and return email."""
+    stored_raw = _decode_secret(prof.get("auth.json", ""))
+    if not stored_raw:
+        return None, None
+    try:
+        stored_auth = json.loads(stored_raw)
+    except Exception:
+        return None, None
+    email = _extract_email_from_jwt(stored_auth.get("tokens", {}).get("id_token"))
+    last_refresh = stored_auth.get("last_refresh", "")
+    return email, last_refresh
+
+
+def _check_openai_auth_sync():
+    """On startup, check if any chatgpt profile auth is stale vs current auth.json."""
+    auth_path = CODEX_DIR / "auth.json"
+    if not auth_path.exists():
+        return
+    try:
+        with open(str(auth_path), "r", encoding="utf-8") as f:
+            current_auth = json.load(f)
+    except Exception:
+        return
+    if current_auth.get("auth_mode") != "chatgpt":
+        return
+    current_email = _extract_email_from_jwt(current_auth.get("tokens", {}).get("id_token"))
+    current_refresh = current_auth.get("last_refresh", "")
+    if not current_email:
+        return
+
+    prov_data = _load_providers()
+    profiles = prov_data.get("profiles", {})
+    chatgpt_profs = _find_chatgpt_profiles(profiles)
+    if not chatgpt_profs:
+        return
+
+    cur_date = current_refresh[:10] if current_refresh else "?"
+
+    # Case 1: email matches a stored profile
+    for name, prof in chatgpt_profs:
+        stored_email, stored_refresh = _get_stored_auth_email(prof)
+        if stored_email == current_email:
+            if current_refresh == stored_refresh:
+                return
+            std_date = stored_refresh[:10] if stored_refresh else "?"
+            print(f"\n  OpenAI auth out of sync (profile: {name}):")
+            print(f"    Current: {current_email} (refreshed: {cur_date})")
+            print(f"    Stored:  {stored_email} (refreshed: {std_date})")
+            try:
+                answer = input(f"  Update '{name}' profile auth? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if answer in ("y", "yes"):
+                save_provider(name)
+                print(f"  Profile '{name}' auth updated.")
+            else:
+                print("  Skipped.")
+            return
+
+    # Case 2: new email — no matching profile
+    existing_openai = None
+    for name, prof in chatgpt_profs:
+        if name == "openai":
+            existing_openai = (name, prof)
+            break
+    if not existing_openai:
+        return
+
+    _, openai_prof = existing_openai
+    stored_email, stored_refresh = _get_stored_auth_email(openai_prof)
+    std_date = stored_refresh[:10] if stored_refresh else "?"
+    new_name = _email_to_profile_name(current_email)
+    print(f"\n  OpenAI auth: new email detected!")
+    print(f"    Current: {current_email} (refreshed: {cur_date})")
+    print(f"    Stored 'openai': {stored_email or '?'} (refreshed: {std_date})")
+    print(f"    [1] Update existing 'openai' profile")
+    print(f"    [2] Save as new '{new_name}' profile")
+    print(f"    [0] Skip")
+    try:
+        choice = input("  Choose: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if choice == "1":
+        save_provider("openai")
+        print("  Profile 'openai' auth updated.")
+    elif choice == "2":
+        save_provider(new_name)
+        print(f"  Profile '{new_name}' created.")
+    else:
+        print("  Skipped.")
+
+
+def _check_active_provider_saved():
+    """On startup, prompt to save active provider if not in profiles."""
+    active = _get_active_provider()
+    if not active or active in ("?", "openai"):
+        if active == "openai":
+            prov_data = _load_providers()
+            if "openai" in prov_data.get("profiles", {}):
+                return
+        else:
+            return
+    prov_data = _load_providers()
+    profiles = prov_data.get("profiles", {})
+    if active in profiles:
+        return
+    print(f"\n  Active provider '{active}' is not saved in profiles.")
+    try:
+        answer = input(f"  Add '{active}' to saved profiles? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if answer in ("y", "yes"):
+        save_provider(active)
+    else:
+        print("  Skipped.")
+
+
 def _history_path():
     return CODEX_DIR / "operation_history.jsonl"
 
@@ -1491,7 +1642,7 @@ def _detect_provider_from_text(text):
 def _sanitize_name(name):
     """Replace spaces and invalid chars in provider name with underscores."""
     import re
-    return re.sub(r'[\s/\\:*?"<>|]+', '_', name.strip())
+    return re.sub(r'[\s/\\:*?"<>|@.+#]+', '_', name.strip()).strip('_')
 
 
 def _extract_provider_config(config_text):
@@ -1758,13 +1909,18 @@ def providers_list():
         return
 
     print(f"\n=== Provider profiles ({len(profiles)}) ===\n")
-    print(f"  {'Active':<8}  {'Name':<20}  {'Auth mode':<12}  {'Saved':<20}")
-    print(f"  {'-'*8}  {'-'*20}  {'-'*12}  {'-'*20}")
+    print(f"  {'Active':<8}  {'Name':<20}  {'Auth mode':<12}  {'Email':<30}  {'Bound':<12}  {'Saved':<12}")
+    print(f"  {'-'*8}  {'-'*20}  {'-'*12}  {'-'*30}  {'-'*12}  {'-'*12}")
     for name, prof in profiles.items():
         is_active = ">>>" if name == active else ""
         auth_mode = prof.get("auth_mode", "?")
-        saved = prof.get("saved_at", "?")[:16]
-        print(f"  {is_active:<8}  {name:<20}  {auth_mode:<12}  {saved}")
+        email = prof.get("auth_email") or ""
+        if not email and auth_mode == "chatgpt":
+            stored_email, _ = _get_stored_auth_email(prof)
+            email = stored_email or ""
+        bound = prof.get("bound_at", "")[:10]
+        saved = prof.get("saved_at", "?")[:10]
+        print(f"  {is_active:<8}  {name:<20}  {auth_mode:<12}  {email:<30}  {bound:<12}  {saved:<12}")
 
     print(f"\n  Current active: {active}")
     if active not in profiles:
@@ -1794,12 +1950,23 @@ def save_provider(name):
         except Exception:
             pass
 
+    existing = profiles.get(name, {})
+    auth_email = None
+    if auth_mode == "chatgpt" and auth_content:
+        try:
+            auth_data = json.loads(auth_content)
+            auth_email = _extract_email_from_jwt(auth_data.get("tokens", {}).get("id_token"))
+        except Exception:
+            pass
+
     profiles[name] = {
         "model_provider": provider_name,
         "model": model_value,
         "auth_mode": auth_mode,
         "provider_section": provider_section,
         "auth.json": auth_content,
+        "auth_email": auth_email,
+        "bound_at": existing.get("bound_at") or datetime.datetime.now().isoformat(),
         "saved_at": datetime.datetime.now().isoformat(),
     }
     data["profiles"] = profiles
@@ -3070,6 +3237,8 @@ def main():
         return
     if handle_chat_bridge_command(args):
         return
+    _check_openai_auth_sync()
+    _check_active_provider_saved()
     provider_filter = None
     session_filter = None
     if args.providers not in (None, PROVIDERS_LIST_SENTINEL):
