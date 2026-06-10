@@ -134,6 +134,18 @@ python codex_chat_transformer.py --providers
 python codex_chat_transformer.py --detect-provider
 ```
 
+### 认证同步（Auth Sync）
+
+启动时自动同步 OpenAI 认证。当活跃提供商使用 `chatgpt` 认证模式时，工具会从当前 JWT token 中提取 email 并与已保存的配置文件进行比对：
+
+- **认证过期**：相同 email 但 `last_refresh` 不同 → 提示更新
+- **新 email**：检测到不同邮箱 → 提供更新现有配置或保存为新配置（自动生成名称，如 `openai_username`）
+- **未保存的提供商**：活跃提供商不在配置中 → 提示保存
+
+每个配置文件现在记录 `bound_at`（首次保存日期）和 `auth_email`。支持不同邮箱下的多个 OpenAI 配置。
+
+CLI（启动时交互提示）和 GUI（启动时弹出对话框）均支持。无需额外参数，自动运行。
+
 ### Factory Droid 模型
 
 本工具也可以管理 Factory Droid custom models/endpoints，不会重写带注释的 `%USERPROFILE%\.factory\settings.json`，也不会修改 Factory auth 文件。
@@ -149,7 +161,7 @@ python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
 
 Droid 写入目标是 `%USERPROFILE%\.factory\settings.local.json`。现有 `settings.json`、legacy `config.json` 和 Factory auth 文件保持不变。默认情况下 API key 会写成环境变量引用，例如 `${NEUROGATE_API_KEY}`；直接写入 key 需要显式使用 `--droid-with-key --api-key ...`。
 
-### Chat Bridge: Codex <-> Droid Sessions
+### Chat Bridge: Codex <-> Droid Sessions [Experimental]
 
 The first chat-transfer slice creates new destination sessions and records pairs in `chat_bridge_mappings.json` for later sync work. It does not copy auth files or API keys.
 When a Codex session has a project `cwd`, Codex -> Droid writes the Droid JSONL/settings pair under the matching project folder in `%USERPROFILE%\.factory\sessions\`, records `cwd` in Droid indexes, and `--droid-sessions` scans those nested project folders.
@@ -310,6 +322,7 @@ GUI 是 CLI 的轻量封装（`import codex_chat_transformer as ct`），无代�
 - 自动检测应用程序旁边的 JSON 配置
 - 导入时如缺少 API 密钥会提示输入
 - 提供商 `openai` 为只读（通过 Codex 身份验证）
+- 启动时认证同步：过期认证刷新、新邮箱配置创建
 - 自动迁移旧版 `config.toml` 格式配置文件
 - RU / EN 界面
 
@@ -426,7 +439,7 @@ API 密钥在本地使用 base64 混淆存储（CLI 和 GUI 均如此）。这**
 | `.codex-global-state.json` → `pinned-thread-ids` | 固定的聊天 |
 | `config.toml` | 所有提供商 `[model_providers.*]` + 设置 |
 | `auth.json` | 当前身份验证（API 密钥或 OAuth） |
-| `providers.json` | 提供商配置文件（`provider_section` + `model` + 身份验证，b64 混淆） |
+| `providers.json` | 提供商配置文件（`provider_section` + `model` + 身份验证 + `auth_email` + `bound_at`，b64 混淆） |
 
 ---
 

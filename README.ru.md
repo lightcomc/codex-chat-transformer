@@ -161,7 +161,7 @@ python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
 
 Все записи Droid идут в `%USERPROFILE%\.factory\settings.local.json`. Существующие `settings.json`, legacy `config.json` и Factory auth-файлы не трогаются. По умолчанию API-ключи пишутся как ссылки на переменные окружения, например `${NEUROGATE_API_KEY}`; прямую запись ключа нужно явно включить через `--droid-with-key --api-key ...`.
 
-### Chat Bridge: сессии Codex <-> Droid
+### Chat Bridge: сессии Codex <-> Droid [Экспериментальный]
 
 Первый срез переноса чатов создаёт новые сессии в целевой системе и записывает пары в `chat_bridge_mappings.json` для будущей синхронизации. Auth-файлы и API-ключи не копируются.
 Если у Codex-сессии есть проектный `cwd`, Codex -> Droid пишет JSONL/settings в соответствующую проектную папку внутри `%USERPROFILE%\.factory\sessions\`, записывает `cwd` в индексы Droid, а `--droid-sessions` сканирует такие вложенные проектные папки.
