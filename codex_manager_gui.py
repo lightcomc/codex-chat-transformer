@@ -308,11 +308,14 @@ def _merge_config(current_text, target_provider, target_section, target_model=No
     return ct._merge_config(current_text, target_provider, target_section, target_model, target_reasoning)
 
 
-def _run_convert(from_p, to_p, auto_backup=True):
+def _run_convert(from_p, to_p, auto_backup=True, progress_cb=None):
     if auto_backup:
         ct.create_backup(from_p)
+        print(f"[backup] created before conversion {from_p} -> {to_p}")
+    print(f"[convert] starting: {from_p} -> {to_p}")
     conn = _db_conn()
     if not conn:
+        print("[convert] no database connection")
         return 0, 0
     cur = conn.cursor()
     cur.execute("SELECT id, rollout_path FROM threads WHERE model_provider = ?", (from_p,))
@@ -320,15 +323,22 @@ def _run_convert(from_p, to_p, auto_backup=True):
     total = len(threads)
     if total == 0:
         conn.close()
+        print(f"[convert] no chats found for '{from_p}'")
         return 0, 0
+    print(f"[convert] found {total} chats, updating DB...")
     cur.execute("UPDATE threads SET model_provider = ? WHERE model_provider = ?", (to_p, from_p))
     conn.commit()
     conn.close()
     jsonl_updated = 0
-    for thread in threads:
+    for i, thread in enumerate(threads):
         rollout = thread["rollout_path"]
         if rollout and ct.transform_jsonl_file(rollout, from_p, to_p):
             jsonl_updated += 1
+        msg = t("converting_progress", i + 1, total)
+        print(f"[convert] {i + 1}/{total} {'OK' if rollout else 'skip'}: {rollout}")
+        if progress_cb:
+            progress_cb(msg)
+    print(f"[convert] done: {jsonl_updated}/{total} jsonl updated")
     return total, jsonl_updated
 
 
@@ -482,8 +492,8 @@ class CodexManagerApp:
         # (pack is called dynamically in _use_provider)
 
         # Provider list
-        list_frame = tk.Frame(self.root, bg=BG2, padx=12, pady=8)
-        list_frame.pack(fill="x", padx=16, pady=(0, 6))
+        self.list_frame = tk.Frame(self.root, bg=BG2, padx=12, pady=8)
+        self.list_frame.pack(fill="x", padx=16, pady=(0, 6))
 
         self.lbl_providers = ttk.Label(list_frame, text=t("saved_providers"))
         self.lbl_providers.pack(anchor="w")
@@ -991,12 +1001,14 @@ class CodexManagerApp:
 
     def _chat_transfer_thread(self, direction, item, preserve_timestamps=True, pin_old=False, skip_system=True, compaction_mode="archived"):
         try:
+            print(f"[chat_bridge] {direction}: starting transfer...")
             if direction == "droid_to_codex":
                 summary = self._run_droid_to_codex_transfer(item, preserve_timestamps, pin_old, compaction_mode)
                 message = t("chat_imported_codex").format(session=summary["codex_session_id"])
             else:
                 summary = self._run_codex_to_droid_transfer(item, preserve_timestamps, skip_system, compaction_mode)
                 message = t("chat_imported_droid").format(session=summary["droid_session_id"])
+            print(f"[chat_bridge] {direction}: done - {message}")
             warnings = summary.get("warnings") or []
             detail = message
             if warnings:
@@ -1004,6 +1016,7 @@ class CodexManagerApp:
             self.root.after(0, lambda: self._chat_transfer_done(message, detail))
         except Exception as e:
             error = str(e)
+            print(f"[chat_bridge] ERROR: {error}")
             self.root.after(0, lambda: self._chat_transfer_failed(error))
 
     def _run_droid_to_codex_transfer(self, session, preserve_timestamps=True, pin_old=False, compaction_mode="archived"):
@@ -1101,6 +1114,7 @@ class CodexManagerApp:
 
     def _check_openai_auth_sync_gui(self):
         """GUI: check if any chatgpt profile auth is stale."""
+        print("[auth_sync] checking...")
         auth_path = CODEX_DIR / "auth.json"
         if not auth_path.exists():
             return
@@ -1171,12 +1185,14 @@ class CodexManagerApp:
 
         def do_update():
             dialog.destroy()
+            print(f"[auth_sync] updating existing 'openai' profile")
             ct.save_provider("openai")
             self._refresh()
             self.status_var.set(t("auth_updated", "openai"))
 
         def do_new():
             dialog.destroy()
+            print(f"[auth_sync] creating new profile '{new_name}'")
             ct.save_provider(new_name)
             self._refresh()
             self.status_var.set(t("auth_created", new_name))
@@ -1344,6 +1360,7 @@ class CodexManagerApp:
                         "auth.json": auth,
                         "saved_at": datetime.datetime.now().isoformat(),
                     }
+                    print(f"[switch] auto-saved current provider: {active}")
 
             # Merge config — new format or backward compat
             target_section = prof.get("provider_section")
@@ -1355,6 +1372,7 @@ class CodexManagerApp:
                     _, target_section, target_model = ct._extract_provider_config(old_cfg)
 
             current_cfg = _read_file_safe(CODEX_DIR / "config.toml")
+            print(f"[switch] merging config: {active} -> {target} (model={target_model}, reasoning={target_reasoning})")
             if current_cfg and target_section:
                 merged = _merge_config(current_cfg, target, target_section, target_model, target_reasoning)
                 with open(str(CODEX_DIR / "config.toml"), "w", encoding="utf-8") as f:
@@ -1363,32 +1381,38 @@ class CodexManagerApp:
                 merged = _merge_config(current_cfg, target, None, target_model, target_reasoning)
                 with open(str(CODEX_DIR / "config.toml"), "w", encoding="utf-8") as f:
                     f.write(merged)
+            print("[switch] config.toml written")
 
             # Write auth
             target_auth = prof.get("auth.json")
             if target_auth:
                 with open(str(CODEX_DIR / "auth.json"), "w", encoding="utf-8") as f:
                     f.write(ct._decode_secret(target_auth))
+                print("[switch] auth.json written")
 
             data["active"] = target
             _save_providers(data)
+            print(f"[switch] providers.json updated (active={target})")
 
             # Convert in background thread
             if self.convert_var.get():
                 self.status_var.set(t("converting", active, target))
                 self.conv_label.config(text=t("converting", active, target))
-                self.conv_frame.pack(fill="x", padx=16, pady=(6, 0), before=self.root.winfo_children()[-1])
+                self.conv_frame.pack(fill="x", padx=16, pady=(6, 0), before=self.list_frame)
                 self._set_buttons_state("disabled")
+                print(f"[switch] starting chat conversion thread: {active} -> {target}")
                 threading.Thread(target=self._convert_thread, args=(active, target), daemon=True).start()
             else:
                 if self.pin_var.get():
                     self._do_pin(10)
                 self.status_var.set(t("switched_noconv", target))
                 self._refresh()
+                print(f"[switch] switched to {target} (no conversion)")
                 messagebox.showinfo(t("ok"), t("switch_done", target))
 
         except Exception as e:
             self._set_buttons_state("normal")
+            print(f"[switch] ERROR: {e}")
             messagebox.showerror(t("error"), str(e))
 
     def _set_buttons_state(self, state):
@@ -1403,7 +1427,9 @@ class CodexManagerApp:
 
     def _convert_thread(self, from_p, to_p):
         try:
-            total, conv = _run_convert(from_p, to_p, auto_backup=self.autobackup_var.get())
+            self.root.after(0, lambda: self.conv_label.config(text=t("converting", from_p, to_p)))
+            total, conv = _run_convert(from_p, to_p, auto_backup=self.autobackup_var.get(),
+                                       progress_cb=lambda msg: self.root.after(0, lambda m=msg: self.conv_label.config(text=m)))
             self.root.after(0, lambda: self._convert_done(total, conv, from_p, to_p))
         except Exception as e:
             self.root.after(0, lambda: self._convert_failed(str(e)))
@@ -1456,6 +1482,7 @@ class CodexManagerApp:
         }
         data["active"] = active
         _save_providers(data)
+        print(f"[save] profile '{name}' saved (provider={active}, model={model_val}, auth={am})")
 
         self._refresh()
         self.status_var.set(t("save_done", name, active, am))
@@ -1469,6 +1496,7 @@ class CodexManagerApp:
         data = _load_providers()
         data.get("profiles", {}).pop(name, None)
         _save_providers(data)
+        print(f"[remove] profile '{name}' removed")
         self._refresh()
         self.status_var.set(t("remove_done", name))
 
@@ -1765,8 +1793,10 @@ class CodexManagerApp:
                             if fp.is_file():
                                 zf.write(str(fp), f"codex/{fp.relative_to(CODEX_DIR)}")
             self.status_var.set(f"{t('backup_saved')}: {path}")
+            print(f"[backup] saved to {path}")
             messagebox.showinfo(t("ok"), f"{t('backup_saved')}:\n{path}")
         except Exception as e:
+            print(f"[backup] ERROR: {e}")
             messagebox.showerror(t("error"), str(e))
 
     def _restore(self):
@@ -1787,8 +1817,10 @@ class CodexManagerApp:
                     zf.extract(name, str(CODEX_DIR.parent))
             self._refresh()
             self.status_var.set(f"{t('restore_done')}")
+            print(f"[restore] restored from {path}")
             messagebox.showinfo(t("ok"), t("restore_done"))
         except Exception as e:
+            print(f"[restore] ERROR: {e}")
             messagebox.showerror(t("error"), str(e))
 
     def _fix_dates(self):
