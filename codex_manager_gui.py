@@ -97,6 +97,7 @@ T = {
     "ask_key_title": {"ru": "Введите API ключ", "en": "Enter API Key"},
     "ask_key_msg": {"ru": "Провайдер «{}» не содержит API ключ.\nВведите ключ для подключения:", "en": "Provider '{}' has no API key.\nEnter key to connect:"},
     "ask_key_skip": {"ru": "Пропустить (без ключа)", "en": "Skip (no key)"},
+    "paste_clip": {"ru": "Вставить", "en": "Paste"},
     "auto_detect_title": {"ru": "Автообнаружение", "en": "Auto-detection"},
     "converted": {"ru": "Сконвертировано {} чатов: {} -> {}", "en": "Converted {} chats: {} -> {}"},
     "switched_noconv": {"ru": "Переключено на {} (без конвертации)", "en": "Switched to {} (no conversion)"},
@@ -449,7 +450,8 @@ class CodexManagerApp:
         info_model = tk.Frame(self.info_frame, bg=BG2)
         info_model.pack(fill="x", pady=(4, 0))
 
-        ttk.Label(info_model, text=f"{t('model')}:", style="Model.TLabel").pack(side="left")
+        self.lbl_model = ttk.Label(info_model, text=f"{t('model')}:", style="Model.TLabel")
+        self.lbl_model.pack(side="left")
         self.model_var = tk.StringVar()
         self.model_entry = tk.Entry(info_model, textvariable=self.model_var, bg=BG2, fg=ACCENT,
                                     insertbackground=FG, font=("Segoe UI", 10, "bold"),
@@ -462,13 +464,22 @@ class CodexManagerApp:
         info_reas = tk.Frame(self.info_frame, bg=BG2)
         info_reas.pack(fill="x", pady=(2, 0))
 
-        ttk.Label(info_reas, text=f"{t('reasoning')}:", style="Model.TLabel").pack(side="left")
+        self.lbl_reasoning = ttk.Label(info_reas, text=f"{t('reasoning')}:", style="Model.TLabel")
+        self.lbl_reasoning.pack(side="left")
         self.reasoning_var = tk.StringVar()
         self.reasoning_cb = ttk.Combobox(info_reas, textvariable=self.reasoning_var,
                                          values=["", "low", "medium", "high", "xhigh"],
                                          width=10, state="readonly", font=("Segoe UI", 10))
         self.reasoning_cb.pack(side="left", padx=(4, 0))
         self.reasoning_cb.bind("<<ComboboxSelected>>", self._on_reasoning_change)
+
+        # Conversion progress strip
+        self.conv_frame = tk.Frame(self.root, bg=ACCENT, padx=12, pady=6)
+        self.conv_label = tk.Label(self.conv_frame, text="", bg=ACCENT, fg="#1e1e2e",
+                                   font=("Segoe UI", 10, "bold"))
+        self.conv_label.pack(anchor="w")
+        # Hidden by default; shown during conversion
+        # (pack is called dynamically in _use_provider)
 
         # Provider list
         list_frame = tk.Frame(self.root, bg=BG2, padx=12, pady=8)
@@ -632,6 +643,34 @@ class CodexManagerApp:
         self.status_label = ttk.Label(self.root, textvariable=self.status_var, style="Stats.TLabel")
         self.status_label.pack(padx=16, pady=(0, 8), anchor="w")
 
+    # ── Dialog helper: ensure paste works in grabbed dialogs ────────────────
+
+    @staticmethod
+    def _bind_paste(widget):
+        """Bind Ctrl+V on a dialog so paste works even with grab_set."""
+        def _paste(event):
+            try:
+                clip = event.widget.clipboard_get()
+                if hasattr(event.widget, "insert"):
+                    event.widget.insert("insert", clip)
+                    return "break"
+            except Exception:
+                pass
+        widget.bind("<Control-v>", _paste)
+        widget.bind("<Control-V>", _paste)
+        for child in widget.winfo_children():
+            CodexManagerApp._bind_paste(child)
+
+    def _paste_to_entry(self, entry):
+        """Paste clipboard content into an Entry widget."""
+        try:
+            clip = self.root.clipboard_get()
+            entry.config(state="normal")
+            entry.delete(0, tk.END)
+            entry.insert(0, clip)
+        except Exception:
+            pass
+
     # ── Language toggle ────────────────────────────────────────────────────
 
     def _toggle_lang(self):
@@ -673,6 +712,8 @@ class CodexManagerApp:
         self.btn_chat_mirror_plan.config(text=t("chat_mirror_plan"))
         self.btn_fixdates.config(text=t("fix_dates"))
         self.btn_edit.config(text=t("edit_provider"))
+        self.lbl_model.config(text=f"{t('model')}:")
+        self.lbl_reasoning.config(text=f"{t('reasoning')}:")
         self.ctx_menu.entryconfig(0, label=t("ctx_switch"))
         self.ctx_menu.entryconfig(1, label=t("ctx_edit"))
         self.ctx_menu.entryconfig(3, label=t("ctx_remove"))
@@ -1119,6 +1160,7 @@ class CodexManagerApp:
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
+        self._bind_paste(dialog)
 
         msg = t("auth_sync_new_email", cur_email=current_email, cur_date=cur_date,
                 std_email=stored_email or "?", std_date=std_date)
@@ -1334,6 +1376,8 @@ class CodexManagerApp:
             # Convert in background thread
             if self.convert_var.get():
                 self.status_var.set(t("converting", active, target))
+                self.conv_label.config(text=t("converting", active, target))
+                self.conv_frame.pack(fill="x", padx=16, pady=(6, 0), before=self.root.winfo_children()[-1])
                 self._set_buttons_state("disabled")
                 threading.Thread(target=self._convert_thread, args=(active, target), daemon=True).start()
             else:
@@ -1365,6 +1409,7 @@ class CodexManagerApp:
             self.root.after(0, lambda: self._convert_failed(str(e)))
 
     def _convert_done(self, total, conv, from_p, to_p):
+        self.conv_frame.pack_forget()
         self._set_buttons_state("normal")
         if self.pin_var.get():
             self._do_pin(10)
@@ -1373,6 +1418,7 @@ class CodexManagerApp:
         messagebox.showinfo(t("ok"), t("switch_done", to_p))
 
     def _convert_failed(self, error):
+        self.conv_frame.pack_forget()
         self._set_buttons_state("normal")
         messagebox.showerror(t("error"), error)
 
@@ -1442,10 +1488,11 @@ class CodexManagerApp:
     def _create_provider(self):
         dialog = tk.Toplevel(self.root)
         dialog.title(t("create_title"))
-        dialog.geometry("440x400")
+        dialog.geometry("540x400")
         dialog.configure(bg=BG)
         dialog.transient(self.root)
         dialog.grab_set()
+        self._bind_paste(dialog)
 
         fields = {}
         row = 0
@@ -1460,6 +1507,8 @@ class CodexManagerApp:
             var = tk.StringVar(value=default)
             entry = tk.Entry(dialog, textvariable=var, bg=BG2, fg=FG, insertbackground=FG, font=("Segoe UI", 10), relief="flat", width=32)
             entry.grid(row=row, column=1, padx=12, pady=4)
+            ttk.Button(dialog, text=t("paste_clip"), style="Small.TButton",
+                       command=lambda e=entry: self._paste_to_entry(e)).grid(row=row, column=2, padx=(0, 8), pady=4)
             fields[key] = var
             row += 1
 
@@ -1561,10 +1610,11 @@ class CodexManagerApp:
 
         dialog = tk.Toplevel(self.root)
         dialog.title(t("edit_title"))
-        dialog.geometry("440x400")
+        dialog.geometry("540x400")
         dialog.configure(bg=BG)
         dialog.transient(self.root)
         dialog.grab_set()
+        self._bind_paste(dialog)
 
         fields = {}
         row = 0
@@ -1587,6 +1637,9 @@ class CodexManagerApp:
             entry.grid(row=row, column=1, padx=12, pady=4)
             if not editable:
                 entry.config(state="readonly")
+            if editable:
+                ttk.Button(dialog, text=t("paste_clip"), style="Small.TButton",
+                           command=lambda e=entry: self._paste_to_entry(e)).grid(row=row, column=2, padx=(0, 8), pady=4)
             fields[key] = (var, editable)
             row += 1
 
@@ -1812,13 +1865,18 @@ class CodexManagerApp:
         result = tk.StringVar(value=initialvalue)
         dialog = tk.Toplevel(self.root)
         dialog.title(title)
-        dialog.geometry("300x120")
+        dialog.geometry("360x120")
         dialog.configure(bg=BG)
         dialog.transient(self.root)
         dialog.grab_set()
+        self._bind_paste(dialog)
         ttk.Label(dialog, text=prompt, style="TLabel").pack(padx=12, pady=(12, 4))
-        entry = tk.Entry(dialog, textvariable=result, bg=BG2, fg=FG, insertbackground=FG, font=("Segoe UI", 11), relief="flat")
-        entry.pack(fill="x", padx=12)
+        entry_frame = tk.Frame(dialog, bg=BG)
+        entry_frame.pack(fill="x", padx=12)
+        entry = tk.Entry(entry_frame, textvariable=result, bg=BG2, fg=FG, insertbackground=FG, font=("Segoe UI", 11), relief="flat")
+        entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(entry_frame, text=t("paste_clip"), style="Small.TButton",
+                   command=lambda: self._paste_to_entry(entry)).pack(side="right", padx=(4, 0))
         entry.select_range(0, tk.END)
         entry.focus()
         def _ok(e=None): dialog.destroy()
@@ -1831,13 +1889,18 @@ class CodexManagerApp:
         result = tk.StringVar()
         dialog = tk.Toplevel(self.root)
         dialog.title(t("ask_key_title"))
-        dialog.geometry("380x160")
+        dialog.geometry("420x160")
         dialog.configure(bg=BG)
         dialog.transient(self.root)
         dialog.grab_set()
-        ttk.Label(dialog, text=t("ask_key_msg", provider_name), style="TLabel", wraplength=340).pack(padx=12, pady=(12, 4))
-        entry = tk.Entry(dialog, textvariable=result, bg=BG2, fg=FG, insertbackground=FG, font=("Segoe UI", 11), relief="flat", show="*")
-        entry.pack(fill="x", padx=12)
+        self._bind_paste(dialog)
+        ttk.Label(dialog, text=t("ask_key_msg", provider_name), style="TLabel", wraplength=380).pack(padx=12, pady=(12, 4))
+        entry_frame = tk.Frame(dialog, bg=BG)
+        entry_frame.pack(fill="x", padx=12)
+        entry = tk.Entry(entry_frame, textvariable=result, bg=BG2, fg=FG, insertbackground=FG, font=("Segoe UI", 11), relief="flat", show="*")
+        entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(entry_frame, text=t("paste_clip"), style="Small.TButton",
+                   command=lambda: self._paste_to_entry(entry)).pack(side="right", padx=(4, 0))
         entry.focus()
         def _ok(e=None): dialog.destroy()
         def _skip(): result.set(""); dialog.destroy()

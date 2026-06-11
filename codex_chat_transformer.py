@@ -1762,18 +1762,19 @@ def _merge_config(current_text, target_provider_name, target_provider_section, t
                 out.append(line)
             continue
 
-        # Replace or remove model_reasoning_effort line
+        # Replace or preserve model_reasoning_effort line
         if stripped.startswith("model_reasoning_effort") and "=" in stripped:
             if target_reasoning:
                 out.append(f'model_reasoning_effort = "{target_reasoning}"')
-            # else: drop the line (no reasoning for target)
+            else:
+                out.append(line)
             continue
 
         # Detect [model_providers.XXX] section headers
         if stripped.startswith("[model_providers."):
             section_name = stripped[len("[model_providers."):-1].strip('"').strip("'")
             if section_name == target_provider_name:
-                if target_provider_section:
+                if target_provider_section and target_provider_name.lower() != "openai":
                     # Replace target provider section with new one
                     in_provider_section = "target"
                     if not target_section_written:
@@ -1783,9 +1784,8 @@ def _merge_config(current_text, target_provider_name, target_provider_section, t
                         target_section_written = True
                     continue
                 else:
-                    # No section provided — keep existing as-is
-                    in_provider_section = None
-                    out.append(line)
+                    # openai or no section — skip, don't write section header
+                    in_provider_section = "target"
                     continue
             else:
                 # Keep other provider sections as-is
@@ -1813,10 +1813,12 @@ def _merge_config(current_text, target_provider_name, target_provider_section, t
     if not model_provider_written:
         out.insert(0, f'model_provider = "{target_provider_name}"')
 
-    # If target section wasn't in file, append it
+    # If target section wasn't in file, append it (dedup check)
     if not target_section_written and target_provider_section:
-        out.append("")
-        out.append(target_provider_section)
+        section_header = target_provider_section.strip().split("\n")[0].strip()
+        if not any(l.strip() == section_header for l in out):
+            out.append("")
+            out.append(target_provider_section)
 
     # If reasoning was requested but line wasn't in file, add it after model
     if target_reasoning and not any(
