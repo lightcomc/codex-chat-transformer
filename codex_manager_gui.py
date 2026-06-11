@@ -495,10 +495,10 @@ class CodexManagerApp:
         self.list_frame = tk.Frame(self.root, bg=BG2, padx=12, pady=8)
         self.list_frame.pack(fill="x", padx=16, pady=(0, 6))
 
-        self.lbl_providers = ttk.Label(list_frame, text=t("saved_providers"))
+        self.lbl_providers = ttk.Label(self.list_frame, text=t("saved_providers"))
         self.lbl_providers.pack(anchor="w")
         self.provider_listbox = tk.Listbox(
-            list_frame, height=5, bg=BG2, fg=FG, selectbackground=ACCENT,
+            self.list_frame, height=5, bg=BG2, fg=FG, selectbackground=ACCENT,
             selectforeground="#1e1e2e", font=("Segoe UI", 11), relief="flat",
             highlightthickness=1, highlightcolor=ACCENT, highlightbackground=BG2,
             activestyle="none"
