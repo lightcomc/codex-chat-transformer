@@ -1144,14 +1144,10 @@ class CodexManagerApp:
                 if current_refresh == stored_refresh:
                     return
                 std_date = stored_refresh[:10] if stored_refresh else "?"
-                if messagebox.askyesno(
-                    t("auth_sync_title"),
-                    t("auth_sync_stale", name=name, cur_email=current_email,
-                      cur_date=cur_date, std_email=stored_email, std_date=std_date),
-                ):
-                    ct.save_provider(name)
-                    self._refresh()
-                    self.status_var.set(t("auth_updated", name))
+                print(f"[auth_sync] updating stale auth for '{name}' ({stored_email}, refresh {std_date} -> {cur_date})")
+                ct.save_provider(name)
+                self._refresh()
+                self.status_var.set(t("auth_updated", name))
                 return
 
         existing_openai = None
