@@ -1346,21 +1346,31 @@ class CodexManagerApp:
             return
 
         try:
-            # Auto-save current
-            if active not in profiles:
-                cfg = _read_file_safe(CODEX_DIR / "config.toml")
-                auth = _read_file_safe(CODEX_DIR / "auth.json")
-                if cfg:
-                    _, section, model_val = ct._extract_provider_config(cfg)
-                    profiles[active] = {
-                        "model_provider": active,
-                        "model": model_val,
-                        "auth_mode": _detect_auth_mode(CODEX_DIR / "auth.json") or "unknown",
-                        "provider_section": section,
-                        "auth.json": auth,
-                        "saved_at": datetime.datetime.now().isoformat(),
-                    }
-                    print(f"[switch] auto-saved current provider: {active}")
+            # Auto-save / update current provider auth
+            cfg = _read_file_safe(CODEX_DIR / "config.toml")
+            auth = _read_file_safe(CODEX_DIR / "auth.json")
+            if cfg:
+                _, section, model_val = ct._extract_provider_config(cfg)
+                auth_mode = _detect_auth_mode(CODEX_DIR / "auth.json") or "unknown"
+                auth_email = None
+                if auth_mode == "chatgpt" and auth:
+                    try:
+                        auth_data = json.loads(auth)
+                        auth_email = ct._extract_email_from_jwt(auth_data.get("tokens", {}).get("id_token"))
+                    except Exception:
+                        pass
+                existing = profiles.get(active, {})
+                profiles[active] = {
+                    "model_provider": active,
+                    "model": model_val,
+                    "auth_mode": auth_mode,
+                    "provider_section": section,
+                    "auth.json": auth,
+                    "auth_email": auth_email,
+                    "bound_at": existing.get("bound_at") or datetime.datetime.now().isoformat(),
+                    "saved_at": datetime.datetime.now().isoformat(),
+                }
+                print(f"[switch] updated current provider auth: {active}")
 
             # Merge config — new format or backward compat
             target_section = prof.get("provider_section")
