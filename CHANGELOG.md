@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.1] - 2026-06-12
+
+### GUI Bugfixes & Improvements
+- Email comparison in auth sync is now case-insensitive — mixed-case emails from JWT (e.g. `User@Outlook.com`) no longer trigger false "new email detected" dialogs.
+- `_extract_email_from_jwt()` normalizes email to lowercase; all stored-vs-current comparisons use `.lower()`.
+- Paste from clipboard buttons added to all input dialogs (add provider, edit provider, API key prompt, string dialogs). Works around `grab_set()` blocking Ctrl+V.
+- Conversion progress strip in main window showing backup, DB update, JSONL update steps.
+- CMD window logging during conversion: `[convert] backup`, `[convert] db_update`, etc.
+- Auth sync for same-email token refresh is now silent (no confirmation dialog) — automatically updates the stored profile.
+- Current provider auth is always saved to `providers.json` when switching away (not just when profile doesn't exist).
+- `model_reasoning_effort` is preserved in `config.toml` when the target provider has no explicit reasoning setting (was deleted before).
+- Duplicate provider sections in `config.toml` prevented with header dedup check; `openai` section is never re-appended.
+- Info panel labels ("Model:", "Reasoning:") now switch language correctly when toggling RU/EN.
+
 ## [1.5.0] - 2026-05-29
 
 ### Codex Desktop Identity

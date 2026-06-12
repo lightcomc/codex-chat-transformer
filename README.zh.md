@@ -314,15 +314,19 @@ GUI 是 CLI 的轻量封装（`import codex_chat_transformer as ct`），无代�
 
 - 一键切换提供商
 - 后台线程转换 —— GUI 不会冻结
+- 转换进度条及 CMD 窗口日志
 - P2P 同步区域：启动服务器、打开 Dashboard、复制 IP:PIN
 - Chat Bridge 面板：Droid -> Codex 和 Codex -> Droid 会话迁移
 - 编辑提供商：按钮或右键上下文菜单
+- 所有输入对话框均有"从剪贴板粘贴"按钮
 - 模型和推理能力可在信息面板中内联编辑
 - 推理能力下拉菜单：low / medium / high / xhigh / default
 - 自动检测应用程序旁边的 JSON 配置
 - 导入时如缺少 API 密钥会提示输入
 - 提供商 `openai` 为只读（通过 Codex 身份验证）
-- 启动时认证同步：过期认证刷新、新邮箱配置创建
+- 启动时认证同步：自动刷新过期令牌、新邮箱配置创建
+- 切换提供商时自动保存当前认证到 `providers.json`
+- 认证同步中邮箱比较不区分大小写
 - 自动迁移旧版 `config.toml` 格式配置文件
 - RU / EN 界面
 

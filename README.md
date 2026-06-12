@@ -317,15 +317,19 @@ GUI is a thin wrapper over CLI (`import codex_chat_transformer as ct`), no code 
 
 - One-click provider switching
 - Background thread conversion — GUI doesn't freeze
+- Conversion progress strip with CMD window logging
 - P2P sync section with server start, Dashboard open, and IP:PIN copy
 - Chat Bridge panel for Droid -> Codex and Codex -> Droid session transfer
 - Edit provider: button or right-click context menu
+- Paste from clipboard buttons on all input dialogs
 - Model and reasoning editable inline in info panel
 - Reasoning dropdown: low / medium / high / xhigh / default
 - Auto-detection of JSON configs next to app
 - API key prompt on import if missing
 - Provider `openai` is read-only (auth via Codex)
-- Auth sync on launch: stale auth refresh, new email profile creation
+- Auth sync on launch: auto-refresh stale tokens, new email profile creation
+- Auto-save current provider auth to `providers.json` on switch
+- Case-insensitive email matching in auth sync
 - Auto-migration of old `config.toml` format profiles
 - RU / EN interface
 
