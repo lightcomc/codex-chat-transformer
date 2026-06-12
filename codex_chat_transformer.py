@@ -454,7 +454,8 @@ def _extract_email_from_jwt(token):
         payload = token.split(".")[1]
         padding = "=" * (4 - len(payload) % 4)
         data = json.loads(base64.b64decode(payload + padding))
-        return data.get("email")
+        email = data.get("email")
+        return email.lower() if email else None
     except Exception:
         return None
 
@@ -518,7 +519,7 @@ def _check_openai_auth_sync():
     # Case 1: email matches a stored profile
     for name, prof in chatgpt_profs:
         stored_email, stored_refresh = _get_stored_auth_email(prof)
-        if stored_email == current_email:
+        if (stored_email or "").lower() == (current_email or "").lower():
             if current_refresh == stored_refresh:
                 return
             std_date = stored_refresh[:10] if stored_refresh else "?"

@@ -1140,7 +1140,7 @@ class CodexManagerApp:
 
         for name, prof in chatgpt_profs:
             stored_email, stored_refresh = ct._get_stored_auth_email(prof)
-            if stored_email == current_email:
+            if (stored_email or "").lower() == (current_email or "").lower():
                 if current_refresh == stored_refresh:
                     return
                 std_date = stored_refresh[:10] if stored_refresh else "?"
