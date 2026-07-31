@@ -75,6 +75,7 @@ T = {
     "remove_confirm": {"ru": "Удалить провайдер '{}'?", "en": "Remove provider '{}'?"},
     "remove_done": {"ru": "Удалён '{}'", "en": "Removed '{}'"},
     "not_saved": {"ru": "Провайдер '{}' не сохранён. Нажмите «Сохранить текущий».", "en": "Provider '{}' not saved. Click 'Save Current'."},
+    "account_unmatched": {"ru": "Текущий аккаунт не сопоставлен со saved-профилем. Нажмите «Сохранить текущий».", "en": "Current account is not matched to a saved profile. Click 'Save Current'."},
     "no_selection": {"ru": "Выберите провайдер из списка.", "en": "Select a provider from the list."},
     "not_found": {"ru": "Профиль '{}' не найден.", "en": "Profile '{}' not found."},
     "backup_saved": {"ru": "Бекап сохранён", "en": "Backup saved"},
@@ -198,8 +199,8 @@ T = {
     },
     "auth_sync_title": {"ru": "Синхронизация OpenAI Auth", "en": "OpenAI Auth Sync"},
     "auth_sync_stale": {
-        "ru": "Auth профиля '{name}' устарел.\n\nТекущий: {cur_email} (refreshed: {cur_date})\nСохранённый: {std_email} (refreshed: {std_date})\n\nОбновить авторизацию?",
-        "en": "Profile '{name}' auth is stale.\n\nCurrent: {cur_email} (refreshed: {cur_date})\nStored: {std_email} (refreshed: {std_date})\n\nUpdate auth?",
+        "ru": "Активен аккаунт: {cur_email}\nДата авторизации обновилась: {cur_date}\nСохранённая в профиле '{name}' устарела: {std_date}\n\nОбновить авторизацию в профиле '{name}'?",
+        "en": "Active account: {cur_email}\nAuth date updated: {cur_date}\nStored in profile '{name}' is stale: {std_date}\n\nUpdate auth in profile '{name}'?",
     },
     "auth_sync_new_email": {
         "ru": "Обнаружена новая почта OpenAI!\n\nТекущий: {cur_email} (refreshed: {cur_date})\nСохранённый 'openai': {std_email} (refreshed: {std_date})\n\nЧто сделать?",
@@ -275,6 +276,10 @@ def _get_config_info():
 
 def _get_active_provider():
     return ct._get_active_provider()
+
+
+def _get_active_profile_name():
+    return ct._get_active_profile_name()
 
 
 def _load_providers():
@@ -466,6 +471,7 @@ class CodexManagerApp:
         self.model_entry = tk.Entry(info_model, textvariable=self.model_var, bg=BG2, fg=ACCENT,
                                     insertbackground=FG, font=("Segoe UI", 10, "bold"),
                                     relief="flat", width=28)
+        self._bind_paste(self.model_entry)
         self.model_entry.pack(side="left", padx=(4, 0))
         self.model_entry.bind("<Return>", self._on_model_change)
         self.model_entry.bind("<FocusOut>", self._on_model_change)
@@ -656,28 +662,60 @@ class CodexManagerApp:
     # ── Dialog helper: ensure paste works in grabbed dialogs ────────────────
 
     @staticmethod
-    def _bind_paste(widget):
-        """Bind Ctrl+V on a dialog so paste works even with grab_set."""
-        def _paste(event):
+    def _paste_clipboard_into(entry, replace_all=False):
+        if str(entry.cget("state")) != "normal":
+            return False
+        clip = entry.clipboard_get()
+        if replace_all:
+            entry.delete(0, tk.END)
+            entry.insert(0, clip)
+        else:
             try:
-                clip = event.widget.clipboard_get()
-                if hasattr(event.widget, "insert"):
-                    event.widget.insert("insert", clip)
-                    return "break"
-            except Exception:
+                entry.delete("sel.first", "sel.last")
+            except tk.TclError:
                 pass
-        widget.bind("<Control-v>", _paste)
-        widget.bind("<Control-V>", _paste)
+            entry.insert("insert", clip)
+        return True
+
+    @staticmethod
+    def _handle_entry_shortcut(event):
+        try:
+            entry = event.widget
+            if not hasattr(entry, "insert"):
+                return None
+            key = str(getattr(event, "keysym", "")).lower()
+            keycode = getattr(event, "keycode", None)
+
+            if key in ("a", "cyrillic_ef") or keycode == 65:
+                entry.select_range(0, tk.END)
+                entry.icursor(tk.END)
+                return "break"
+            if key in ("c", "cyrillic_es") or keycode == 67:
+                entry.event_generate("<<Copy>>")
+                return "break"
+            if key in ("x", "cyrillic_che") or keycode == 88:
+                if str(entry.cget("state")) == "normal":
+                    entry.event_generate("<<Cut>>")
+                    return "break"
+            if key in ("v", "cyrillic_em") or keycode == 86:
+                if CodexManagerApp._paste_clipboard_into(entry):
+                    return "break"
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _bind_paste(widget):
+        """Bind normal edit shortcuts on dialog entries, including RU keyboard layout."""
+        widget.bind("<Control-KeyPress>", CodexManagerApp._handle_entry_shortcut)
         for child in widget.winfo_children():
             CodexManagerApp._bind_paste(child)
 
     def _paste_to_entry(self, entry):
         """Paste clipboard content into an Entry widget."""
         try:
-            clip = self.root.clipboard_get()
-            entry.config(state="normal")
-            entry.delete(0, tk.END)
-            entry.insert(0, clip)
+            self._paste_clipboard_into(entry, replace_all=True)
+            entry.focus_set()
         except Exception:
             pass
 
@@ -793,7 +831,8 @@ class CodexManagerApp:
         self.stats_label.config(text="\n".join(lines))
 
         active = _get_active_provider()
-        self.active_label.config(text=f"{t('active_provider')}: {active}")
+        active_profile = _get_active_profile_name()
+        self.active_label.config(text=f"{t('active_provider')}: {active_profile or active}")
 
         cfg_info = _get_config_info()
         self.model_var.set(cfg_info["model"])
@@ -803,8 +842,12 @@ class CodexManagerApp:
         data = _load_providers()
         profiles = data.get("profiles", {})
         self.provider_listbox.delete(0, tk.END)
+        # Only mark a profile active when the live account is actually matched to it.
+        # Falling back to the provider name ("openai") would falsely highlight whichever
+        # profile happens to share that name after an email change.
+        active_marker = active_profile
         for name in profiles:
-            prefix = ">>> " if name == active else "    "
+            prefix = ">>> " if (active_marker and name == active_marker) else "    "
             auth = profiles[name].get("auth_mode", "?")
             saved = profiles[name].get("saved_at", "")[:10]
             email = profiles[name].get("auth_email", "")
@@ -814,8 +857,11 @@ class CodexManagerApp:
             email_part = f"  {email}" if email else ""
             self.provider_listbox.insert(tk.END, f"{prefix}{name}  ({auth}, {saved}{email_part})")
 
-        if active not in profiles:
-            self.status_var.set(t("not_saved", active))
+        if not active_marker:
+            # Active account is logged in but matched no saved profile (e.g. new/changed email).
+            self.status_var.set(t("account_unmatched"))
+        elif active_marker not in profiles:
+            self.status_var.set(t("not_saved", active_marker))
 
     def _short_chat_text(self, value, limit=62):
         text = " ".join(str(value or "-").split())
@@ -1113,97 +1159,27 @@ class CodexManagerApp:
         self._check_active_provider_saved_gui()
 
     def _check_openai_auth_sync_gui(self):
-        """GUI: check if any chatgpt profile auth is stale."""
+        """GUI: on startup, silently save the live auth.json back into the active
+        chatgpt profile when it is fresher than what's stored.
+
+        Finds the ACTIVE account and refreshes its stored auth without any prompt.
+        """
         print("[auth_sync] checking...")
-        auth_path = CODEX_DIR / "auth.json"
-        if not auth_path.exists():
+        active_profile = ct._compute_active_auth_sync()
+        if not active_profile:
             return
-        try:
-            with open(str(auth_path), "r", encoding="utf-8") as f:
-                current_auth = json.load(f)
-        except Exception:
-            return
-        if current_auth.get("auth_mode") != "chatgpt":
-            return
-        current_email = ct._extract_email_from_jwt(current_auth.get("tokens", {}).get("id_token"))
-        current_refresh = current_auth.get("last_refresh", "")
-        if not current_email:
-            return
-
-        prov_data = _load_providers()
-        profiles = prov_data.get("profiles", {})
-        chatgpt_profs = ct._find_chatgpt_profiles(profiles)
-        if not chatgpt_profs:
-            return
-
-        cur_date = current_refresh[:10] if current_refresh else "?"
-
-        for name, prof in chatgpt_profs:
-            stored_email, stored_refresh = ct._get_stored_auth_email(prof)
-            if (stored_email or "").lower() == (current_email or "").lower():
-                if current_refresh == stored_refresh:
-                    return
-                std_date = stored_refresh[:10] if stored_refresh else "?"
-                print(f"[auth_sync] updating stale auth for '{name}' ({stored_email}, refresh {std_date} -> {cur_date})")
-                ct.save_provider(name)
-                self._refresh()
-                self.status_var.set(t("auth_updated", name))
-                return
-
-        existing_openai = None
-        for name, prof in chatgpt_profs:
-            if name == "openai":
-                existing_openai = (name, prof)
-                break
-        if not existing_openai:
-            return
-
-        _, openai_prof = existing_openai
-        stored_email, stored_refresh = ct._get_stored_auth_email(openai_prof)
-        std_date = stored_refresh[:10] if stored_refresh else "?"
-        new_name = ct._email_to_profile_name(current_email)
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title(t("auth_sync_title"))
-        dialog.configure(bg=BG)
-        dialog.geometry("440x320")
-        dialog.resizable(False, False)
-        dialog.transient(self.root)
-        dialog.grab_set()
-        self._bind_paste(dialog)
-
-        msg = t("auth_sync_new_email", cur_email=current_email, cur_date=cur_date,
-                std_email=stored_email or "?", std_date=std_date)
-        ttk.Label(dialog, text=msg, style="Stats.TLabel", justify="left", wraplength=390).pack(padx=16, pady=(16, 8))
-
-        btn_frame = tk.Frame(dialog, bg=BG)
-        btn_frame.pack(pady=8)
-
-        def do_update():
-            dialog.destroy()
-            print(f"[auth_sync] updating existing 'openai' profile")
-            ct.save_provider("openai")
-            self._refresh()
-            self.status_var.set(t("auth_updated", "openai"))
-
-        def do_new():
-            dialog.destroy()
-            print(f"[auth_sync] creating new profile '{new_name}'")
-            ct.save_provider(new_name)
-            self._refresh()
-            self.status_var.set(t("auth_created", new_name))
-
-        def do_skip():
-            dialog.destroy()
-
-        ttk.Button(btn_frame, text=t("auth_update_existing", "openai"), command=do_update).pack(fill="x", pady=2)
-        ttk.Button(btn_frame, text=t("auth_save_new", new_name), command=do_new).pack(fill="x", pady=2)
-        ttk.Button(btn_frame, text=t("auth_skip"), command=do_skip).pack(fill="x", pady=2)
+        print(f"[auth_sync] refreshing stored auth for active profile '{active_profile}'")
+        ct.save_provider(active_profile)
+        self._refresh()
+        self.status_var.set(t("auth_updated", active_profile))
 
     def _check_active_provider_saved_gui(self):
         """GUI: prompt to save active provider if not in profiles."""
         active = _get_active_provider()
         if not active or active == "?":
+            return
+        # If the current account is already recognized as a saved profile, nothing to do.
+        if _get_active_profile_name() is not None:
             return
         prov_data = _load_providers()
         profiles = prov_data.get("profiles", {})
@@ -1333,12 +1309,15 @@ class CodexManagerApp:
         prof = profiles[name]
         target = prof["model_provider"]
         active = _get_active_provider()
+        active_profile = _get_active_profile_name()
 
-        if target == active:
-            messagebox.showinfo(t("info"), t("already_using", active))
+        # Block only when the SAME account/profile is selected, not merely the same
+        # provider — two different OpenAI logins share model_provider="openai".
+        if active_profile and name == active_profile:
+            messagebox.showinfo(t("info"), t("already_using", active_profile))
             return
 
-        if not messagebox.askyesno(t("switch_title"), t("switch_confirm", active, target)):
+        if not messagebox.askyesno(t("switch_title"), t("switch_confirm", active_profile or active, name)):
             return
 
         try:
@@ -1355,8 +1334,8 @@ class CodexManagerApp:
                         auth_email = ct._extract_email_from_jwt(auth_data.get("tokens", {}).get("id_token"))
                     except Exception:
                         pass
-                existing = profiles.get(active, {})
-                profiles[active] = {
+                existing = profiles.get(active_profile or active, {})
+                profiles[active_profile or active] = {
                     "model_provider": active,
                     "model": model_val,
                     "auth_mode": auth_mode,
@@ -1366,7 +1345,7 @@ class CodexManagerApp:
                     "bound_at": existing.get("bound_at") or datetime.datetime.now().isoformat(),
                     "saved_at": datetime.datetime.now().isoformat(),
                 }
-                print(f"[switch] updated current provider auth: {active}")
+                print(f"[switch] updated current provider auth: {active_profile or active}")
 
             # Merge config — new format or backward compat
             target_section = prof.get("provider_section")
@@ -1396,9 +1375,9 @@ class CodexManagerApp:
                     f.write(ct._decode_secret(target_auth))
                 print("[switch] auth.json written")
 
-            data["active"] = target
+            data["active"] = name
             _save_providers(data)
-            print(f"[switch] providers.json updated (active={target})")
+            print(f"[switch] providers.json updated (active={name})")
 
             # Convert in background thread
             if self.convert_var.get():
@@ -1486,7 +1465,7 @@ class CodexManagerApp:
             "bound_at": existing.get("bound_at") or datetime.datetime.now().isoformat(),
             "saved_at": datetime.datetime.now().isoformat(),
         }
-        data["active"] = active
+        data["active"] = name
         _save_providers(data)
         print(f"[save] profile '{name}' saved (provider={active}, model={model_val}, auth={am})")
 
@@ -1540,6 +1519,7 @@ class CodexManagerApp:
             ttk.Label(dialog, text=t(label_key), style="TLabel").grid(row=row, column=0, padx=12, pady=4, sticky="w")
             var = tk.StringVar(value=default)
             entry = tk.Entry(dialog, textvariable=var, bg=BG2, fg=FG, insertbackground=FG, font=("Segoe UI", 10), relief="flat", width=32)
+            self._bind_paste(entry)
             entry.grid(row=row, column=1, padx=12, pady=4)
             ttk.Button(dialog, text=t("paste_clip"), style="Small.TButton",
                        command=lambda e=entry: self._paste_to_entry(e)).grid(row=row, column=2, padx=(0, 8), pady=4)
@@ -1668,6 +1648,8 @@ class CodexManagerApp:
                              insertbackground=FG if editable else BG2,
                              font=("Segoe UI", 10), relief="flat", width=32,
                              readonlybackground=BG2)
+            if editable:
+                self._bind_paste(entry)
             entry.grid(row=row, column=1, padx=12, pady=4)
             if not editable:
                 entry.config(state="readonly")
@@ -1912,6 +1894,7 @@ class CodexManagerApp:
         entry_frame = tk.Frame(dialog, bg=BG)
         entry_frame.pack(fill="x", padx=12)
         entry = tk.Entry(entry_frame, textvariable=result, bg=BG2, fg=FG, insertbackground=FG, font=("Segoe UI", 11), relief="flat")
+        self._bind_paste(entry)
         entry.pack(side="left", fill="x", expand=True)
         ttk.Button(entry_frame, text=t("paste_clip"), style="Small.TButton",
                    command=lambda: self._paste_to_entry(entry)).pack(side="right", padx=(4, 0))
@@ -1936,6 +1919,7 @@ class CodexManagerApp:
         entry_frame = tk.Frame(dialog, bg=BG)
         entry_frame.pack(fill="x", padx=12)
         entry = tk.Entry(entry_frame, textvariable=result, bg=BG2, fg=FG, insertbackground=FG, font=("Segoe UI", 11), relief="flat", show="*")
+        self._bind_paste(entry)
         entry.pack(side="left", fill="x", expand=True)
         ttk.Button(entry_frame, text=t("paste_clip"), style="Small.TButton",
                    command=lambda: self._paste_to_entry(entry)).pack(side="right", padx=(4, 0))

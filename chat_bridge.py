@@ -2,6 +2,9 @@
 """Chat Bridge helpers for Codex <-> Factory Droid sessions."""
 
 import datetime
+import base64
+import binascii
+import gzip
 import json
 import os
 import random
@@ -17,6 +20,10 @@ BRIDGE_FORMAT = "codex-droid-chat-bridge"
 BRIDGE_VERSION = 1
 MAPPING_FILE = "chat_bridge_mappings.json"
 CHAT_COMPACTION_MODES = ("inline", "native", "archived", "raw")
+DROID_SOURCE_ARCHIVE_FORMAT = "codex-droid-source-events"
+DROID_SOURCE_ARCHIVE_VERSION = 1
+DROID_IMAGE_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
+DROID_NATIVE_EVENT_TYPES = frozenset({"session_start", "message", "compaction_state", "todo_state", "session_end"})
 
 # Codex Desktop identity constants for Droid -> Codex conversion
 CODEX_DESKTOP_CLI_VERSION = "0.133.0-alpha.1"
@@ -205,8 +212,59 @@ def _read_json_file(path):
     return data if isinstance(data, dict) else {}
 
 
+def _droid_source_archive_path(jsonl_path):
+    jsonl_path = Path(jsonl_path)
+    return jsonl_path.with_name(f"{jsonl_path.stem}.bridge-source-events.json.gz")
+
+
+def _read_droid_source_archive(jsonl_path):
+    archive_path = _droid_source_archive_path(jsonl_path)
+    if not archive_path.exists():
+        return []
+    try:
+        with gzip.open(archive_path, "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        raise ValueError(f"invalid Droid source archive at {archive_path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("format") != DROID_SOURCE_ARCHIVE_FORMAT:
+        raise ValueError(f"invalid Droid source archive format at {archive_path}")
+    if _int_or_default(payload.get("version"), 0) != DROID_SOURCE_ARCHIVE_VERSION:
+        raise ValueError(f"unsupported Droid source archive version at {archive_path}")
+    expected_session_id = Path(jsonl_path).stem
+    archive_session_id = str(payload.get("droid_session_id") or "")
+    if archive_session_id and archive_session_id != expected_session_id:
+        raise ValueError(f"Droid source archive session mismatch at {archive_path}")
+    events = payload.get("events")
+    if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
+        raise ValueError(f"invalid Droid source archive events at {archive_path}")
+    source_app = str(payload.get("source_app") or "")
+    restored = json.loads(json.dumps(events))
+    if source_app:
+        for event in restored:
+            if not _bridge_source_app(event):
+                event["source_app"] = source_app
+    return restored
+
+
 def _bridge_id(app, session_id):
     return f"{app}-{_safe_id_piece(session_id)}"
+
+
+def _bridge_extras(bridge):
+    extras = bridge.get("extras") if isinstance(bridge, dict) and isinstance(bridge.get("extras"), dict) else {}
+    return extras
+
+
+def _bridge_droid_session_start(bridge):
+    extras = _bridge_extras(bridge)
+    data = extras.get("droid_session_start")
+    return data if isinstance(data, dict) else {}
+
+
+def _bridge_droid_settings(bridge):
+    extras = _bridge_extras(bridge)
+    data = extras.get("droid_settings")
+    return data if isinstance(data, dict) else {}
 
 
 def _unknown_work_context():
@@ -623,6 +681,10 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
         elif event_type == "compaction_state":
             compactions.append(_droid_compaction_from_event(event, event_index, session_start))
 
+    sidecar_source_events = _read_droid_source_archive(jsonl_path)
+    if sidecar_source_events:
+        archived_source_events = sidecar_source_events
+
     created_ms = min(timestamps) if timestamps else int(_utc_now().timestamp() * 1000)
     updated_ms = max(timestamps) if timestamps else created_ms
     work_context = _unknown_work_context()
@@ -648,6 +710,8 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
             "provider": bridge_provider,
             "model": settings_model,
             "reasoning_effort": settings.get("reasoningEffort") or "",
+            "is_title_manually_set": bool(session_start.get("isSessionTitleManuallySet")) if "isSessionTitleManuallySet" in session_start else False,
+            "title_auto_stage": str(session_start.get("sessionTitleAutoStage") or ""),
         },
         "work_context": work_context,
         "messages": messages,
@@ -657,6 +721,11 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
                 "sessionTitle": session_start.get("sessionTitle") or "",
                 "cwd": cwd,
                 "hostId": session_start.get("hostId") or "",
+                "owner": session_start.get("owner") or "",
+                "parent": session_start.get("parent") or "",
+                "version": session_start.get("version"),
+                "isSessionTitleManuallySet": bool(session_start.get("isSessionTitleManuallySet")) if "isSessionTitleManuallySet" in session_start else None,
+                "sessionTitleAutoStage": session_start.get("sessionTitleAutoStage") or "",
             },
             "droid_settings": {
                 "model": settings_model,
@@ -664,6 +733,7 @@ def droid_session_to_bridge(jsonl_path, settings_path=None):
                 "providerLock": settings_provider,
                 "providerLockTimestamp": settings.get("providerLockTimestamp") or "",
                 "tokenUsage": settings.get("tokenUsage") if isinstance(settings.get("tokenUsage"), dict) else {},
+                "assistantActiveTimeMs": _int_or_default(settings.get("assistantActiveTimeMs"), 0) if "assistantActiveTimeMs" in settings else None,
             }
         },
         "raw_event_refs": raw_event_refs,
@@ -2737,11 +2807,112 @@ def _droid_content_part(part):
     if part_type == "tool_call":
         return {"type": "tool_use", "id": part.get("id") or "", "name": part.get("name") or "", "input": _droid_tool_input(part.get("input"))}
     if part_type == "tool_result":
-        result = {"type": "tool_result", "tool_use_id": part.get("tool_call_id") or "", "content": part.get("content")}
+        result = {
+            "type": "tool_result",
+            "tool_use_id": str(part.get("tool_call_id") or ""),
+            "content": _normalize_droid_tool_result_content(part.get("content")),
+        }
         if "is_error" in part:
             result["is_error"] = bool(part.get("is_error"))
         return result
     return {"type": "text", "text": f"[unsupported bridge part: {part_type}]"}
+
+
+def _json_diagnostic_text(value):
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _droid_image_from_data_url(value):
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"data:(image/(?:jpeg|jpg|png|gif|webp));base64,([A-Za-z0-9+/=\s]+)", value.strip(), flags=re.IGNORECASE)
+    if not match:
+        return None
+    media_type = match.group(1).lower()
+    if media_type == "image/jpg":
+        media_type = "image/jpeg"
+    encoded = re.sub(r"\s+", "", match.group(2))
+    try:
+        base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "data": encoded,
+            "media_type": media_type,
+        },
+    }
+
+
+def _normalize_droid_image_block(value):
+    if not isinstance(value, dict):
+        return None
+    image_url = value.get("image_url")
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url")
+    image = _droid_image_from_data_url(image_url or value.get("url"))
+    if image:
+        return image
+    source = value.get("source") if isinstance(value.get("source"), dict) else {}
+    media_type = str(source.get("media_type") or source.get("mediaType") or "").lower()
+    if media_type == "image/jpg":
+        media_type = "image/jpeg"
+    data = source.get("data")
+    if source.get("type") != "base64" or media_type not in DROID_IMAGE_MEDIA_TYPES or not isinstance(data, str):
+        return None
+    encoded = re.sub(r"\s+", "", data)
+    try:
+        base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "data": encoded,
+            "media_type": media_type,
+        },
+    }
+
+
+def _normalize_droid_tool_result_block(value):
+    if isinstance(value, str):
+        return {"type": "text", "text": value}
+    if not isinstance(value, dict):
+        return {"type": "text", "text": _json_diagnostic_text(value)}
+    part_type = str(value.get("type") or "")
+    if part_type in ("input_image", "image"):
+        image = _normalize_droid_image_block(value)
+        if image:
+            return image
+    if part_type in ("text", "input_text", "output_text"):
+        return {"type": "text", "text": str(value.get("text") or "")}
+    return {"type": "text", "text": _json_diagnostic_text(value)}
+
+
+def _normalize_droid_tool_result_content(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return [_normalize_droid_tool_result_block(item) for item in value]
+    if isinstance(value, dict):
+        normalized = _normalize_droid_tool_result_block(value)
+        if normalized.get("type") in ("text", "image") and value.get("type") in (
+            "text",
+            "input_text",
+            "output_text",
+            "input_image",
+            "image",
+        ):
+            return [normalized]
+    return _json_diagnostic_text(value)
 
 
 def _droid_thinking_part(part):
@@ -2764,8 +2935,7 @@ def _droid_thinking_part(part):
         if summary:
             signature_payload["summary"] = summary
         signature = json.dumps(signature_payload, ensure_ascii=False)
-    if signature:
-        result["signature"] = signature
+    result["signature"] = signature
     if part.get("signature_provider") or encrypted_content:
         result["signatureProvider"] = str(part.get("signature_provider") or "openai")
     if part.get("duration_ms") is not None:
@@ -2796,6 +2966,123 @@ def _droid_bridge_source_event(source_event, index, source_app):
         "representedBy": str(source_event.get("represented_by") or ""),
         "raw": raw,
     }
+
+
+def _validate_droid_image_block(block, location):
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    if source.get("type") != "base64":
+        raise ValueError(f"{location} image source must use base64")
+    media_type = source.get("media_type")
+    if media_type not in DROID_IMAGE_MEDIA_TYPES:
+        raise ValueError(f"{location} image has unsupported media_type")
+    data = source.get("data")
+    if not isinstance(data, str):
+        raise ValueError(f"{location} image data must be a string")
+    try:
+        base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"{location} image data is not valid base64") from exc
+
+
+def _validate_droid_document_block(block, location):
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    source_type = source.get("type")
+    media_type = source.get("media_type")
+    if source_type == "base64" and media_type == "application/pdf":
+        if not isinstance(source.get("data", ""), str):
+            raise ValueError(f"{location} PDF data must be a string")
+        return
+    if source_type == "text" and media_type == "text/plain":
+        if not isinstance(source.get("data", ""), str):
+            raise ValueError(f"{location} document data must be a string")
+        return
+    raise ValueError(f"{location} has unsupported document source")
+
+
+def _validate_droid_content_block(block, location, tool_result_inner=False):
+    if not isinstance(block, dict):
+        raise ValueError(f"{location} must be an object")
+    block_type = block.get("type")
+    if block_type == "text":
+        if not isinstance(block.get("text"), str):
+            raise ValueError(f"{location} text must be a string")
+        return
+    if block_type == "image":
+        _validate_droid_image_block(block, location)
+        return
+    if tool_result_inner:
+        raise ValueError(f"{location} has unsupported tool result content type: {block_type}")
+    if block_type == "thinking":
+        if not isinstance(block.get("thinking"), str) or not isinstance(block.get("signature"), str):
+            raise ValueError(f"{location} thinking and signature must be strings")
+        if "signatureProvider" in block and not isinstance(block.get("signatureProvider"), str):
+            raise ValueError(f"{location} signatureProvider must be a string")
+        return
+    if block_type == "redacted_thinking":
+        if not isinstance(block.get("data"), str):
+            raise ValueError(f"{location} redacted thinking data must be a string")
+        return
+    if block_type == "tool_use":
+        if not isinstance(block.get("id"), str) or not isinstance(block.get("name"), str):
+            raise ValueError(f"{location} tool id and name must be strings")
+        if not isinstance(block.get("input"), dict):
+            raise ValueError(f"{location} tool input must be an object")
+        return
+    if block_type == "tool_result":
+        if not isinstance(block.get("tool_use_id"), str):
+            raise ValueError(f"{location} tool_use_id must be a string")
+        content = block.get("content")
+        if isinstance(content, str):
+            return
+        if not isinstance(content, list):
+            raise ValueError(f"{location} tool result content must be a string or list")
+        for index, inner_block in enumerate(content):
+            _validate_droid_content_block(inner_block, f"{location}.content[{index}]", tool_result_inner=True)
+        return
+    if block_type == "document":
+        _validate_droid_document_block(block, location)
+        return
+    raise ValueError(f"{location} has unsupported content type: {block_type}")
+
+
+def _validate_droid_events(events):
+    if not isinstance(events, list) or not events:
+        raise ValueError("Droid events must be a non-empty list")
+    session_starts = [event for event in events if isinstance(event, dict) and event.get("type") == "session_start"]
+    if len(session_starts) != 1 or events[0] is not session_starts[0]:
+        raise ValueError("Droid events must start with exactly one session_start")
+    if not isinstance(session_starts[0].get("id"), str) or not session_starts[0].get("id"):
+        raise ValueError("Droid session_start id must be a non-empty string")
+
+    message_ids = set()
+    for event_index, event in enumerate(events):
+        if not isinstance(event, dict):
+            raise ValueError(f"Droid event {event_index} must be an object")
+        event_type = event.get("type")
+        if event_type not in DROID_NATIVE_EVENT_TYPES:
+            raise ValueError(f"Droid event {event_index} has unsupported type: {event_type}")
+        if event_type != "message":
+            continue
+        message_id = event.get("id")
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError(f"Droid message {event_index} id must be a non-empty string")
+        if message_id in message_ids:
+            raise ValueError(f"Droid message id is duplicated: {message_id}")
+        parent_id = event.get("parentId")
+        if parent_id is not None and (not isinstance(parent_id, str) or parent_id not in message_ids):
+            raise ValueError(f"Droid message {message_id} has invalid parentId")
+        timestamp = event.get("timestamp")
+        if not isinstance(timestamp, str) or _parse_datetime(timestamp) is None:
+            raise ValueError(f"Droid message {message_id} has invalid timestamp")
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        if message.get("role") not in ("user", "assistant"):
+            raise ValueError(f"Droid message {message_id} has unsupported role")
+        content = message.get("content")
+        if not isinstance(content, list):
+            raise ValueError(f"Droid message {message_id} content must be a list")
+        for block_index, block in enumerate(content):
+            _validate_droid_content_block(block, f"message {message_id} content[{block_index}]")
+        message_ids.add(message_id)
 
 
 def _droid_compaction_state_event(compaction, index):
@@ -2922,6 +3209,10 @@ def _droid_project_dir_name(cwd):
     return name or ""
 
 
+def _droid_root_sessions_dir(factory_home):
+    return Path(factory_home) / "sessions"
+
+
 def _normalize_droid_cwd(cwd):
     text = str(cwd or "").strip()
     if text.startswith("\\\\?\\UNC\\"):
@@ -2932,7 +3223,7 @@ def _normalize_droid_cwd(cwd):
 
 
 def _droid_session_dir(factory_home, cwd):
-    sessions_dir = Path(factory_home) / "sessions"
+    sessions_dir = _droid_root_sessions_dir(factory_home)
     project_name = _droid_project_dir_name(cwd)
     return sessions_dir / project_name if project_name else sessions_dir
 
@@ -2990,6 +3281,7 @@ def _resolve_droid_session_settings(factory_home, session, timestamp, target_pro
     session_model = str(session.get("model") or "")
     session_provider = str(session.get("provider") or "")
     session_reasoning = str(session.get("reasoning_effort") or session.get("reasoningEffort") or "")
+    droid_settings = _bridge_droid_settings({"extras": session.get("extras")}) if isinstance(session.get("extras"), dict) else {}
     models = []
     effective_settings = {}
     try:
@@ -3039,9 +3331,9 @@ def _resolve_droid_session_settings(factory_home, session, timestamp, target_pro
         provider_lock = str((match or {}).get("provider") or _canonical_droid_provider(session_provider, selected_model_name) or "")
     reasoning = str(session_reasoning or (match or {}).get("reasoningEffort") or defaults.get("reasoningEffort") or effective_settings.get("reasoningEffort") or "")
     settings = {
-        "assistantActiveTimeMs": 0,
-        "providerLockTimestamp": timestamp,
-        "tokenUsage": {},
+        "assistantActiveTimeMs": _int_or_default(droid_settings.get("assistantActiveTimeMs"), 0) if "assistantActiveTimeMs" in droid_settings else 0,
+        "providerLockTimestamp": droid_settings.get("providerLockTimestamp") or timestamp,
+        "tokenUsage": droid_settings.get("tokenUsage") if isinstance(droid_settings.get("tokenUsage"), dict) else {},
     }
     if selected_model:
         settings["model"] = selected_model
@@ -3076,7 +3368,8 @@ def _update_droid_discovery_index(
     except Exception:
         data = {}
     data["version"] = int(data.get("version") or 1)
-    data["sessionsDir"] = str(factory_home / "sessions")
+    sessions_root = factory_home / "sessions"
+    data["sessionsDir"] = str(sessions_root)
     data["updatedAt"] = int(_utc_now().timestamp() * 1000)
     if not isinstance(data.get("projectDirectories"), list):
         data["projectDirectories"] = []
@@ -3113,6 +3406,17 @@ def _update_droid_discovery_index(
         entry["cwd"] = str(cwd)
     entries[session_id] = entry
     data["entries"] = entries
+    directory_path = str(jsonl_path.parent)
+    data["directories"][directory_path] = {
+        "sessionFiles": sorted(path.name for path in jsonl_path.parent.glob("*.jsonl")),
+    }
+    root_path = str(sessions_root)
+    if root_path not in data["directories"]:
+        data["directories"][root_path] = {
+            "sessionFiles": sorted(path.name for path in sessions_root.glob("*.jsonl")),
+        }
+    if jsonl_path.parent != sessions_root:
+        data["projectDirectories"] = sorted(set(data["projectDirectories"]) | {directory_path})
     if not isinstance(data.get("favorites"), dict):
         data["favorites"] = {"exists": False, "sessionIds": []}
     index_path.write_text(json.dumps(data, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
@@ -3171,35 +3475,37 @@ def _update_droid_index(
     )
 
 
-def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compaction_mode="archived", target_provider=None, target_model=None):
+def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compaction_mode="archived", target_provider=None, target_model=None, mirror_to_root=True):
     validate_bridge(bridge)
     compaction_mode = _normalize_compaction_mode(compaction_mode)
     factory_home = Path(factory_home)
     work = bridge.get("work_context") if isinstance(bridge.get("work_context"), dict) else {}
     current = work.get("current") if isinstance(work.get("current"), dict) else {}
     cwd = _normalize_droid_cwd(work.get("primary_cwd") or current.get("cwd") or "")
-    host_id = _droid_host_id(factory_home) if cwd else ""
+    droid_session_start = _bridge_droid_session_start(bridge)
+    original_host_id = str(droid_session_start.get("hostId") or "")
+    host_id = original_host_id or (_droid_host_id(factory_home) if cwd else "")
     sessions_dir = _droid_session_dir(factory_home, cwd)
     sessions_dir.mkdir(parents=True, exist_ok=True)
     source = bridge["source"]
     session = bridge["session"]
+    session_with_extras = dict(session)
+    session_with_extras["extras"] = _bridge_extras(bridge)
     droid_id = _new_id("bridge-droid")
     jsonl_path = sessions_dir / f"{droid_id}.jsonl"
     settings_path = sessions_dir / f"{droid_id}.settings.json"
+    archive_path = _droid_source_archive_path(jsonl_path)
     jsonl_tmp = None
     settings_tmp = None
+    archive_tmp = None
     now = _utc_now()
     now_ms = int(now.timestamp() * 1000)
     source_created_ms = _ms(session.get("created_at"), default=now_ms)
-    source_updated_ms = _ms(session.get("updated_at"), default=source_created_ms)
-    if preserve_timestamps:
-        created_ms = source_created_ms
-        updated_ms = source_updated_ms
-    else:
-        created_ms = now_ms
-        updated_ms = created_ms + max(len(bridge.get("messages", [])), 0)
+    created_ms = source_created_ms if preserve_timestamps else now_ms
+    imported_ms = now_ms
     try:
         title = session.get("title") or droid_id
+        manual_title = bool(session.get("is_title_manually_set")) or bool(droid_session_start.get("isSessionTitleManuallySet")) or bool(session.get("title"))
         compactions = bridge.get("compactions") or []
         events = _droid_raw_replay_events(bridge, droid_id, title, cwd=cwd, host_id=host_id) if compaction_mode == "raw" else []
         if events:
@@ -3212,22 +3518,27 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compa
                 "id": droid_id,
                 "title": title,
                 "sessionTitle": title,
-                "owner": "codex-provider-manager",
+                "owner": str(droid_session_start.get("owner") or "codex-provider-manager"),
+                "isSessionTitleManuallySet": manual_title,
             }
-            if native_compaction and native_compaction.get("parent_session_id"):
-                session_start["parent"] = str(native_compaction.get("parent_session_id"))
+            parent_session_id = str(droid_session_start.get("parent") or "")
+            if not parent_session_id and native_compaction and native_compaction.get("parent_session_id"):
+                parent_session_id = str(native_compaction.get("parent_session_id"))
+            if parent_session_id:
+                session_start["parent"] = parent_session_id
+            if not manual_title:
+                session_start["sessionTitleAutoStage"] = str(droid_session_start.get("sessionTitleAutoStage") or session.get("title_auto_stage") or "first_message")
             if cwd:
                 session_start.update({
-                    "version": 2,
+                    "version": _int_or_default(droid_session_start.get("version"), 2),
                     "cwd": cwd,
-                    "isSessionTitleManuallySet": False,
-                    "sessionTitleAutoStage": "first_message",
                 })
                 if host_id:
                     session_start["hostId"] = host_id
             events = [session_start]
 
             parent_id = ""
+            emitted_message_ids = set()
             if native_compaction:
                 events.append(_droid_compaction_state_event(_droid_anchorless_compaction(native_compaction), 0))
 
@@ -3249,32 +3560,53 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compa
                 }
                 if message.get("role") not in ("user", "assistant"):
                     event["bridgeRole"] = str(message.get("role") or "unknown")
-                if parent_id:
+                explicit_parent_id = str(message.get("parent_id") or "")
+                if explicit_parent_id in emitted_message_ids:
+                    event["parentId"] = explicit_parent_id
+                elif parent_id:
                     event["parentId"] = parent_id
                 events.append(event)
                 parent_id = event_id
+                emitted_message_ids.add(event_id)
 
             if compaction_mode == "inline":
                 for compaction_index, compaction in enumerate(compactions):
                     events.append(_droid_compaction_state_event(compaction, compaction_index))
 
-            for source_index, source_event in enumerate(bridge.get("source_events") or []):
-                events.append(_droid_bridge_source_event(source_event, source_index, source.get("app") or ""))
             message_count = len(active_messages)
 
+        _validate_droid_events(events)
         jsonl_fd, jsonl_tmp_name = tempfile.mkstemp(prefix=f"{droid_id}.", suffix=".jsonl.tmp", dir=str(sessions_dir))
         jsonl_tmp = Path(jsonl_tmp_name)
         with os.fdopen(jsonl_fd, "w", encoding="utf-8") as handle:
             handle.write("".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events))
-        settings = _resolve_droid_session_settings(factory_home, session, session.get("updated_at") or _iso(now), target_provider=target_provider, target_model=target_model)
+        settings = _resolve_droid_session_settings(factory_home, session_with_extras, session.get("updated_at") or _iso(now), target_provider=target_provider, target_model=target_model)
         settings_fd, settings_tmp_name = tempfile.mkstemp(prefix=f"{droid_id}.", suffix=".settings.json.tmp", dir=str(sessions_dir))
         settings_tmp = Path(settings_tmp_name)
         with os.fdopen(settings_fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(settings, indent=2, ensure_ascii=True) + "\n")
+        source_events = [event for event in (bridge.get("source_events") or []) if isinstance(event, dict)]
+        if source_events:
+            archive_fd, archive_tmp_name = tempfile.mkstemp(prefix=f"{droid_id}.", suffix=".bridge-source-events.json.gz.tmp", dir=str(sessions_dir))
+            archive_tmp = Path(archive_tmp_name)
+            archive_payload = {
+                "format": DROID_SOURCE_ARCHIVE_FORMAT,
+                "version": DROID_SOURCE_ARCHIVE_VERSION,
+                "droid_session_id": droid_id,
+                "source_app": str(source.get("app") or ""),
+                "events": source_events,
+            }
+            with os.fdopen(archive_fd, "wb") as raw_handle:
+                with gzip.GzipFile(fileobj=raw_handle, mode="wb", mtime=0) as gzip_handle:
+                    gzip_handle.write(json.dumps(archive_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         jsonl_tmp.replace(jsonl_path)
         settings_tmp.replace(settings_path)
-        os.utime(jsonl_path, (updated_ms / 1000.0, updated_ms / 1000.0))
-        os.utime(settings_path, (updated_ms / 1000.0, updated_ms / 1000.0))
+        if archive_tmp is not None:
+            archive_tmp.replace(archive_path)
+        os.utime(jsonl_path, (imported_ms / 1000.0, imported_ms / 1000.0))
+        os.utime(settings_path, (imported_ms / 1000.0, imported_ms / 1000.0))
+        if archive_path.exists():
+            os.utime(archive_path, (imported_ms / 1000.0, imported_ms / 1000.0))
         _update_droid_index(
             factory_home,
             droid_id,
@@ -3285,7 +3617,7 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compa
             cwd=cwd,
             host_id=host_id,
             created_ms=created_ms,
-            modified_ms=updated_ms,
+            modified_ms=imported_ms,
         )
         warnings = []
         try:
@@ -3303,11 +3635,15 @@ def import_bridge_to_droid(bridge, factory_home, preserve_timestamps=True, compa
             "droid_session_id": droid_id,
             "droid_jsonl_path": str(jsonl_path),
             "droid_settings_path": str(settings_path),
+            "droid_source_archive_path": str(archive_path) if archive_path.exists() else "",
+            "droid_list_jsonl_path": str(jsonl_path),
+            "droid_list_settings_path": str(settings_path),
             "mapping_path": str(mapping_path),
+            "mirror_mode": "",
             "warnings": warnings,
         }
     except Exception:
-        for path in (jsonl_tmp, settings_tmp, jsonl_path, settings_path):
+        for path in (jsonl_tmp, settings_tmp, archive_tmp, jsonl_path, settings_path, archive_path):
             try:
                 if path is not None and Path(path).exists():
                     Path(path).unlink()

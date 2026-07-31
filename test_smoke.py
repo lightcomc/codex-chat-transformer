@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import codex_chat_transformer as ct
@@ -228,6 +229,15 @@ def test_gui_chat_bridge_buttons_bind_expected_callbacks():
         assert callback in commands, f"GUI Chat Bridge button callback not bound: {callback}"
 
 
+def test_gui_dialog_entries_bind_paste_directly():
+    text = (Path(__file__).parent / "codex_manager_gui.py").read_text(encoding="utf-8")
+    assert "def _paste_clipboard_into" in text, "GUI paste helper missing"
+    assert "def _handle_entry_shortcut" in text, "GUI entry shortcut handler missing"
+    assert "keycode == 65" in text, "Ctrl+A should select all"
+    assert "cyrillic_em" in text, "Ctrl+V should work on RU keyboard layout"
+    assert text.count("self._bind_paste(entry)") >= 4, "dialog Entry widgets should bind paste directly"
+
+
 def test_merge_preserves_all_sections():
     cfg = (
         'model_provider = "A"\n'
@@ -247,6 +257,40 @@ def test_merge_preserves_all_sections():
     assert 'model = "gpt-5.5"' in result, "model not updated"
     assert "[model_providers.A]" in result, "ProviderA section lost"
     assert "[model_providers.B]" in result, "ProviderB section lost"
+    # Regression: each provider section must appear EXACTLY once.
+    # A substring `in` check passes even when a section is duplicated.
+    assert result.count("[model_providers.A]") == 1, "ProviderA duplicated"
+    assert result.count("[model_providers.B]") == 1, "ProviderB duplicated"
+
+
+def test_merge_no_duplicate_from_contaminated_blob():
+    """If a profile stored a contaminated provider_section that is the
+    concatenation of several [model_providers.*] blocks (legacy bug),
+    merging must NOT duplicate the other providers already in config.toml."""
+    cfg = (
+        'model_provider = "A"\n'
+        'model = "gpt-5"\n'
+        "\n"
+        "[model_providers.A]\n"
+        'name = "A"\n'
+        'base_url = "https://a.com"\n'
+        "\n"
+        "[model_providers.B]\n"
+        'name = "B"\n'
+        'base_url = "https://b.com"\n'
+    )
+    # Contaminated blob: B's section followed by a stray copy of A's section.
+    blob = (
+        "[model_providers.B]\n"
+        'name = "B"\n'
+        'base_url = "https://b.com"\n'
+        "[model_providers.A]\n"
+        'name = "A"\n'
+        'base_url = "https://a.com"\n'
+    )
+    result = ct._merge_config(cfg, "B", blob, "gpt-5.5")
+    assert result.count("[model_providers.A]") == 1, "ProviderA duplicated from blob"
+    assert result.count("[model_providers.B]") == 1, "ProviderB duplicated from blob"
 
 
 def test_merge_append_new_section():
@@ -328,17 +372,24 @@ def test_remove_provider():
 def test_extract_provider_config():
     cfg = (
         'model = "gpt-5.5"\n'
-        'model_provider = "MyProv"\n'
+        'model_provider = "Active"\n'
         "\n"
-        "[model_providers.MyProv]\n"
-        'name = "MyProv"\n'
-        'base_url = "https://my.com/v1"\n'
+        "[model_providers.Active]\n"
+        'name = "Active"\n'
+        'base_url = "https://active.com/v1"\n'
         'wire_api = "responses"\n'
+        "\n"
+        "[model_providers.Other]\n"
+        'name = "Other"\n'
+        'base_url = "https://other.com/v1"\n'
     )
     name, section, model = ct._extract_provider_config(cfg)
-    assert name == "MyProv"
+    assert name == "Active"
     assert model == "gpt-5.5"
-    assert "[model_providers.MyProv]" in section
+    assert "[model_providers.Active]" in section
+    # Regression: must return ONLY the active provider's section. An earlier
+    # line-collector grabbed every consecutive [model_providers.*] block.
+    assert "[model_providers.Other]" not in section, "extractor leaked other provider section"
 
 
 def test_transform_signature():
@@ -1651,10 +1702,16 @@ def test_chat_bridge_codex_to_droid_preserves_project_context():
 
         summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=factory_home)
         jsonl_path = Path(summary["droid_jsonl_path"])
-        assert jsonl_path.parent.name == "-C-Research-nothing", f"Droid project sessions should be nested by cwd: {jsonl_path}"
+        list_jsonl_path = Path(summary["droid_list_jsonl_path"])
+        project_dir = factory_home / "sessions" / "-C-Research-nothing"
+        assert jsonl_path.parent == project_dir, f"Codex-imported Droid sessions should live in their project directory: {jsonl_path}"
+        assert list_jsonl_path == jsonl_path, f"list path should point at the canonical imported session file: {summary}"
+        assert list((factory_home / "sessions").rglob(f"{summary['droid_session_id']}.jsonl")) == [jsonl_path], f"import should create one canonical Droid session file: {summary}"
         first_event = json.loads(jsonl_path.read_text(encoding="utf-8").splitlines()[0])
         assert first_event["cwd"] == r"C:\Research\nothing", f"session_start should preserve cwd: {first_event}"
         assert first_event["hostId"] == "host-project-1", f"session_start should preserve hostId: {first_event}"
+        assert first_event["isSessionTitleManuallySet"] is True, f"imported title should be marked manual so Droid does not regenerate it: {first_event}"
+        assert "sessionTitleAutoStage" not in first_event, f"manual imported title should not schedule auto title generation: {first_event}"
 
         session_index = json.loads((factory_home / "sessions-index.json").read_text(encoding="utf-8"))
         entry = next(e for e in session_index["entries"] if e["sessionId"] == summary["droid_session_id"])
@@ -1664,9 +1721,49 @@ def test_chat_bridge_codex_to_droid_preserves_project_context():
         discovery = json.loads((factory_home / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
         discovered = discovery["entries"][summary["droid_session_id"]]
         assert discovered["cwd"] == r"C:\Research\nothing", f"discovery index should preserve cwd: {discovered}"
-        assert discovered["directoryPath"].endswith(r"sessions\-C-Research-nothing"), f"discovery directory should point at project folder: {discovered}"
+        assert discovered["directoryPath"] == str(project_dir), f"discovery index should point at the project sessions dir: {discovered}"
+        assert str(project_dir) in discovery["projectDirectories"], f"discovery index should track the imported project directory: {discovery}"
+        assert jsonl_path.name in discovery["directories"][str(project_dir)]["sessionFiles"], f"project directory snapshot should include the import: {discovery}"
     finally:
         restore_temp_codex_home(original, tmp_dir)
+
+
+def test_chat_bridge_droid_round_trip_preserves_manual_title_and_settings_metadata():
+    import chat_bridge
+
+    with tempfile.TemporaryDirectory() as tmp:
+        jsonl_path, settings_path = write_temp_droid_session(tmp, session_id="droid-manual", title="Pinned Review Task")
+        events = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+        events[0].update({
+            "sessionTitle": "Pinned Review Task",
+            "owner": "manual-owner",
+            "version": 2,
+            "cwd": r"C:\Research\nothing",
+            "hostId": "host-manual-1",
+            "isSessionTitleManuallySet": True,
+            "sessionTitleAutoStage": "first_file_edit",
+        })
+        jsonl_path.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        settings["assistantActiveTimeMs"] = 4321
+        settings["tokenUsage"] = {"total": 123, "output": 7}
+        settings_path.write_text(json.dumps(settings), encoding="utf-8")
+
+        bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True, mirror_to_root=False)
+        round_trip_events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+        round_trip_settings = json.loads(Path(summary["droid_settings_path"]).read_text(encoding="utf-8"))
+
+    first_event = round_trip_events[0]
+    assert bridge["session"]["is_title_manually_set"] is True, f"Droid bridge should retain manual title marker: {bridge['session']}"
+    assert first_event["title"] == "Pinned Review Task", f"round-trip should preserve imported title text: {first_event}"
+    assert first_event["isSessionTitleManuallySet"] is True, f"round-trip should keep manual title flag: {first_event}"
+    assert "sessionTitleAutoStage" not in first_event, f"manual title should not be scheduled for regeneration: {first_event}"
+    assert first_event["hostId"] == "host-manual-1", f"round-trip should keep original Droid hostId when present: {first_event}"
+    assert first_event["owner"] == "manual-owner", f"round-trip should keep original owner: {first_event}"
+    assert round_trip_settings["assistantActiveTimeMs"] == 4321, f"assistant active time should survive round-trip: {round_trip_settings}"
+    assert round_trip_settings["tokenUsage"] == {"total": 123, "output": 7}, f"token usage should survive round-trip: {round_trip_settings}"
 
 
 def test_chat_bridge_codex_to_droid_normalizes_extended_windows_cwd():
@@ -1703,12 +1800,12 @@ def test_chat_bridge_codex_to_droid_normalizes_extended_windows_cwd():
         discovery = json.loads((Path(tmp) / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
         discovered = discovery["entries"][summary["droid_session_id"]]
 
-    assert jsonl_path.parent.name == "-C-Research-nothing", f"extended cwd should use Droid's normal project folder slug: {jsonl_path}"
+    assert jsonl_path.parent.name == "-C-Research-nothing", f"extended cwd should map to the canonical project directory: {jsonl_path}"
     assert first_event["cwd"] == r"C:\Research\nothing", f"Droid cwd should not keep Windows extended prefix: {first_event}"
     assert discovered["cwd"] == r"C:\Research\nothing", f"discovery cwd should not keep Windows extended prefix: {discovered}"
 
 
-def test_chat_bridge_codex_to_droid_preserves_droid_index_timestamps():
+def test_chat_bridge_codex_to_droid_uses_fresh_discovery_time():
     import chat_bridge
 
     bridge = {
@@ -1732,17 +1829,23 @@ def test_chat_bridge_codex_to_droid_preserves_droid_index_timestamps():
         "raw_event_refs": [],
     }
     with tempfile.TemporaryDirectory() as tmp:
+        before_import_ms = int(time.time() * 1000)
         summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True)
+        after_import_ms = int(time.time() * 1000)
+        events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
         session_index = json.loads((Path(tmp) / "sessions-index.json").read_text(encoding="utf-8"))
         entry = next(e for e in session_index["entries"] if e["sessionId"] == summary["droid_session_id"])
         discovery = json.loads((Path(tmp) / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
         discovered = discovery["entries"][summary["droid_session_id"]]
 
-    expected_updated_ms = 1735787047000
     expected_created_ms = 1735787045000
-    assert abs(entry["mtime"] - expected_updated_ms) < 1500, f"Droid mtime should preserve source updated_at: {entry}"
-    assert abs(discovered["modifiedTimeMs"] - expected_updated_ms) < 1500, f"discovery modified time should preserve source updated_at: {discovered}"
+    assert before_import_ms - 1000 <= entry["mtime"] <= after_import_ms + 1000, f"Droid mtime should reflect the fresh import: {entry}"
+    assert discovered["modifiedTimeMs"] == entry["mtime"], f"discovery modified time should match the fresh import: {discovered}"
     assert discovered["createdTimeMs"] == expected_created_ms, f"discovery created time should preserve source created_at: {discovered}"
+    assert [event["timestamp"] for event in events if event.get("type") == "message"] == [
+        "2025-01-02T03:04:05Z",
+        "2025-01-02T03:04:07Z",
+    ], f"fresh discovery time must not rewrite message timestamps: {events}"
 
 
 def test_chat_bridge_codex_to_droid_writes_droid_valid_tool_inputs_and_parent_chain():
@@ -1787,6 +1890,153 @@ def test_chat_bridge_codex_to_droid_writes_droid_valid_tool_inputs_and_parent_ch
     assert "parentId" not in messages[0], f"first Droid message should start the chain: {messages[0]}"
     assert messages[1]["parentId"] == messages[0]["id"], f"second message should point at previous message: {messages}"
     assert messages[2]["parentId"] == messages[1]["id"], f"tool result should point at assistant tool call message: {messages}"
+
+
+def test_chat_bridge_codex_to_droid_normalizes_native_content_contract():
+    import chat_bridge
+
+    png_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+XwP7WQAAAABJRU5ErkJggg=="
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "codex", "session_id": "codex-content", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {
+            "bridge_id": "codex-codex-content",
+            "title": "Native Content",
+            "created_at": "2026-05-28T10:00:00Z",
+            "updated_at": "2026-05-28T10:00:03Z",
+            "provider": "openai",
+            "model": "gpt-5",
+        },
+        "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+        "messages": [
+            {
+                "id": "assistant-tools",
+                "role": "assistant",
+                "created_at": "2026-05-28T10:00:01Z",
+                "parts": [
+                    {"type": "reasoning", "text": "inspect screenshot"},
+                    {"type": "tool_call", "id": "call-image", "name": "view_image", "input": {}},
+                ],
+            },
+            {
+                "id": "tool-results",
+                "role": "tool",
+                "created_at": "2026-05-28T10:00:02Z",
+                "parts": [
+                    {
+                        "type": "tool_result",
+                        "tool_call_id": "call-image",
+                        "content": [
+                            {"type": "input_image", "image_url": f"data:image/png;base64,{png_data}"},
+                            {"type": "text", "text": "caption"},
+                            {"type": "unsupported", "value": 3},
+                        ],
+                    },
+                    {"type": "tool_result", "tool_call_id": "call-object", "content": {"answer": 42}},
+                    {"type": "tool_result", "tool_call_id": "call-number", "content": 7},
+                    {"type": "tool_result", "tool_call_id": "call-null", "content": None},
+                ],
+            },
+        ],
+        "source_events": [],
+        "extras": {},
+        "raw_event_refs": [],
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True)
+        events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+
+    chat_bridge._validate_droid_events(events)
+    thinking = events[1]["message"]["content"][0]
+    results = events[2]["message"]["content"]
+    assert thinking["signature"] == "", f"Droid thinking signature must always be a string: {thinking}"
+    assert results[0]["content"][0] == {
+        "type": "image",
+        "source": {"type": "base64", "data": png_data, "media_type": "image/png"},
+    }, f"Codex input_image should become a native persisted Droid image: {results[0]}"
+    assert results[0]["content"][1] == {"type": "text", "text": "caption"}, f"text tool output should stay native text: {results[0]}"
+    assert results[0]["content"][2]["type"] == "text" and '"type":"unsupported"' in results[0]["content"][2]["text"], f"unsupported array blocks should become diagnostic text: {results[0]}"
+    assert results[1]["content"] == '{"answer":42}', f"object tool output should become deterministic text: {results[1]}"
+    assert results[2]["content"] == "7", f"numeric tool output should become text: {results[2]}"
+    assert results[3]["content"] == "null", f"null tool output should become text: {results[3]}"
+
+    invalid_events = json.loads(json.dumps(events))
+    invalid_events[2]["message"]["content"][0]["content"] = [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]
+    try:
+        chat_bridge._validate_droid_events(invalid_events)
+    except ValueError as exc:
+        assert "unsupported tool result content type" in str(exc), f"validator should identify unsupported content: {exc}"
+    else:
+        raise AssertionError("validator should reject non-native tool result blocks")
+
+
+def test_chat_bridge_codex_to_droid_rejects_invalid_raw_replay_before_commit():
+    import chat_bridge
+
+    bridge = {
+        "format": "codex-droid-chat-bridge",
+        "version": 1,
+        "source": {"app": "droid", "session_id": "droid-invalid", "path": "", "exported_at": "2026-05-28T10:00:00Z"},
+        "session": {
+            "bridge_id": "droid-droid-invalid",
+            "title": "Invalid Replay",
+            "created_at": "2026-05-28T10:00:00Z",
+            "updated_at": "2026-05-28T10:00:01Z",
+            "provider": "openai",
+            "model": "gpt-5",
+        },
+        "work_context": {"primary_cwd": "", "current": {"cwd": "", "confidence": "unknown"}, "timeline_complete": False, "snapshots": []},
+        "messages": [],
+        "source_events": [
+            {
+                "index": 0,
+                "timestamp": "2026-05-28T10:00:00Z",
+                "source_app": "droid",
+                "outer_type": "session_start",
+                "payload_type": "session_start",
+                "represented_by": "",
+                "raw": {"type": "session_start", "id": "droid-invalid", "title": "Invalid Replay", "owner": "test"},
+            },
+            {
+                "index": 1,
+                "timestamp": "2026-05-28T10:00:01Z",
+                "source_app": "droid",
+                "outer_type": "message",
+                "payload_type": "message",
+                "represented_by": "bad-message",
+                "raw": {
+                    "type": "message",
+                    "id": "bad-message",
+                    "timestamp": "2026-05-28T10:00:01Z",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call-invalid",
+                                "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}],
+                            },
+                        ],
+                    },
+                },
+            },
+        ],
+        "extras": {},
+        "raw_event_refs": [],
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True, compaction_mode="raw")
+        except ValueError as exc:
+            assert "unsupported tool result content type" in str(exc), f"validator should report the foreign block: {exc}"
+        else:
+            raise AssertionError("invalid raw replay should fail before commit")
+        assert not list((Path(tmp) / "sessions").rglob("*.jsonl")), "invalid replay should not leave a Droid session file"
+        assert not (Path(tmp) / "sessions-index.json").exists(), "invalid replay should not update the Droid index"
+        assert not (Path(tmp) / "cache" / "session-discovery-index.json").exists(), "invalid replay should not update discovery"
 
 
 def test_chat_bridge_codex_to_droid_uses_unique_event_ids_for_tool_pairs():
@@ -2296,10 +2546,15 @@ def test_chat_bridge_codex_to_droid_preserves_lossless_source_events():
 
         summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp_dir / "factory", preserve_timestamps=True)
         events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
-        droid_source_events = [event for event in events if event.get("type") == "bridge_source_event"]
-        assert len(droid_source_events) == len(source_events), f"Droid JSONL should keep every bridge source event: {events}"
-        assert droid_source_events[3]["payloadType"] == "reasoning", f"reasoning should be present in Droid JSONL: {droid_source_events[3]}"
-        assert droid_source_events[5]["raw"]["payload"]["output"] == "tool output body", f"tool output body should survive losslessly: {droid_source_events[5]}"
+        archive_path = Path(summary["droid_source_archive_path"])
+        archived_events = chat_bridge._read_droid_source_archive(summary["droid_jsonl_path"])
+        assert archive_path.exists(), f"lossless source metadata should be written outside native Droid JSONL: {summary}"
+        assert not [event for event in events if event.get("type") == "bridge_source_event"], f"native Droid JSONL should contain no archival event types: {events}"
+        assert len(archived_events) == len(source_events), f"source archive should keep every bridge source event: {archived_events}"
+        assert archived_events[3]["payload_type"] == "reasoning", f"reasoning should be present in the source archive: {archived_events[3]}"
+        assert archived_events[5]["raw"]["payload"]["output"] == "tool output body", f"tool output body should survive losslessly: {archived_events[5]}"
+        droid_bridge = chat_bridge.droid_session_to_bridge(summary["droid_jsonl_path"], summary["droid_settings_path"])
+        assert droid_bridge["source_events"] == archived_events, f"Droid bridge should restore the external source archive: {droid_bridge['source_events']}"
 
         discovery = json.loads((tmp_dir / "factory" / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
         discovered = discovery["entries"][summary["droid_session_id"]]
@@ -3262,12 +3517,13 @@ def test_chat_bridge_codex_to_droid_raw_compaction_mode_skips_native_state():
     with tempfile.TemporaryDirectory() as tmp:
         summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True, compaction_mode="raw")
         events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+        source_events = chat_bridge._read_droid_source_archive(summary["droid_jsonl_path"])
         discovery = json.loads((Path(tmp) / "cache" / "session-discovery-index.json").read_text(encoding="utf-8"))
 
     assert not [event for event in events if event.get("type") == "compaction_state"], f"raw mode should not write native Droid compaction_state: {events}"
-    source_events = [event for event in events if event.get("type") == "bridge_source_event"]
-    assert len(source_events) == 2, f"raw mode should keep mixed lossless source events: {events}"
-    assert [event["payloadType"] for event in source_events] == ["task_started", "compacted"], f"raw mode source event order should be preserved: {source_events}"
+    assert not [event for event in events if event.get("type") == "bridge_source_event"], f"raw mode should keep native Droid JSONL free of archive events: {events}"
+    assert len(source_events) == 2, f"raw mode should keep mixed lossless source events in the sidecar: {source_events}"
+    assert [event["payload_type"] for event in source_events] == ["task_started", "compacted"], f"raw mode source event order should be preserved: {source_events}"
     assert len([event for event in events if event.get("type") == "message"]) == 2, f"raw mode should keep visible messages: {events}"
     assert discovery["entries"][summary["droid_session_id"]]["messageCount"] == 2, f"source events should not inflate message count: {discovery}"
 
@@ -3295,9 +3551,11 @@ def test_chat_bridge_codex_to_droid_default_archived_compaction_mode_skips_nativ
     with tempfile.TemporaryDirectory() as tmp:
         summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=tmp, preserve_timestamps=True)
         events = chat_bridge._read_jsonl(summary["droid_jsonl_path"])
+        source_events = chat_bridge._read_droid_source_archive(summary["droid_jsonl_path"])
 
     assert not [event for event in events if event.get("type") == "compaction_state"], f"default archived mode should not activate Droid compaction: {events}"
-    assert [event["payloadType"] for event in events if event.get("type") == "bridge_source_event"] == ["compacted"], f"default archived mode should keep compaction only as source archive: {events}"
+    assert not [event for event in events if event.get("type") == "bridge_source_event"], f"default archived mode should keep native JSONL free of archive events: {events}"
+    assert [event["payload_type"] for event in source_events] == ["compacted"], f"default archived mode should keep compaction only in the source sidecar: {source_events}"
     assert len([event for event in events if event.get("type") == "message"]) == 2, f"default archived mode should keep full visible history: {events}"
 
 
@@ -4375,7 +4633,7 @@ def test_chat_bridge_cli_mirror_apply_confirm_exports_codex_copy_to_droid():
         droid_rollouts = list((factory_home / "sessions").rglob("*.jsonl"))
         assert handled is True, "confirmed mirror apply should be handled"
         assert backup_calls == [], f"Codex-to-Droid mirror copy should not back up Codex DB: {backup_calls}"
-        assert len(droid_rollouts) == 1, f"confirmed export should create one Droid session copy: {droid_rollouts}"
+        assert len(droid_rollouts) == 1, f"confirmed export should create one canonical Droid session file: {droid_rollouts}"
         assert "codex-export ->" in text, f"output should report exported session pair: {text}"
         assert "mirror me" in droid_rollouts[0].read_text(encoding="utf-8"), "Droid copy should contain transferred messages"
     finally:
@@ -6292,6 +6550,320 @@ def test_sqlite_sync_updates_existing():
         shutil.rmtree(tmp_dir)
 
 
+def _make_jwt(email):
+    """Build a minimal unsigned JWT id_token whose payload carries `email`."""
+    import base64
+
+    def b64(d):
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+
+    header = b64({"alg": "none", "typ": "JWT"})
+    payload = b64({"email": email})
+    return f"{header}.{payload}."
+
+
+def test_get_active_profile_name_distinguishes_openai_logins():
+    """Two openai profiles (same model_provider, different emails) must be told apart."""
+    orig, tmp_dir = setup_temp_codex_home()
+    try:
+        jwt_a = _make_jwt("alice@example.com")
+        jwt_b = _make_jwt("bob@example.com")
+        data = {
+            "profiles": {
+                "openai_alice": {
+                    "model_provider": "openai",
+                    "auth_mode": "chatgpt",
+                    "auth.json": ct._encode_secret(json.dumps({"auth_mode": "chatgpt", "tokens": {"id_token": jwt_a}})),
+                },
+                "openai_bob": {
+                    "model_provider": "openai",
+                    "auth_mode": "chatgpt",
+                    "auth.json": ct._encode_secret(json.dumps({"auth_mode": "chatgpt", "tokens": {"id_token": jwt_b}})),
+                },
+            },
+            "active": "openai_bob",
+        }
+        ct._save_providers(data)
+        # config.toml selects the openai provider
+        (ct.CODEX_DIR / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+        # Current live auth.json is Bob's account
+        (ct.CODEX_DIR / "auth.json").write_text(
+            json.dumps({"auth_mode": "chatgpt", "tokens": {"id_token": jwt_b}}),
+            encoding="utf-8",
+        )
+
+        assert ct._get_active_provider() == "openai", "provider must be openai"
+        active = ct._get_active_profile_name()
+        assert active == "openai_bob", f"expected openai_bob, got {active}"
+
+        # Switch the live auth to Alice -> active profile should change to Alice
+        (ct.CODEX_DIR / "auth.json").write_text(
+            json.dumps({"auth_mode": "chatgpt", "tokens": {"id_token": jwt_a}}),
+            encoding="utf-8",
+        )
+        active = ct._get_active_profile_name()
+        assert active == "openai_alice", f"expected openai_alice, got {active}"
+    finally:
+        restore_temp_codex_home(orig, tmp_dir)
+
+
+def test_switch_between_two_openai_profiles_not_blocked():
+    """use_provider must switch auth.json even when both profiles share provider 'openai'."""
+    orig, tmp_dir = setup_temp_codex_home()
+    try:
+        jwt_a = _make_jwt("alice@example.com")
+        jwt_b = _make_jwt("bob@example.com")
+
+        # config.toml with an openai provider section
+        (ct.CODEX_DIR / "config.toml").write_text(
+            'model_provider = "openai"\n\n[model_providers.openai]\nname = "OpenAI"\nbase_url = "https://api.openai.com/v1"\nwire_api = "responses"\n',
+            encoding="utf-8",
+        )
+        # Live auth = Alice
+        (ct.CODEX_DIR / "auth.json").write_text(
+            json.dumps({"auth_mode": "chatgpt", "tokens": {"id_token": jwt_a}}),
+            encoding="utf-8",
+        )
+
+        ct._save_providers({
+            "profiles": {
+                "openai_alice": {
+                    "model_provider": "openai",
+                    "auth_mode": "chatgpt",
+                    "model": "gpt-5",
+                    "provider_section": '[model_providers.openai]\nname = "OpenAI"\nbase_url = "https://api.openai.com/v1"\nwire_api = "responses"\n',
+                    "auth.json": ct._encode_secret(json.dumps({"auth_mode": "chatgpt", "tokens": {"id_token": jwt_a}})),
+                },
+                "openai_bob": {
+                    "model_provider": "openai",
+                    "auth_mode": "chatgpt",
+                    "model": "gpt-5",
+                    "provider_section": '[model_providers.openai]\nname = "OpenAI"\nbase_url = "https://api.openai.com/v1"\nwire_api = "responses"\n',
+                    "auth.json": ct._encode_secret(json.dumps({"auth_mode": "chatgpt", "tokens": {"id_token": jwt_b}})),
+                },
+            },
+            "active": "openai_alice",
+        })
+
+        # Sanity: live auth is currently Alice's
+        assert ct._get_active_profile_name() == "openai_alice"
+
+        # Switch to Bob (same provider 'openai') — must NOT be a no-op.
+        ct.use_provider("openai_bob", skip_convert=True)
+
+        live = json.loads((ct.CODEX_DIR / "auth.json").read_text(encoding="utf-8"))
+        live_jwt = live.get("tokens", {}).get("id_token", "")
+        assert ct._extract_email_from_jwt(live_jwt) == "bob@example.com", "auth.json should now be Bob's"
+        assert ct._get_active_profile_name() == "openai_bob", "active profile should now be Bob"
+
+        data = ct._load_providers()
+        assert data["active"] == "openai_bob", f"active field should be openai_bob, got {data.get('active')}"
+        # Alice's auth must be preserved (auto-saved back), not overwritten by Bob's.
+        alice_auth = json.loads(ct._decode_secret(data["profiles"]["openai_alice"]["auth.json"]))
+        assert ct._extract_email_from_jwt(alice_auth.get("tokens", {}).get("id_token", "")) == "alice@example.com", "Alice's profile must not be clobbered"
+    finally:
+        restore_temp_codex_home(orig, tmp_dir)
+
+
+def test_startup_auth_sync_updates_active_profile():
+    """On startup, if the live auth.json is fresher than the ACTIVE profile's stored
+    auth, _compute_active_auth_sync() returns that profile name (and save refreshes it)."""
+    orig, tmp_dir = setup_temp_codex_home()
+    try:
+        jwt_a = _make_jwt("alice@example.com")
+        # config + live auth: Alice, freshly refreshed (today)
+        (ct.CODEX_DIR / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+        live_last_refresh = "2026-07-31T00:00:00.000Z"
+        (ct.CODEX_DIR / "auth.json").write_text(
+            json.dumps({"auth_mode": "chatgpt", "last_refresh": live_last_refresh,
+                        "tokens": {"id_token": jwt_a}}),
+            encoding="utf-8",
+        )
+        # Two profiles share email alice; the ACTIVE one has a STALE stored auth.
+        ct._save_providers({
+            "profiles": {
+                "openai_alice": {
+                    "model_provider": "openai", "auth_mode": "chatgpt",
+                    "auth.json": ct._encode_secret(json.dumps({
+                        "auth_mode": "chatgpt",
+                        "last_refresh": "2026-07-25T00:00:00.000Z",  # stale
+                        "tokens": {"id_token": jwt_a}})),
+                },
+                "openai_alice_dup": {
+                    "model_provider": "openai", "auth_mode": "chatgpt",
+                    "auth.json": ct._encode_secret(json.dumps({
+                        "auth_mode": "chatgpt",
+                        "last_refresh": "2026-07-20T00:00:00.000Z",  # even staler
+                        "tokens": {"id_token": jwt_a}})),
+                },
+            },
+            "active": "openai_alice",
+        })
+
+        # Active profile detected from live auth -> openai_alice
+        assert ct._get_active_profile_name() == "openai_alice", "active profile should be alice"
+
+        # Decision function must pick the ACTIVE profile to update.
+        assert ct._compute_active_auth_sync() == "openai_alice"
+
+        # Applying the refresh via save_provider must update only the active profile.
+        ct.save_provider("openai_alice")
+        data = ct._load_providers()
+        _, stored_refresh = ct._get_stored_auth_email(data["profiles"]["openai_alice"])
+        assert stored_refresh == live_last_refresh, f"active profile auth not refreshed, still {stored_refresh!r}"
+        # The duplicate must be left untouched.
+        _, dup_refresh = ct._get_stored_auth_email(data["profiles"]["openai_alice_dup"])
+        assert dup_refresh == "2026-07-20T00:00:00.000Z", "duplicate profile should not be touched"
+    finally:
+        restore_temp_codex_home(orig, tmp_dir)
+
+
+def test_startup_auth_sync_no_update_when_fresh():
+    """No update when the active profile auth is already up to date."""
+    orig, tmp_dir = setup_temp_codex_home()
+    try:
+        jwt_a = _make_jwt("alice@example.com")
+        live_last_refresh = "2026-07-31T00:00:00.000Z"
+        (ct.CODEX_DIR / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+        (ct.CODEX_DIR / "auth.json").write_text(
+            json.dumps({"auth_mode": "chatgpt", "last_refresh": live_last_refresh,
+                        "tokens": {"id_token": jwt_a}}),
+            encoding="utf-8",
+        )
+        ct._save_providers({
+            "profiles": {
+                "openai_alice": {
+                    "model_provider": "openai", "auth_mode": "chatgpt",
+                    "auth.json": ct._encode_secret(json.dumps({
+                        "auth_mode": "chatgpt",
+                        "last_refresh": live_last_refresh,  # SAME -> fresh
+                        "tokens": {"id_token": jwt_a}})),
+                },
+            },
+            "active": "openai_alice",
+        })
+
+        # Fresh -> nothing to do.
+        assert ct._compute_active_auth_sync() is None
+    finally:
+        restore_temp_codex_home(orig, tmp_dir)
+
+
+def test_active_profile_matched_by_account_id_after_email_change():
+    """When the live account changed its email, the profile must still be recognized
+    by the stable account_id (email-only matching would return None)."""
+    orig, tmp_dir = setup_temp_codex_home()
+    try:
+        account_id = "d05b5d1d-57b8-41c0-a974-44bb738c684a"
+        old_email_jwt = _make_jwt("terrylee0236@gmail.com")
+        new_email_jwt = _make_jwt("new.email@example.com")
+        # Saved profile stores OLD email + account_id.
+        ct._save_providers({
+            "profiles": {
+                "openai_terrylee": {
+                    "model_provider": "openai", "auth_mode": "chatgpt",
+                    "auth.json": ct._encode_secret(json.dumps({
+                        "auth_mode": "chatgpt",
+                        "tokens": {"id_token": old_email_jwt, "account_id": account_id}})),
+                },
+                "openai_other": {
+                    "model_provider": "openai", "auth_mode": "chatgpt",
+                    "auth.json": ct._encode_secret(json.dumps({
+                        "auth_mode": "chatgpt",
+                        "tokens": {"id_token": _make_jwt("boards.drawls1d@icloud.com"),
+                                   "account_id": "012b6a36-334f-448f-b04b-e44bcd38fb66"}})),
+                },
+            },
+            "active": "openai_terrylee",
+        })
+        (ct.CODEX_DIR / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+        # Live auth: SAME account_id but NEW (changed) email.
+        (ct.CODEX_DIR / "auth.json").write_text(
+            json.dumps({"auth_mode": "chatgpt",
+                        "tokens": {"id_token": new_email_jwt, "account_id": account_id}}),
+            encoding="utf-8",
+        )
+
+        active = ct._get_active_profile_name()
+        assert active == "openai_terrylee", f"should match by account_id after email change, got {active!r}"
+    finally:
+        restore_temp_codex_home(orig, tmp_dir)
+
+
+def test_auth_sync_updates_email_after_account_id_match():
+    """Startup auth sync must refresh the matched profile's stored email when the
+    account changed its email (recognized via account_id), keeping auth fresh."""
+    orig, tmp_dir = setup_temp_codex_home()
+    try:
+        account_id = "d05b5d1d-57b8-41c0-a974-44bb738c684a"
+        old_jwt = _make_jwt("terrylee0236@gmail.com")
+        new_jwt = _make_jwt("renamed@example.com")
+        live_refresh = "2026-07-31T00:00:00.000Z"
+        ct._save_providers({
+            "profiles": {
+                "openai_terrylee": {
+                    "model_provider": "openai", "auth_mode": "chatgpt",
+                    "auth.json": ct._encode_secret(json.dumps({
+                        "auth_mode": "chatgpt",
+                        "last_refresh": "2026-07-25T00:00:00.000Z",
+                        "tokens": {"id_token": old_jwt, "account_id": account_id}})),
+                },
+            },
+            "active": "openai_terrylee",
+        })
+        (ct.CODEX_DIR / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+        (ct.CODEX_DIR / "auth.json").write_text(
+            json.dumps({"auth_mode": "chatgpt", "last_refresh": live_refresh,
+                        "tokens": {"id_token": new_jwt, "account_id": account_id}}),
+            encoding="utf-8",
+        )
+
+        # Matched by account_id despite the email change.
+        assert ct._compute_active_auth_sync() == "openai_terrylee"
+        ct.save_provider("openai_terrylee")
+
+        data = ct._load_providers()
+        prof = data["profiles"]["openai_terrylee"]
+        # Stored email now reflects the NEW one.
+        assert prof.get("auth_email") == "renamed@example.com", f"email not updated, got {prof.get('auth_email')!r}"
+        stored_raw = ct._decode_secret(prof["auth.json"])
+        stored = json.loads(stored_raw)
+        assert stored.get("last_refresh") == live_refresh, "stored auth not refreshed"
+    finally:
+        restore_temp_codex_home(orig, tmp_dir)
+
+
+def test_unmatched_active_account_returns_none():
+    """An account whose account_id/email matches no saved profile returns None
+    (so the GUI does not falsely highlight a profile as active)."""
+    orig, tmp_dir = setup_temp_codex_home()
+    try:
+        ct._save_providers({
+            "profiles": {
+                "openai_old": {
+                    "model_provider": "openai", "auth_mode": "chatgpt",
+                    "auth.json": ct._encode_secret(json.dumps({
+                        "auth_mode": "chatgpt",
+                        "tokens": {"id_token": _make_jwt("old@example.com"),
+                                   "account_id": "11111111-1111-1111-1111-111111111111"}})),
+                },
+            },
+            "active": "openai_old",
+        })
+        (ct.CODEX_DIR / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+        # Live auth is a completely different account.
+        (ct.CODEX_DIR / "auth.json").write_text(
+            json.dumps({"auth_mode": "chatgpt",
+                        "tokens": {"id_token": _make_jwt("stranger@example.com"),
+                                   "account_id": "22222222-2222-2222-2222-222222222222"}}),
+            encoding="utf-8",
+        )
+
+        assert ct._get_active_profile_name() is None, "unmatched account should return None"
+    finally:
+        restore_temp_codex_home(orig, tmp_dir)
+
+
 # --- Run ---
 
 if __name__ == "__main__":
@@ -6302,10 +6874,18 @@ if __name__ == "__main__":
     test("GUI Chat Bridge controls are wired", test_gui_chat_bridge_controls_are_wired)
     test("GUI Chat Bridge display keys remain unique", test_gui_chat_bridge_display_keys_remain_unique)
     test("GUI Chat Bridge buttons bind expected callbacks", test_gui_chat_bridge_buttons_bind_expected_callbacks)
+    test("GUI dialog entries bind paste directly", test_gui_dialog_entries_bind_paste_directly)
     test("_merge_config preserves all provider sections", test_merge_preserves_all_sections)
     test("_merge_config appends new section", test_merge_append_new_section)
     test("b64 encode/decode roundtrip", test_b64_roundtrip)
     test("b64 passthrough for non-encoded", test_b64_passthrough)
+    test("_get_active_profile_name distinguishes two openai logins", test_get_active_profile_name_distinguishes_openai_logins)
+    test("switch between two openai profiles is not blocked", test_switch_between_two_openai_profiles_not_blocked)
+    test("startup auth sync updates the active profile (with prompt)", test_startup_auth_sync_updates_active_profile)
+    test("startup auth sync does not update when fresh", test_startup_auth_sync_no_update_when_fresh)
+    test("active profile matched by account_id after email change", test_active_profile_matched_by_account_id_after_email_change)
+    test("auth sync updates stored email after account_id match", test_auth_sync_updates_email_after_account_id_match)
+    test("unmatched active account returns None", test_unmatched_active_account_returns_none)
     test("add_provider uses new format + b64 auth", test_add_provider_format)
     test("remove_provider deletes profile", test_remove_provider)
     test("_extract_provider_config", test_extract_provider_config)
@@ -6353,9 +6933,12 @@ if __name__ == "__main__":
     test("chat bridge Droid to Codex import rolls back invalid rollout", test_chat_bridge_droid_to_codex_import_rolls_back_invalid_rollout)
     test("chat bridge Codex to Droid import writes session and mapping", test_chat_bridge_codex_to_droid_import_writes_session_and_mapping)
     test("chat bridge Codex to Droid preserves project context", test_chat_bridge_codex_to_droid_preserves_project_context)
+    test("chat bridge Droid round-trip preserves manual title and settings metadata", test_chat_bridge_droid_round_trip_preserves_manual_title_and_settings_metadata)
     test("chat bridge Codex to Droid normalizes extended Windows cwd", test_chat_bridge_codex_to_droid_normalizes_extended_windows_cwd)
-    test("chat bridge Codex to Droid preserves Droid index timestamps", test_chat_bridge_codex_to_droid_preserves_droid_index_timestamps)
+    test("chat bridge Codex to Droid uses fresh discovery time", test_chat_bridge_codex_to_droid_uses_fresh_discovery_time)
     test("chat bridge Codex to Droid writes valid tool inputs and parent chain", test_chat_bridge_codex_to_droid_writes_droid_valid_tool_inputs_and_parent_chain)
+    test("chat bridge Codex to Droid normalizes native content contract", test_chat_bridge_codex_to_droid_normalizes_native_content_contract)
+    test("chat bridge Codex to Droid rejects invalid raw replay before commit", test_chat_bridge_codex_to_droid_rejects_invalid_raw_replay_before_commit)
     test("chat bridge Codex to Droid uses unique event ids for tool pairs", test_chat_bridge_codex_to_droid_uses_unique_event_ids_for_tool_pairs)
     test("chat bridge Codex to Droid groups parallel tools like Droid", test_chat_bridge_codex_to_droid_groups_parallel_tool_calls_like_droid)
     test("chat bridge renders grouped tools to Codex in part order", test_chat_bridge_renders_grouped_tool_message_to_codex_in_part_order)
