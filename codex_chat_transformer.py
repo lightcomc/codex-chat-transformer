@@ -34,6 +34,10 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
+import _logging
+
+logger = _logging.get_logger("core")
+
 CODEX_DIR = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 STATE_DB = CODEX_DIR / "state_5.sqlite"
 GLOBAL_STATE = CODEX_DIR / ".codex-global-state.json"
@@ -92,7 +96,7 @@ def parse_sync_peer(raw_target):
 def get_db_conn(exit_on_error=True):
     if not STATE_DB.exists():
         if exit_on_error:
-            print(f"ERROR: Database not found: {STATE_DB}")
+            logger.warning(f"Database not found: {STATE_DB}")
             sys.exit(1)
         return None
     conn = sqlite3.connect(str(STATE_DB))
@@ -278,7 +282,7 @@ def transform_jsonl_file(filepath, from_provider, to_provider, dry_run=False, fr
 def transform(conn, from_provider, to_provider, dry_run=False, thread_id=None, skip_pinned=False, from_model=None, to_model=None, project=None):
     """Main transformation: update DB and JSONL files."""
     if is_codex_running():
-        print("WARNING: Codex Desktop is running. Restart Codex after conversion.")
+        logger.warning("Codex Desktop is running. Restart Codex after conversion.")
     cur = conn.cursor()
 
     pinned_ids = set()
@@ -995,7 +999,7 @@ def restore_backup(backup_dir):
     backup_dir = Path(backup_dir)
     db_backup = backup_dir / "state_5.sqlite"
     if not db_backup.exists():
-        print(f"ERROR: No state_5.sqlite found in {backup_dir}")
+        logger.warning(f"No state_5.sqlite found in {backup_dir}")
         sys.exit(1)
 
     # Copy back
@@ -1017,7 +1021,7 @@ def restore_backup(backup_dir):
 def load_global_state():
     """Load .codex-global-state.json."""
     if not GLOBAL_STATE.exists():
-        print(f"ERROR: Global state not found: {GLOBAL_STATE}")
+        logger.warning(f"Global state not found: {GLOBAL_STATE}")
         sys.exit(1)
     with open(str(GLOBAL_STATE), "r", encoding="utf-8") as f:
         return json.load(f)
@@ -1182,7 +1186,7 @@ def restore_from_zip(zip_path):
     """Restore .codex from a ZIP backup."""
     zip_path = Path(zip_path)
     if not zip_path.exists():
-        print(f"ERROR: ZIP not found: {zip_path}")
+        logger.warning(f"ZIP not found: {zip_path}")
         sys.exit(1)
 
     with zipfile.ZipFile(str(zip_path), "r") as zf:
@@ -1212,7 +1216,7 @@ def restore_from_zip(zip_path):
             restored += 1
 
         print(f"Restored {restored} files.")
-        print("WARNING: Codex must be restarted to pick up changes.")
+        logger.warning("Codex must be restarted to pick up changes.")
         record_history("restore_zip", zip_path=str(zip_path), details={"files": restored})
 
 
@@ -1640,7 +1644,7 @@ def print_pack_summary(action, summary):
         print(f"  Sessions:  {len(summary['sessions_imported'])}")
         print(f"  Backup:    {summary['backup_path']}")
     for warning in summary.get("warnings", []):
-        print(f"WARNING: {warning}")
+        logger.warning(f"{warning}")
 
 
 # ── Provider profiles management ──────────────────────────────────────────
@@ -2060,7 +2064,7 @@ def save_provider(name):
     auth_content = read_file_safe(CODEX_DIR / "auth.json")
 
     if not cfg_content:
-        print("ERROR: config.toml not found.")
+        logger.warning("config.toml not found.")
         sys.exit(1)
 
     provider_name, provider_section, model_value = extract_provider_config(cfg_content)
@@ -2103,13 +2107,13 @@ def save_provider(name):
 def use_provider(name, skip_convert=False):
     """Switch to a provider profile: swap config/auth + convert threads."""
     if is_codex_running():
-        print("WARNING: Codex Desktop is running. Restart Codex after switching.")
+        logger.warning("Codex Desktop is running. Restart Codex after switching.")
     data = load_providers()
     profiles = data.get("profiles", {})
     active = get_active_provider()
 
     if name not in profiles:
-        print(f"ERROR: Profile '{name}' not found.")
+        logger.warning(f"Profile '{name}' not found.")
         print(f"Available: {', '.join(profiles.keys()) or 'none'}")
         sys.exit(1)
 
@@ -2258,13 +2262,13 @@ def add_provider(json_path, api_key=None):
     else:
         p = Path(json_path)
         if not p.exists():
-            print(f"ERROR: File not found: {json_path}")
+            logger.warning(f"File not found: {json_path}")
             sys.exit(1)
         with open(str(p), "r", encoding="utf-8") as f:
             raw = json.load(f)
 
     if not isinstance(raw, dict) or "name" not in raw or "base_url" not in raw:
-        print("ERROR: JSON must have 'name' and 'base_url' fields.")
+        logger.warning("JSON must have 'name' and 'base_url' fields.")
         print('Example: {"name": "MyProvider", "model": "gpt-5.5", "base_url": "https://...", "wire_api": "responses"}')
         sys.exit(1)
 
@@ -2435,7 +2439,7 @@ def set_model(model_name):
     cfg_path = CODEX_DIR / "config.toml"
     cfg_text = read_file_safe(str(cfg_path))
     if not cfg_text:
-        print("ERROR: config.toml not found.")
+        logger.warning("config.toml not found.")
         return
     lines = cfg_text.split("\n")
     out = []
@@ -2618,7 +2622,7 @@ def handle_droid_command(args):
             )
             return True
     except ValueError as e:
-        print(f"ERROR: {e}")
+        logger.warning(f"{e}")
         return True
 
     return False
@@ -3177,7 +3181,7 @@ def handle_chat_bridge_command(args):
 
         ids = _chat_session_ids(args)
         if not ids:
-            print("ERROR: --chat-session is required for chat transfer commands.")
+            logger.warning("--chat-session is required for chat transfer commands.")
             return True
 
         if args.droid_to_codex:
@@ -3253,7 +3257,7 @@ def handle_chat_bridge_command(args):
             )
             return True
     except ValueError as e:
-        print(f"ERROR: {e}")
+        logger.warning(f"{e}")
         return True
 
     return False
@@ -3344,12 +3348,27 @@ def build_parser():
     parser.add_argument("--sync-pull", metavar="HOST[:PORT]", help="Connect to sync host and pull data")
     parser.add_argument("--sync-push", metavar="HOST[:PORT]", help="Connect to sync host and push data")
     parser.add_argument("--sync-pin", metavar="PIN", help="PIN for sync authentication (prompts if omitted)")
+    # Logging
+    parser.add_argument("--verbose", action="store_true", help="Show INFO-level logs (what the tool is doing)")
+    parser.add_argument("--debug", action="store_true", help="Show DEBUG-level logs (very chatty)")
+    parser.add_argument("--quiet", action="store_true", help="Only show ERROR-level logs")
+    parser.add_argument("--log", metavar="FILE", help="Write logs to FILE (rotating, 1 MB x 3) in addition to console")
     return parser
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    # Configure logging from CLI flags (or CODEX_MANAGER_LOG env, default WARNING).
+    if getattr(args, "debug", False):
+        _lvl, _file = "DEBUG", None
+    elif getattr(args, "verbose", False):
+        _lvl, _file = "INFO", None
+    elif getattr(args, "quiet", False):
+        _lvl, _file = "ERROR", None
+    else:
+        _lvl, _file = None, getattr(args, "log", None)
+    _logging.setup_logging(level=_lvl, log_file=_file)
     if handle_droid_command(args):
         return
     if handle_chat_bridge_command(args):
@@ -3361,24 +3380,24 @@ def main():
     if args.providers not in (None, PROVIDERS_LIST_SENTINEL):
         provider_filter = _parse_csv_list(args.providers)
         if not provider_filter:
-            print("ERROR: --providers requires at least one provider name.")
+            logger.warning("--providers requires at least one provider name.")
             return
     if args.sessions is not None:
         session_filter = _parse_csv_list(args.sessions)
         if not session_filter:
-            print("ERROR: --sessions requires at least one session ID.")
+            logger.warning("--sessions requires at least one session ID.")
             return
     if args.without_keys and not args.export_pack:
-        print("ERROR: --without-keys is only valid with --export-pack.")
+        logger.warning("--without-keys is only valid with --export-pack.")
         return
     if args.providers == PROVIDERS_LIST_SENTINEL and (args.export_pack or args.import_pack):
-        print("ERROR: --providers requires a comma-separated value with pack commands.")
+        logger.warning("--providers requires a comma-separated value with pack commands.")
         return
     if provider_filter and not (args.export_pack or args.import_pack):
-        print("ERROR: --providers NAME1,NAME2 is only valid with --export-pack or --import-pack.")
+        logger.warning("--providers NAME1,NAME2 is only valid with --export-pack or --import-pack.")
         return
     if session_filter and not (args.export_pack or args.import_pack):
-        print("ERROR: --sessions is only valid with --export-pack or --import-pack.")
+        logger.warning("--sessions is only valid with --export-pack or --import-pack.")
         return
 
     if args.restore:
@@ -3407,7 +3426,7 @@ def main():
                 without_keys=args.without_keys,
             )
         except ValueError as e:
-            print(f"ERROR: {e}")
+            logger.warning(f"{e}")
             return
         print_pack_summary("Exported", summary)
         return
@@ -3421,7 +3440,7 @@ def main():
                 session_ids=session_filter,
             )
         except ValueError as e:
-            print(f"ERROR: {e}")
+            logger.warning(f"{e}")
             return
         print_pack_summary("Imported", summary)
         return
@@ -3430,7 +3449,7 @@ def main():
         try:
             results = search_sessions(args.search, project=args.project)
         except ValueError as e:
-            print(f"ERROR: {e}")
+            logger.warning(f"{e}")
             return
         print_search_results(results)
         return
@@ -3519,7 +3538,7 @@ def main():
         try:
             peer = parse_sync_peer(args.sync_pull or args.sync_push)
         except ValueError as e:
-            print(f"ERROR: {e}")
+            logger.warning(f"{e}")
             return
         host = peer["host"]
         port = peer["port"]
@@ -3612,7 +3631,7 @@ def main():
                 return
 
             if not args.from_provider or not args.to_provider:
-                print("ERROR: --from and --to are required for transformation.")
+                logger.warning("--from and --to are required for transformation.")
                 print("Use --list to see available providers.")
                 print("\nExample:")
                 print("  python codex_chat_transformer.py --list")
@@ -3622,7 +3641,7 @@ def main():
                 sys.exit(1)
 
             if args.from_provider == args.to_provider:
-                print("ERROR: --from and --to must be different.")
+                logger.warning("--from and --to must be different.")
                 sys.exit(1)
 
             print(f"Transforming: {args.from_provider} -> {args.to_provider}"
