@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-provider-manager"
+version = "1.6.0"
+description = "Manage Codex Desktop provider profiles: switch providers, convert chats, sync between machines."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "lightcom" }]
+keywords = ["codex", "openai", "provider", "profile", "droid", "chatgpt", "sync"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Developers",
+    "Topic :: Utilities",
+]
+# Runtime dependencies: stdlib + Tkinter only (Tkinter ships with CPython on Windows/macOS,
+# Linux users may need: sudo apt install python3-tk). pystray/Pillow are optional (system tray).
+dependencies = []
+
+[project.optional-dependencies]
+tray = ["pystray", "pillow"]
+dev = ["pytest"]
+
+[project.scripts]
+# After `pip install .` these console commands become available anywhere:
+codex-manager = "codex_chat_transformer:main"
+
+[project.gui-scripts]
+# GUI entry point (launches a window, so it is a gui-script, not a console script):
+codex-manager-gui = "codex_manager_gui:main"
+
+[tool.setuptools]
+# Flat layout: modules live in the repo root, each .py is a top-level module.
+py-modules = [
+    "codex_chat_transformer",
+    "codex_manager_gui",
+    "codex_sync",
+    "chat_bridge",
+    "droid_provider_adapter",
+    "sync_tray",
+    "_logging",
+]
+
+[tool.pytest.ini_options]
+# Allow importing the legacy test_smoke.py (which uses a custom runner) without pytest
+# auto-collecting its helper named `test`.
+python_files = ["test_*.py"]
+addopts = "-q"

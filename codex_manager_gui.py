@@ -2017,10 +2017,15 @@ def _check_consent():
     return False
 
 
-if __name__ == "__main__":
+def main():
+    """Entry point for the GUI (used by the `codex-manager-gui` console script)."""
     # GUI: default WARNING (quiet); set CODEX_MANAGER_LOG=INFO/DEBUG to see activity.
     _logging.setup_logging()
     _check_consent()
     root = tk.Tk()
     app = CodexManagerApp(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

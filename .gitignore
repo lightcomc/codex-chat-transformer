@@ -21,3 +21,7 @@
 !README.zh.md
 !sync_tray.py
 !_logging.py
+!pyproject.toml
+!.github/
+!.github/workflows/
+!.github/workflows/tests.yml
