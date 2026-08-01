@@ -6722,7 +6722,7 @@ def test_active_profile_matched_by_account_id_after_email_change():
     orig, tmp_dir = setup_temp_codex_home()
     try:
         account_id = "d05b5d1d-57b8-41c0-a974-44bb738c684a"
-        old_email_jwt = _make_jwt("terrylee0236@gmail.com")
+        old_email_jwt = _make_jwt("terry@example.com")
         new_email_jwt = _make_jwt("new.email@example.com")
         # Saved profile stores OLD email + account_id.
         ct._save_providers({
@@ -6737,7 +6737,7 @@ def test_active_profile_matched_by_account_id_after_email_change():
                     "model_provider": "openai", "auth_mode": "chatgpt",
                     "auth.json": ct._encode_secret(json.dumps({
                         "auth_mode": "chatgpt",
-                        "tokens": {"id_token": _make_jwt("boards.drawls1d@icloud.com"),
+                        "tokens": {"id_token": _make_jwt("boards@example.com"),
                                    "account_id": "012b6a36-334f-448f-b04b-e44bcd38fb66"}})),
                 },
             },
@@ -6763,7 +6763,7 @@ def test_auth_sync_updates_email_after_account_id_match():
     orig, tmp_dir = setup_temp_codex_home()
     try:
         account_id = "d05b5d1d-57b8-41c0-a974-44bb738c684a"
-        old_jwt = _make_jwt("terrylee0236@gmail.com")
+        old_jwt = _make_jwt("terry@example.com")
         new_jwt = _make_jwt("renamed@example.com")
         live_refresh = "2026-07-31T00:00:00.000Z"
         ct._save_providers({
