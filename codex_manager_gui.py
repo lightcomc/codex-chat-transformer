@@ -275,42 +275,42 @@ def _get_config_info():
 
 
 def _get_active_provider():
-    return ct._get_active_provider()
+    return ct.get_active_provider()
 
 
 def _get_active_profile_name():
-    return ct._get_active_profile_name()
+    return ct.get_active_profile_name()
 
 
 def _load_providers():
-    data = ct._load_providers()
+    data = ct.load_providers()
     for prof in data.get("profiles", {}).values():
-        prof["auth.json"] = ct._decode_secret(prof.get("auth.json"))
+        prof["auth.json"] = ct.decode_secret(prof.get("auth.json"))
     return data
 
 
 def _save_providers(data):
-    ct._save_providers(data)
+    ct.save_providers(data)
 
 
 def _read_file_safe(path):
-    return ct._read_file_safe(str(path))
+    return ct.read_file_safe(str(path))
 
 
 def _detect_provider_in_config(path):
-    return ct._detect_provider_in_config(str(path))
+    return ct.detect_provider_in_config(str(path))
 
 
 def _detect_auth_mode(path):
-    return ct._detect_auth_mode(str(path))
+    return ct.detect_auth_mode(str(path))
 
 
 def _extract_provider_config(config_text):
-    return ct._extract_provider_config(config_text)
+    return ct.extract_provider_config(config_text)
 
 
 def _merge_config(current_text, target_provider, target_section, target_model=None, target_reasoning=None):
-    return ct._merge_config(current_text, target_provider, target_section, target_model, target_reasoning)
+    return ct.merge_config(current_text, target_provider, target_section, target_model, target_reasoning)
 
 
 def _run_convert(from_p, to_p, auto_backup=True, progress_cb=None):
@@ -348,7 +348,7 @@ def _run_convert(from_p, to_p, auto_backup=True, progress_cb=None):
 
 
 def _detect_provider_in_text(text):
-    return ct._detect_provider_from_text(text)
+    return ct.detect_provider_from_text(text)
 
 
 def _detect_auth_mode_text(text):
@@ -852,7 +852,7 @@ class CodexManagerApp:
             saved = profiles[name].get("saved_at", "")[:10]
             email = profiles[name].get("auth_email", "")
             if not email and auth == "chatgpt":
-                stored_email, _ = ct._get_stored_auth_email(profiles[name])
+                stored_email, _ = ct.get_stored_auth_email(profiles[name])
                 email = stored_email or ""
             email_part = f"  {email}" if email else ""
             self.provider_listbox.insert(tk.END, f"{prefix}{name}  ({auth}, {saved}{email_part})")
@@ -1165,7 +1165,7 @@ class CodexManagerApp:
         Finds the ACTIVE account and refreshes its stored auth without any prompt.
         """
         print("[auth_sync] checking...")
-        active_profile = ct._compute_active_auth_sync()
+        active_profile = ct.compute_active_auth_sync()
         if not active_profile:
             return
         print(f"[auth_sync] refreshing stored auth for active profile '{active_profile}'")
@@ -1202,7 +1202,7 @@ class CodexManagerApp:
         profiles = data.get("profiles", {})
 
         for item in found:
-            name = ct._sanitize_name(item["name"])
+            name = ct.sanitize_name(item["name"])
             if name in profiles:
                 continue
             if messagebox.askyesno(t("auto_detect_title"), t("auto_detected", name)):
@@ -1232,7 +1232,7 @@ class CodexManagerApp:
             auth_text = json.dumps(raw, indent=2)
             provider_name = fallback_name or "NewProvider"
         elif "base_url" in raw:
-            name = ct._sanitize_name(raw.get("name", fallback_name or "NewProvider"))
+            name = ct.sanitize_name(raw.get("name", fallback_name or "NewProvider"))
             model = raw.get("model", "gpt-5.5")
             wire = raw.get("wire_api", "responses")
             reasoning = raw.get("model_reasoning_effort", "")
@@ -1271,13 +1271,13 @@ class CodexManagerApp:
         name_raw = self._ask_string(t("save_title"), t("save_prompt"), initialvalue=provider_name)
         if not name_raw:
             return
-        name = ct._sanitize_name(name_raw)
+        name = ct.sanitize_name(name_raw)
 
-        pn = ct._detect_provider_from_text(config_text) if config_text else name
+        pn = ct.detect_provider_from_text(config_text) if config_text else name
         am = _detect_auth_mode_text(auth_text) if auth_text else "unknown"
 
         # Extract provider section from config text
-        _, section, model_val = ct._extract_provider_config(config_text) if config_text else (None, None, None)
+        _, section, model_val = ct.extract_provider_config(config_text) if config_text else (None, None, None)
 
         data.setdefault("profiles", {})[name] = {
             "model_provider": pn,
@@ -1325,13 +1325,13 @@ class CodexManagerApp:
             cfg = _read_file_safe(CODEX_DIR / "config.toml")
             auth = _read_file_safe(CODEX_DIR / "auth.json")
             if cfg:
-                _, section, model_val = ct._extract_provider_config(cfg)
+                _, section, model_val = ct.extract_provider_config(cfg)
                 auth_mode = _detect_auth_mode(CODEX_DIR / "auth.json") or "unknown"
                 auth_email = None
                 if auth_mode == "chatgpt" and auth:
                     try:
                         auth_data = json.loads(auth)
-                        auth_email = ct._extract_email_from_jwt(auth_data.get("tokens", {}).get("id_token"))
+                        auth_email = ct.extract_email_from_jwt(auth_data.get("tokens", {}).get("id_token"))
                     except Exception:
                         pass
                 existing = profiles.get(active_profile or active, {})
@@ -1354,7 +1354,7 @@ class CodexManagerApp:
             if not target_section:
                 old_cfg = prof.get("config.toml")
                 if old_cfg:
-                    _, target_section, target_model = ct._extract_provider_config(old_cfg)
+                    _, target_section, target_model = ct.extract_provider_config(old_cfg)
 
             current_cfg = _read_file_safe(CODEX_DIR / "config.toml")
             print(f"[switch] merging config: {active} -> {target} (model={target_model}, reasoning={target_reasoning})")
@@ -1372,7 +1372,7 @@ class CodexManagerApp:
             target_auth = prof.get("auth.json")
             if target_auth:
                 with open(str(CODEX_DIR / "auth.json"), "w", encoding="utf-8") as f:
-                    f.write(ct._decode_secret(target_auth))
+                    f.write(ct.decode_secret(target_auth))
                 print("[switch] auth.json written")
 
             data["active"] = name
@@ -1443,13 +1443,13 @@ class CodexManagerApp:
         auth = _read_file_safe(CODEX_DIR / "auth.json")
         am = _detect_auth_mode(CODEX_DIR / "auth.json") or "unknown"
 
-        _, section, model_val = ct._extract_provider_config(cfg) if cfg else (None, None, None)
+        _, section, model_val = ct.extract_provider_config(cfg) if cfg else (None, None, None)
 
         auth_email = None
         if am == "chatgpt" and auth:
             try:
                 auth_data = json.loads(auth)
-                auth_email = ct._extract_email_from_jwt(auth_data.get("tokens", {}).get("id_token"))
+                auth_email = ct.extract_email_from_jwt(auth_data.get("tokens", {}).get("id_token"))
             except Exception:
                 pass
 
@@ -1601,7 +1601,7 @@ class CodexManagerApp:
         if not section:
             old_cfg = prof.get("config.toml", "")
             if old_cfg:
-                _, section, _ = ct._extract_provider_config(old_cfg)
+                _, section, _ = ct.extract_provider_config(old_cfg)
                 for line in section.split("\n"):
                     s = line.strip()
                     if s.startswith("base_url") and "=" in s and not cur_url:
@@ -1614,7 +1614,7 @@ class CodexManagerApp:
         auth_raw = prof.get("auth.json", "")
         if auth_raw:
             try:
-                auth_decoded = json.loads(ct._decode_secret(auth_raw))
+                auth_decoded = json.loads(ct.decode_secret(auth_raw))
                 cur_key = auth_decoded.get("OPENAI_API_KEY", "")
             except Exception:
                 pass
@@ -1674,7 +1674,7 @@ class CodexManagerApp:
             if not new_name_raw:
                 messagebox.showwarning(t("warning"), t("f_enter_name"), parent=dialog)
                 return
-            new_name = ct._sanitize_name(new_name_raw)
+            new_name = ct.sanitize_name(new_name_raw)
             model = fields["model"][0].get().strip()
             base_url = fields["base_url"][0].get().strip()
             api_key = fields["api_key"][0].get().strip()
@@ -1714,8 +1714,8 @@ class CodexManagerApp:
                 if current_cfg:
                     # Remove old section if renamed
                     if new_name != orig_name:
-                        current_cfg = ct._remove_provider_section(current_cfg, orig_name)
-                    merged = ct._merge_config(current_cfg, new_name, section, model, reasoning if reasoning else None)
+                        current_cfg = ct.remove_provider_section(current_cfg, orig_name)
+                    merged = ct.merge_config(current_cfg, new_name, section, model, reasoning if reasoning else None)
                     with open(str(CODEX_DIR / "config.toml"), "w", encoding="utf-8") as f:
                         f.write(merged)
 
@@ -1753,7 +1753,7 @@ class CodexManagerApp:
         cfg = _read_file_safe(CODEX_DIR / "config.toml")
         if not cfg:
             return
-        merged = ct._merge_config(cfg, _get_active_provider(), None, None, new_reas or None)
+        merged = ct.merge_config(cfg, _get_active_provider(), None, None, new_reas or None)
         with open(str(CODEX_DIR / "config.toml"), "w", encoding="utf-8") as f:
             f.write(merged)
         self._refresh()

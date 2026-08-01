@@ -425,7 +425,7 @@ def _chat_import_target_config():
     provider = info.get("provider")
     model = info.get("model")
     return {
-        "provider": provider if provider and provider != "?" else _get_active_provider(),
+        "provider": provider if provider and provider != "?" else get_active_provider(),
         "model": model if model and model != "?" else None,
     }
 
@@ -446,7 +446,7 @@ def _read_auth_info():
         return {"mode": "error", "has_key": False}
 
 
-def _extract_email_from_jwt(token):
+def extract_email_from_jwt(token):
     """Extract email from JWT id_token without external deps."""
     if not token or "." not in token:
         return None
@@ -465,7 +465,7 @@ def _email_to_profile_name(email):
     if not email:
         return "openai_unknown"
     local = email.split("@")[0].lower()
-    return _sanitize_name(f"openai_{local}")
+    return sanitize_name(f"openai_{local}")
 
 
 def _extract_account_id_from_auth(auth_dict):
@@ -491,16 +491,16 @@ def _find_chatgpt_profiles(profiles):
     return result
 
 
-def _get_stored_auth_email(prof):
+def get_stored_auth_email(prof):
     """Decode stored auth from profile and return email."""
-    stored_raw = _decode_secret(prof.get("auth.json", ""))
+    stored_raw = decode_secret(prof.get("auth.json", ""))
     if not stored_raw:
         return None, None
     try:
         stored_auth = json.loads(stored_raw)
     except Exception:
         return None, None
-    email = _extract_email_from_jwt(stored_auth.get("tokens", {}).get("id_token"))
+    email = extract_email_from_jwt(stored_auth.get("tokens", {}).get("id_token"))
     last_refresh = stored_auth.get("last_refresh", "")
     return email, last_refresh
 
@@ -517,12 +517,12 @@ def _check_openai_auth_sync():
         return
     if current_auth.get("auth_mode") != "chatgpt":
         return
-    current_email = _extract_email_from_jwt(current_auth.get("tokens", {}).get("id_token"))
+    current_email = extract_email_from_jwt(current_auth.get("tokens", {}).get("id_token"))
     current_refresh = current_auth.get("last_refresh", "")
     if not current_email:
         return
 
-    prov_data = _load_providers()
+    prov_data = load_providers()
     profiles = prov_data.get("profiles", {})
     chatgpt_profs = _find_chatgpt_profiles(profiles)
     if not chatgpt_profs:
@@ -532,7 +532,7 @@ def _check_openai_auth_sync():
 
     # Case 1: email matches a stored profile
     for name, prof in chatgpt_profs:
-        stored_email, stored_refresh = _get_stored_auth_email(prof)
+        stored_email, stored_refresh = get_stored_auth_email(prof)
         if (stored_email or "").lower() == (current_email or "").lower():
             if current_refresh == stored_refresh:
                 return
@@ -562,7 +562,7 @@ def _check_openai_auth_sync():
         return
 
     _, openai_prof = existing_openai
-    stored_email, stored_refresh = _get_stored_auth_email(openai_prof)
+    stored_email, stored_refresh = get_stored_auth_email(openai_prof)
     std_date = stored_refresh[:10] if stored_refresh else "?"
     new_name = _email_to_profile_name(current_email)
     print(f"\n  OpenAI auth: new email detected!")
@@ -588,15 +588,15 @@ def _check_openai_auth_sync():
 
 def _check_active_provider_saved():
     """On startup, prompt to save active provider if not in profiles."""
-    active = _get_active_provider()
+    active = get_active_provider()
     if not active or active in ("?", "openai"):
         if active == "openai":
-            prov_data = _load_providers()
+            prov_data = load_providers()
             if "openai" in prov_data.get("profiles", {}):
                 return
         else:
             return
-    prov_data = _load_providers()
+    prov_data = load_providers()
     profiles = prov_data.get("profiles", {})
     if active in profiles:
         return
@@ -726,7 +726,7 @@ def print_history(limit=20):
 
 
 def _profile_auth_has_key(prof):
-    auth_raw = _decode_secret(prof.get("auth.json", ""))
+    auth_raw = decode_secret(prof.get("auth.json", ""))
     if not auth_raw:
         return False
     try:
@@ -760,7 +760,7 @@ def build_doctor_report():
     running = is_codex_running()
     cfg = _read_config_info()
     auth = _read_auth_info()
-    prov_data = _load_providers()
+    prov_data = load_providers()
     profiles = prov_data.get("profiles", {})
     active = cfg.get("provider")
     issues = []
@@ -904,7 +904,7 @@ def doctor():
     print(f"  Status: {status}")
 
 
-def _detect_provider_in_config(filepath):
+def detect_provider_in_config(filepath):
     """Read a config.toml and return the model_provider value (or 'openai' for default)."""
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -917,7 +917,7 @@ def _detect_provider_in_config(filepath):
         return None
 
 
-def _detect_auth_mode(filepath):
+def detect_auth_mode(filepath):
     """Read an auth.json and return the auth_mode value."""
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -941,8 +941,8 @@ def swap_configs(target_provider):
     swaps_done = []
 
     for basename, detect_fn in [
-        ("config.toml", _detect_provider_in_config),
-        ("auth.json", _detect_auth_mode),
+        ("config.toml", detect_provider_in_config),
+        ("auth.json", detect_auth_mode),
     ]:
         active = CODEX_DIR / basename
         if not active.exists():
@@ -1549,7 +1549,7 @@ def import_pack(zip_file, scope="all", provider_names=None, session_ids=None):
             record.setdefault("saved_at", datetime.datetime.now().isoformat())
             profiles[name] = record
         data["profiles"] = profiles
-        _save_providers(data)
+        save_providers(data)
 
     if selected_session_ids:
         import base64
@@ -1645,7 +1645,7 @@ def print_pack_summary(action, summary):
 
 # ── Provider profiles management ──────────────────────────────────────────
 
-def _detect_provider_from_text(text):
+def detect_provider_from_text(text):
     """Get model_provider from TOML text."""
     for line in text.split("\n"):
         stripped = line.strip()
@@ -1654,13 +1654,13 @@ def _detect_provider_from_text(text):
     return "openai"
 
 
-def _sanitize_name(name):
+def sanitize_name(name):
     """Replace spaces and invalid chars in provider name with underscores."""
     import re
     return re.sub(r'[\s/\\:*?"<>|@.+#]+', '_', name.strip()).strip('_')
 
 
-def _extract_provider_config(config_text):
+def extract_provider_config(config_text):
     """Extract provider-specific parts from config.toml.
     Returns (provider_name, provider_section_text, model_value).
 
@@ -1721,7 +1721,7 @@ def _extract_named_section(config_text, provider_name):
     return sections.get(provider_name, "")
 
 
-def _remove_provider_section(text, provider_name):
+def remove_provider_section(text, provider_name):
     """Remove a [model_providers.X] section from TOML text."""
     lines = text.split("\n")
     out = []
@@ -1746,7 +1746,7 @@ def _remove_provider_section(text, provider_name):
     return "\n".join(out)
 
 
-def _merge_config(current_text, target_provider_name, target_provider_section, target_model=None, target_reasoning=None):
+def merge_config(current_text, target_provider_name, target_provider_section, target_model=None, target_reasoning=None):
     """Merge provider settings into current config, preserving all preferences.
     Changes only: model_provider, model, model_reasoning_effort fields.
     Updates [model_providers.<target>] section if provided.
@@ -1859,7 +1859,7 @@ def _merge_config(current_text, target_provider_name, target_provider_section, t
 
     return "\n".join(out)
 
-def _load_providers():
+def load_providers():
     """Load providers.json. Migrate old format profiles to new format."""
     if not PROVIDERS_FILE.exists():
         return {"profiles": {}, "active": None}
@@ -1873,7 +1873,7 @@ def _load_providers():
         if "config.toml" in prof and "provider_section" not in prof:
             old_cfg = prof["config.toml"]
             if old_cfg:
-                _, section, model_val = _extract_provider_config(old_cfg)
+                _, section, model_val = extract_provider_config(old_cfg)
                 prof["provider_section"] = section or ""
                 prof["model"] = model_val or ""
                 changed = True
@@ -1881,18 +1881,18 @@ def _load_providers():
             del prof["config.toml"]
 
     if changed:
-        _save_providers(data)
+        save_providers(data)
 
     return data
 
 
-def _encode_secret(text):
+def encode_secret(text):
     if not text:
         return text
     return "b64:" + base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
-def _decode_secret(text):
+def decode_secret(text):
     if not text or not text.startswith("b64:"):
         return text
     try:
@@ -1901,33 +1901,33 @@ def _decode_secret(text):
         return text
 
 
-def _save_providers(data):
+def save_providers(data):
     """Save providers.json with b64 obfuscation for auth.json fields."""
     out = json.loads(json.dumps(data))
     for prof in out.get("profiles", {}).values():
         auth = prof.get("auth.json")
         if auth and not auth.startswith("b64:"):
-            prof["auth.json"] = _encode_secret(auth)
+            prof["auth.json"] = encode_secret(auth)
     with open(str(PROVIDERS_FILE), "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
 
 
-def _get_active_provider():
+def get_active_provider():
     """Detect current active provider from config.toml."""
     cfg_path = CODEX_DIR / "config.toml"
-    return _detect_provider_in_config(str(cfg_path)) or "openai"
+    return detect_provider_in_config(str(cfg_path)) or "openai"
 
 
-def _get_active_profile_name():
+def get_active_profile_name():
     """Detect the active *profile* (account) by matching current auth.json to saved profiles.
 
-    Unlike _get_active_provider() (which returns the provider name, e.g. "openai"),
+    Unlike get_active_provider() (which returns the provider name, e.g. "openai"),
     this distinguishes multiple profiles that share the same provider — e.g. two
     different ChatGPT logins. Returns the profile name on match, or None.
     """
-    active_provider = _get_active_provider()
+    active_provider = get_active_provider()
     auth_path = CODEX_DIR / "auth.json"
-    current_auth_raw = _read_file_safe(str(auth_path))
+    current_auth_raw = read_file_safe(str(auth_path))
     if not current_auth_raw:
         return None
     try:
@@ -1940,18 +1940,18 @@ def _get_active_profile_name():
     current_key = None
     current_account_id = None
     if auth_mode == "chatgpt":
-        current_email = _extract_email_from_jwt(current_auth.get("tokens", {}).get("id_token"))
+        current_email = extract_email_from_jwt(current_auth.get("tokens", {}).get("id_token"))
         current_account_id = _extract_account_id_from_auth(current_auth)
     elif auth_mode == "apikey":
         current_key = current_auth.get("OPENAI_API_KEY")
 
-    data = _load_providers()
+    data = load_providers()
     profiles = data.get("profiles", {})
     for name, prof in profiles.items():
         # Only compare profiles of the same provider to avoid cross-provider key collisions.
         if prof.get("model_provider") != active_provider:
             continue
-        stored_raw = _decode_secret(prof.get("auth.json", ""))
+        stored_raw = decode_secret(prof.get("auth.json", ""))
         if not stored_raw:
             continue
         try:
@@ -1964,7 +1964,7 @@ def _get_active_profile_name():
             if current_account_id and stored_account_id and stored_account_id == current_account_id:
                 return name
             # Fallback: email match (for older profiles without account_id).
-            stored_email = _extract_email_from_jwt(stored_auth.get("tokens", {}).get("id_token"))
+            stored_email = extract_email_from_jwt(stored_auth.get("tokens", {}).get("id_token"))
             if current_email and stored_email and (stored_email or "").lower() == (current_email or "").lower():
                 return name
         elif auth_mode == "apikey":
@@ -1974,14 +1974,14 @@ def _get_active_profile_name():
     return None
 
 
-def _compute_active_auth_sync():
+def compute_active_auth_sync():
     """Decide whether the active chatgpt profile needs its stored auth refreshed.
 
     Returns the profile name to update, or None when nothing to do. Pure data logic —
     no GUI, no side effects — so it can be unit-tested directly.
     """
     auth_path = CODEX_DIR / "auth.json"
-    current_auth_raw = _read_file_safe(str(auth_path))
+    current_auth_raw = read_file_safe(str(auth_path))
     if not current_auth_raw:
         return None
     try:
@@ -1994,22 +1994,22 @@ def _compute_active_auth_sync():
     if not current_refresh:
         return None
 
-    active_profile = _get_active_profile_name()
+    active_profile = get_active_profile_name()
     if not active_profile:
         return None
 
-    data = _load_providers()
+    data = load_providers()
     profiles = data.get("profiles", {})
     prof = profiles.get(active_profile)
     if not prof:
         return None
-    _, stored_refresh = _get_stored_auth_email(prof)
+    _, stored_refresh = get_stored_auth_email(prof)
     if current_refresh == stored_refresh:
         return None  # already up to date
     return active_profile
 
 
-def _read_file_safe(filepath):
+def read_file_safe(filepath):
     """Read file content, return None if not found."""
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -2020,9 +2020,9 @@ def _read_file_safe(filepath):
 
 def providers_list():
     """Show all saved provider profiles."""
-    data = _load_providers()
-    active = _get_active_provider()
-    active_profile = _get_active_profile_name()
+    data = load_providers()
+    active = get_active_provider()
+    active_profile = get_active_profile_name()
     profiles = data.get("profiles", {})
 
     if not profiles:
@@ -2039,7 +2039,7 @@ def providers_list():
         auth_mode = prof.get("auth_mode", "?")
         email = prof.get("auth_email") or ""
         if not email and auth_mode == "chatgpt":
-            stored_email, _ = _get_stored_auth_email(prof)
+            stored_email, _ = get_stored_auth_email(prof)
             email = stored_email or ""
         bound = prof.get("bound_at", "")[:10]
         saved = prof.get("saved_at", "?")[:10]
@@ -2052,18 +2052,18 @@ def providers_list():
 
 def save_provider(name):
     """Save current provider section + auth as a profile."""
-    name = _sanitize_name(name)
-    data = _load_providers()
+    name = sanitize_name(name)
+    data = load_providers()
     profiles = data.get("profiles", {})
 
-    cfg_content = _read_file_safe(CODEX_DIR / "config.toml")
-    auth_content = _read_file_safe(CODEX_DIR / "auth.json")
+    cfg_content = read_file_safe(CODEX_DIR / "config.toml")
+    auth_content = read_file_safe(CODEX_DIR / "auth.json")
 
     if not cfg_content:
         print("ERROR: config.toml not found.")
         sys.exit(1)
 
-    provider_name, provider_section, model_value = _extract_provider_config(cfg_content)
+    provider_name, provider_section, model_value = extract_provider_config(cfg_content)
     if not provider_name:
         provider_name = "openai"
     auth_mode = "unknown"
@@ -2078,7 +2078,7 @@ def save_provider(name):
     if auth_mode == "chatgpt" and auth_content:
         try:
             auth_data = json.loads(auth_content)
-            auth_email = _extract_email_from_jwt(auth_data.get("tokens", {}).get("id_token"))
+            auth_email = extract_email_from_jwt(auth_data.get("tokens", {}).get("id_token"))
         except Exception:
             pass
 
@@ -2094,7 +2094,7 @@ def save_provider(name):
     }
     data["profiles"] = profiles
     data["active"] = name
-    _save_providers(data)
+    save_providers(data)
 
     print(f"Saved profile '{name}' (provider: {provider_name}, model: {model_value}, auth: {auth_mode})")
     record_history("save_provider", provider=name, details={"model_provider": provider_name, "model": model_value, "auth_mode": auth_mode})
@@ -2104,9 +2104,9 @@ def use_provider(name, skip_convert=False):
     """Switch to a provider profile: swap config/auth + convert threads."""
     if is_codex_running():
         print("WARNING: Codex Desktop is running. Restart Codex after switching.")
-    data = _load_providers()
+    data = load_providers()
     profiles = data.get("profiles", {})
-    active = _get_active_provider()
+    active = get_active_provider()
 
     if name not in profiles:
         print(f"ERROR: Profile '{name}' not found.")
@@ -2115,7 +2115,7 @@ def use_provider(name, skip_convert=False):
 
     prof = profiles[name]
     target_provider = prof["model_provider"]
-    active_profile = _get_active_profile_name()
+    active_profile = get_active_profile_name()
 
     # Block only when the SAME account/profile is selected, not merely the same
     # provider — two different OpenAI logins share model_provider="openai".
@@ -2131,24 +2131,24 @@ def use_provider(name, skip_convert=False):
     save_target = active_profile or active
     if save_target not in profiles:
         print(f"Auto-saving current provider '{save_target}' before switching...")
-        current_cfg = _read_file_safe(CODEX_DIR / "config.toml")
-        current_auth = _read_file_safe(CODEX_DIR / "auth.json")
+        current_cfg = read_file_safe(CODEX_DIR / "config.toml")
+        current_auth = read_file_safe(CODEX_DIR / "auth.json")
         if current_cfg:
-            _, section, model_val = _extract_provider_config(current_cfg)
+            _, section, model_val = extract_provider_config(current_cfg)
             profiles[save_target] = {
                 "model_provider": active,
                 "model": model_val,
-                "auth_mode": _detect_auth_mode(str(CODEX_DIR / "auth.json")) or "unknown",
+                "auth_mode": detect_auth_mode(str(CODEX_DIR / "auth.json")) or "unknown",
                 "provider_section": section,
                 "auth.json": current_auth,
                 "saved_at": datetime.datetime.now().isoformat(),
             }
     else:
         # Update existing profile with current files
-        current_cfg = _read_file_safe(CODEX_DIR / "config.toml")
-        current_auth = _read_file_safe(CODEX_DIR / "auth.json")
+        current_cfg = read_file_safe(CODEX_DIR / "config.toml")
+        current_auth = read_file_safe(CODEX_DIR / "auth.json")
         if current_cfg:
-            _, section, model_val = _extract_provider_config(current_cfg)
+            _, section, model_val = extract_provider_config(current_cfg)
             profiles[save_target]["provider_section"] = section
             profiles[save_target]["model"] = model_val
         if current_auth:
@@ -2165,29 +2165,29 @@ def use_provider(name, skip_convert=False):
     if not target_section:
         old_cfg = prof.get("config.toml")
         if old_cfg:
-            _, target_section, target_model = _extract_provider_config(old_cfg)
+            _, target_section, target_model = extract_provider_config(old_cfg)
 
-    current_cfg = _read_file_safe(CODEX_DIR / "config.toml")
+    current_cfg = read_file_safe(CODEX_DIR / "config.toml")
     if current_cfg and target_section:
-        merged = _merge_config(current_cfg, target_provider, target_section, target_model)
+        merged = merge_config(current_cfg, target_provider, target_section, target_model)
         with open(str(CODEX_DIR / "config.toml"), "w", encoding="utf-8") as f:
             f.write(merged)
         print(f"  config.toml: merged (provider: {target_provider}, all sections preserved)")
     elif current_cfg:
         # No section, just update fields
-        merged = _merge_config(current_cfg, target_provider, None, target_model)
+        merged = merge_config(current_cfg, target_provider, None, target_model)
         with open(str(CODEX_DIR / "config.toml"), "w", encoding="utf-8") as f:
             f.write(merged)
         print(f"  config.toml: updated (provider: {target_provider})")
 
     if target_auth_content:
         with open(str(CODEX_DIR / "auth.json"), "w", encoding="utf-8") as f:
-            f.write(_decode_secret(target_auth_content))
+            f.write(decode_secret(target_auth_content))
         auth_mode = prof.get("auth_mode", "?")
         print(f"  auth.json: written (auth_mode: {auth_mode})")
 
     data["active"] = name
-    _save_providers(data)
+    save_providers(data)
 
     # 3. Convert threads
     if not skip_convert:
@@ -2203,9 +2203,9 @@ def use_provider(name, skip_convert=False):
 
 def detect_provider():
     """Scan for unsaved provider configs in prefixed files."""
-    data = _load_providers()
+    data = load_providers()
     profiles = data.get("profiles", {})
-    active = _get_active_provider()
+    active = get_active_provider()
     found = []
 
     for prefix in ("-", "--"):
@@ -2213,11 +2213,11 @@ def detect_provider():
             fpath = CODEX_DIR / f"{prefix}{basename}"
             if fpath.exists():
                 if prefix == "-" and basename == "config.toml":
-                    provider = _detect_provider_in_config(str(fpath))
+                    provider = detect_provider_in_config(str(fpath))
                     if provider and provider != active and provider not in profiles:
                         found.append({"provider": provider, "file": f"{prefix}{basename}"})
                 elif prefix == "-" and basename == "auth.json":
-                    auth_mode = _detect_auth_mode(str(fpath))
+                    auth_mode = detect_auth_mode(str(fpath))
                     if auth_mode and auth_mode == "apikey" and active == "openai":
                         pass  # expected
 
@@ -2268,7 +2268,7 @@ def add_provider(json_path, api_key=None):
         print('Example: {"name": "MyProvider", "model": "gpt-5.5", "base_url": "https://...", "wire_api": "responses"}')
         sys.exit(1)
 
-    name = _sanitize_name(raw["name"])
+    name = sanitize_name(raw["name"])
     model = raw.get("model", "gpt-5.5")
     base_url = raw["base_url"]
     wire_api = raw.get("wire_api", "responses")
@@ -2303,7 +2303,7 @@ def add_provider(json_path, api_key=None):
 
     provider_section = f'[model_providers.{name}]\nname = "{name}"\nbase_url = "{base_url}"\nwire_api = "{wire_api}"'
 
-    data = _load_providers()
+    data = load_providers()
     data.setdefault("profiles", {})[name] = {
         "model_provider": name,
         "model": model,
@@ -2312,7 +2312,7 @@ def add_provider(json_path, api_key=None):
         "auth.json": auth_text,
         "saved_at": datetime.datetime.now().isoformat(),
     }
-    _save_providers(data)
+    save_providers(data)
     print(f"Added provider '{name}' (model: {model}, url: {base_url}, auth: {auth_mode})")
     record_history("add_provider", provider=name, details={"model": model, "base_url": base_url, "auth_mode": auth_mode})
     return name
@@ -2320,21 +2320,21 @@ def add_provider(json_path, api_key=None):
 
 def remove_provider(name):
     """Remove a saved provider profile."""
-    data = _load_providers()
+    data = load_providers()
     profiles = data.get("profiles", {})
     if name not in profiles:
         print(f"Profile '{name}' not found.")
         return
     del profiles[name]
     data["profiles"] = profiles
-    _save_providers(data)
+    save_providers(data)
     print(f"Removed profile '{name}'.")
     record_history("remove_provider", provider=name)
 
 
 def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, reasoning=None, new_name=None):
     """Edit a saved provider profile. Only updates fields that are provided."""
-    data = _load_providers()
+    data = load_providers()
     profiles = data.get("profiles", {})
     if name not in profiles:
         print(f"Profile '{name}' not found.")
@@ -2342,14 +2342,14 @@ def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, 
 
     prof = profiles[name]
     old_provider_name = prof.get("model_provider", name)
-    final_name = _sanitize_name(new_name) if new_name else name
+    final_name = sanitize_name(new_name) if new_name else name
 
     # Parse current provider_section
     section_text = prof.get("provider_section", "")
     if not section_text:
         old_cfg = prof.get("config.toml", "")
         if old_cfg:
-            _, section_text, _ = _extract_provider_config(old_cfg)
+            _, section_text, _ = extract_provider_config(old_cfg)
 
     # Rebuild section with new name and values
     section_lines = section_text.split("\n") if section_text else []
@@ -2392,7 +2392,7 @@ def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, 
         del profiles[name]
     profiles[final_name] = prof
     data["profiles"] = profiles
-    _save_providers(data)
+    save_providers(data)
 
     changes = []
     if new_name and new_name != name: changes.append(f"name={new_name}")
@@ -2405,15 +2405,15 @@ def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, 
     record_history("edit_provider", provider=final_name, details={"old_name": name, "changes": changes})
 
     # If this is the active provider (by old or new name), update config.toml
-    active = _get_active_provider()
+    active = get_active_provider()
     if active in (old_provider_name, final_name):
         cfg_path = CODEX_DIR / "config.toml"
-        cfg_text = _read_file_safe(str(cfg_path))
+        cfg_text = read_file_safe(str(cfg_path))
         if cfg_text:
             # Remove old section if renamed
             if new_name and new_name != name and old_provider_name != final_name:
-                cfg_text = _remove_provider_section(cfg_text, old_provider_name)
-            merged = _merge_config(cfg_text, final_name, prof["provider_section"],
+                cfg_text = remove_provider_section(cfg_text, old_provider_name)
+            merged = merge_config(cfg_text, final_name, prof["provider_section"],
                                    prof.get("model"), prof.get("model_reasoning_effort"))
             with open(str(cfg_path), "w", encoding="utf-8") as f:
                 f.write(merged)
@@ -2433,7 +2433,7 @@ def edit_provider(name, model=None, base_url=None, api_key=None, wire_api=None, 
 def set_model(model_name):
     """Change only the model in config.toml. No provider switch."""
     cfg_path = CODEX_DIR / "config.toml"
-    cfg_text = _read_file_safe(str(cfg_path))
+    cfg_text = read_file_safe(str(cfg_path))
     if not cfg_text:
         print("ERROR: config.toml not found.")
         return
@@ -2564,7 +2564,7 @@ def handle_droid_command(args):
             return True
 
         if args.droid_import_provider:
-            data = _load_providers()
+            data = load_providers()
             profiles = data.get("profiles", {})
             profile = profiles.get(args.droid_import_provider)
             if not profile:
@@ -3463,7 +3463,7 @@ def main():
         added_name = add_provider(args.add_provider, args.api_key)
         if args.droid_after_add:
             # Chain: add -> import into Droid Factory with same key.
-            data = _load_providers()
+            data = load_providers()
             profile = data.get("profiles", {}).get(added_name)
             if profile:
                 import droid_provider_adapter as droid
@@ -3635,3 +3635,22 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# --- Backward-compatible aliases (older callers) ---
+_load_providers = load_providers
+_save_providers = save_providers
+_get_active_provider = get_active_provider
+_get_active_profile_name = get_active_profile_name
+_encode_secret = encode_secret
+_decode_secret = decode_secret
+_sanitize_name = sanitize_name
+_extract_provider_config = extract_provider_config
+_merge_config = merge_config
+_remove_provider_section = remove_provider_section
+_detect_provider_from_text = detect_provider_from_text
+_detect_provider_in_config = detect_provider_in_config
+_detect_auth_mode = detect_auth_mode
+_get_stored_auth_email = get_stored_auth_email
+_compute_active_auth_sync = compute_active_auth_sync
+_read_file_safe = read_file_safe
+_extract_email_from_jwt = extract_email_from_jwt
