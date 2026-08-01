@@ -458,7 +458,6 @@ test_smoke.py                — 冒烟测试（99 个测试）
 codex_manager.cmd / .ps1     — Windows 启动器
 codex_manager.sh             — Unix 启动器
 providers_template.json      — 提供商模板
-providers_example.json       — 提供商示例
 CHANGELOG.md                 — 更新日志
 install.sh / install.ps1     — 一键安装程序
 ```

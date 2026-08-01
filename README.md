@@ -463,7 +463,6 @@ test_smoke.py                — Smoke tests (99 tests)
 codex_manager.cmd / .ps1     — Windows launchers
 codex_manager.sh             — Unix launcher
 providers_template.json      — Provider template
-providers_example.json       — Provider example
 CHANGELOG.md                 — Changelog
 install.sh / install.ps1     — One-line installers
 ```

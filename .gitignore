@@ -15,7 +15,6 @@
 !install.sh
 !install.ps1
 !providers_template.json
-!providers_example.json
 !test_smoke.py
 !CHANGELOG.md
 !README.ru.md

@@ -458,7 +458,6 @@ test_smoke.py                — Smoke-тесты (99 тестов)
 codex_manager.cmd / .ps1     — Windows запускаторы
 codex_manager.sh             — Unix запускатор
 providers_template.json      — Шаблон провайдера
-providers_example.json       — Пример провайдера
 CHANGELOG.md                 — История изменений
 install.sh / install.ps1     — Установка одной строкой
 ```
