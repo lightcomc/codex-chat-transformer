@@ -351,6 +351,19 @@ GUI 是 CLI 的轻量封装（`import codex_chat_transformer as ct`），无代�
 }
 ```
 
+**API 供应商一键安装（无需 GUI）：** API 供应商可以发布 JSON 配置文件，用户一条命令即可完成安装、切换，并（可选）推送到 Factory Droid：
+
+```bash
+# 从本地文件安装并切换
+python codex_chat_transformer.py --add-provider my_vendor.json --api-key sk-... --use-after-add
+
+# 通过 HTTPS 下载并在一步中切换
+python codex_chat_transformer.py --add-provider https://vendor.example/profile.json --api-key sk-... --use-after-add
+
+# 同上，并推送到 Factory Droid（默认使用 ${MY_VENDOR_KEY} 环境变量引用）
+python codex_chat_transformer.py --add-provider https://vendor.example/profile.json --api-key sk-... --droid-after-add --droid-api-key-env MY_VENDOR_KEY
+```
+
 ---
 
 ## 系统要求

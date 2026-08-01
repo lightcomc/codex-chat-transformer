@@ -347,6 +347,138 @@ def test_add_provider_format():
         restore_providers(orig, tmp)
 
 
+def test_add_provider_from_url():
+    """--add-provider accepts an https:// URL: fetch JSON + register profile, no GUI."""
+    import http.server
+    import threading
+
+    payload = {
+        "name": "UrlProv",
+        "model": "gpt-5",
+        "base_url": "https://api.urlprov.invalid/v1",
+        "wire_api": "responses",
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a, **kw):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), H)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    orig, tmp = setup_temp_providers()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/profile.json"
+        name = ct.add_provider(url, api_key="sk-urlkey")
+        assert name == "UrlProv", f"expected UrlProv, got {name!r}"
+
+        data = ct._load_providers()
+        p = data["profiles"]["UrlProv"]
+        assert p["model_provider"] == "UrlProv"
+        assert p["model"] == "gpt-5"
+        decoded = json.loads(ct._decode_secret(p["auth.json"]))
+        assert decoded["OPENAI_API_KEY"] == "sk-urlkey"
+    finally:
+        restore_providers(orig, tmp)
+        server.shutdown()
+        server.server_close()
+
+
+def test_add_provider_chain_use_after_add():
+    """--add-provider with --use-after-add switches active config/auth to the new profile."""
+    orig, tmp = setup_temp_codex_home()
+    try:
+        # Seed distinct auth/config so _get_active_provider reads something.
+        (ct.CODEX_DIR / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+        (ct.CODEX_DIR / "auth.json").write_text(
+            json.dumps({"auth_mode": "chatgpt", "tokens": {"id_token": "", "account_id": ""}, "last_refresh": ""}),
+            encoding="utf-8",
+        )
+
+        jf = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+        json.dump(
+            {
+                "name": "ChainProv",
+                "model": "gpt-5.5",
+                "base_url": "https://api.chain.invalid/v1",
+                "wire_api": "responses",
+            },
+            jf,
+        )
+        jf.close()
+
+        # Simulate the CLI chain: add + use-after-add.
+        name = ct.add_provider(jf.name, api_key="sk-chainkey")
+        assert name == "ChainProv"
+        ct.use_provider(name, skip_convert=True)
+
+        live_cfg = (ct.CODEX_DIR / "config.toml").read_text(encoding="utf-8")
+        live_auth = json.loads((ct.CODEX_DIR / "auth.json").read_text(encoding="utf-8"))
+        assert 'model_provider = "ChainProv"' in live_cfg, "config.toml should point to ChainProv"
+        assert live_auth.get("OPENAI_API_KEY") == "sk-chainkey", "auth.json should carry the new key"
+        assert ct._detect_provider_in_config(str(ct.CODEX_DIR / "config.toml")) == "ChainProv"
+
+        os.unlink(jf.name)
+    finally:
+        restore_temp_codex_home(orig, tmp)
+
+
+def test_add_provider_chain_droid_after_add():
+    """--add-provider with --droid-after-add imports the fresh profile into Droid
+    with the same key (with_key=True)."""
+    import droid_provider_adapter as droid_mod
+
+    orig, tmp = setup_temp_codex_home()
+    try:
+        with tempfile.TemporaryDirectory() as factory_td:
+            factory_home = Path(factory_td)
+            # Seed a config so save_provider picks provider name; profile is stored
+            # under the provider name (matching how --droid-after-add looks it up).
+            jf = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+            json.dump(
+                {
+                    "name": "DroidChain",
+                    "model": "gpt-5",
+                    "base_url": "https://api.droidchain.invalid/v1",
+                    "wire_api": "responses",
+                },
+                jf,
+            )
+            jf.close()
+
+            name = ct.add_provider(jf.name, api_key="sk-droidchain")
+            assert name == "DroidChain"
+
+            # Now mirror the in-main() chain logic: import the freshly stored profile
+            # into a temp Droid Factory home, with the key materialized (with_key=True
+            # is what --droid-with-key does).
+            data = ct._load_providers()
+            profile = data["profiles"][name]
+            # Use the real import path (no network) writing into a temp factory home.
+            summary = droid_mod.import_codex_provider(
+                factory_home,
+                name,
+                profile,
+                with_key=True,
+                api_key_env=None,
+            )
+            settings_raw = (factory_home / "settings.local.json").read_text(encoding="utf-8")
+            assert "sk-droidchain" in settings_raw, "with_key should write the key into Droid settings"
+            assert summary["model_id"].startswith("custom:"), f"unexpected model_id: {summary}"
+            os.unlink(jf.name)
+    finally:
+        restore_temp_codex_home(orig, tmp)
+
+
 def test_remove_provider():
     orig, tmp = setup_temp_providers()
     try:
@@ -6722,6 +6854,9 @@ if __name__ == "__main__":
     test("auth sync updates stored email after account_id match", test_auth_sync_updates_email_after_account_id_match)
     test("unmatched active account returns None", test_unmatched_active_account_returns_none)
     test("add_provider uses new format + b64 auth", test_add_provider_format)
+    test("add_provider from URL fetches JSON", test_add_provider_from_url)
+    test("add_provider chain switches via use-after-add", test_add_provider_chain_use_after_add)
+    test("add_provider chain imports into Droid via droid-after-add", test_add_provider_chain_droid_after_add)
     test("remove_provider deletes profile", test_remove_provider)
     test("_extract_provider_config", test_extract_provider_config)
     test("transform() has project/from_model/to_model params", test_transform_signature)

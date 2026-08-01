@@ -351,6 +351,19 @@ GUI — тонкая обёртка над CLI (`import codex_chat_transformer a
 }
 ```
 
+**One-liner для API-вендора (без GUI):** провайдер API может отдать JSON-профиль, а пользователь одной командой установит его, переключится и (опционально) пробросит в Droid:
+
+```bash
+# Из локального файла + переключение
+python codex_chat_transformer.py --add-provider my_vendor.json --api-key sk-... --use-after-add
+
+# Или скачать по HTTPS и переключить в один шаг
+python codex_chat_transformer.py --add-provider https://vendor.example/profile.json --api-key sk-... --use-after-add
+
+# То же + проброс в Factory Droid (env-ссылка ${MY_VENDOR_KEY} по умолчанию)
+python codex_chat_transformer.py --add-provider https://vendor.example/profile.json --api-key sk-... --droid-after-add --droid-api-key-env MY_VENDOR_KEY
+```
+
 ---
 
 ## Требования

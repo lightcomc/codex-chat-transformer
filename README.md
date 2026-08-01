@@ -354,6 +354,19 @@ Place a JSON file next to the app — it's auto-detected. If no API key is prese
 }
 ```
 
+**Vendor one-liner (no GUI):** an API provider can ship a JSON profile and have the end user install it, switch to it, and (optionally) mirror into Droid in a single command:
+
+```bash
+# Install from a local file and switch
+python codex_chat_transformer.py --add-provider my_vendor.json --api-key sk-... --use-after-add
+
+# Or fetch over HTTPS and switch in one step
+python codex_chat_transformer.py --add-provider https://vendor.example/profile.json --api-key sk-... --use-after-add
+
+# Same, but also push the new profile into Factory Droid (uses ${MY_VENDOR_KEY} env ref by default)
+python codex_chat_transformer.py --add-provider https://vendor.example/profile.json --api-key sk-... --droid-after-add --droid-api-key-env MY_VENDOR_KEY
+```
+
 ---
 
 ## Requirements

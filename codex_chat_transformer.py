@@ -2244,9 +2244,17 @@ def detect_provider():
 
 
 def add_provider(json_path, api_key=None):
-    """Add a provider from a simple JSON file + optional API key."""
+    """Add a provider from a simple JSON file, URL, or stdin + optional API key.
+
+    Returns the sanitized profile name so callers can chain --use-after-add.
+    """
     if json_path == "-":
         raw = json.load(sys.stdin)
+    elif json_path.startswith(("http://", "https://")):
+        from urllib.request import urlopen, Request
+        req = Request(json_path, headers={"Accept": "application/json", "User-Agent": "codex-provider-manager"})
+        with urlopen(req, timeout=30) as resp:
+            raw = json.load(resp)
     else:
         p = Path(json_path)
         if not p.exists():
@@ -2307,6 +2315,7 @@ def add_provider(json_path, api_key=None):
     _save_providers(data)
     print(f"Added provider '{name}' (model: {model}, url: {base_url}, auth: {auth_mode})")
     record_history("add_provider", provider=name, details={"model": model, "base_url": base_url, "auth_mode": auth_mode})
+    return name
 
 
 def remove_provider(name):
@@ -3283,8 +3292,10 @@ def build_parser():
     parser.add_argument("--use-provider", metavar="NAME", help="Switch to a saved provider profile")
     parser.add_argument("--detect-provider", action="store_true", help="Scan for unsaved provider configs")
     parser.add_argument("--remove-provider", metavar="NAME", help="Remove a saved provider profile")
-    parser.add_argument("--add-provider", metavar="FILE", help="Add provider from JSON file (use - for stdin)")
+    parser.add_argument("--add-provider", metavar="FILE_OR_URL", help="Add provider from JSON file, https:// URL, or - for stdin")
     parser.add_argument("--api-key", metavar="KEY", help="API key for --add-provider (prompts if omitted)")
+    parser.add_argument("--use-after-add", action="store_true", help="Switch to the provider added by --add-provider")
+    parser.add_argument("--droid-after-add", action="store_true", help="Import the provider added by --add-provider into Droid Factory")
     parser.add_argument("--doctor", action="store_true", help="Read-only health check of Codex state")
     parser.add_argument("--from-model", metavar="MODEL", help="Source model name for model mapping")
     parser.add_argument("--to-model", metavar="MODEL", help="Target model name for model mapping")
@@ -3449,7 +3460,24 @@ def main():
         return
 
     if args.add_provider:
-        add_provider(args.add_provider, args.api_key)
+        added_name = add_provider(args.add_provider, args.api_key)
+        if args.droid_after_add:
+            # Chain: add -> import into Droid Factory with same key.
+            data = _load_providers()
+            profile = data.get("profiles", {}).get(added_name)
+            if profile:
+                import droid_provider_adapter as droid
+                droid.import_codex_provider(
+                    _droid_home_from_args(args),
+                    added_name,
+                    profile,
+                    api_key_env=getattr(args, "droid_api_key_env", None),
+                    with_key=getattr(args, "droid_with_key", False),
+                )
+                print(f"Droid provider imported: {added_name}")
+        if args.use_after_add:
+            # Chain: add -> switch active provider.
+            use_provider(added_name)
         return
 
     if args.edit_provider:
