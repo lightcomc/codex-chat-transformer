@@ -3356,6 +3356,254 @@ def build_parser():
     return parser
 
 
+# ── Command handlers (split out of main() for readability) ─────────────────
+
+
+def _cmd_backup_restore(args):
+    """Handle --backup / --restore / --restore-zip / --fix-dates."""
+    if args.restore:
+        restore_backup(args.restore)
+        return True
+    if args.restore_zip:
+        restore_from_zip(args.restore_zip)
+        return True
+    if args.backup:
+        full_backup()
+        return True
+    if args.fix_dates:
+        fix_dates()
+        return True
+    return False
+
+
+def _cmd_pack(args, provider_filter, session_filter):
+    """Handle --export-pack / --import-pack."""
+    if args.export_pack:
+        try:
+            summary = export_pack(
+                args.export_pack,
+                scope=args.scope,
+                provider_names=provider_filter,
+                session_ids=session_filter,
+                without_keys=args.without_keys,
+            )
+        except ValueError as e:
+            logger.warning(f"{e}")
+            return True
+        print_pack_summary("Exported", summary)
+        return True
+    if args.import_pack:
+        try:
+            summary = import_pack(
+                args.import_pack,
+                scope=args.scope,
+                provider_names=provider_filter,
+                session_ids=session_filter,
+            )
+        except ValueError as e:
+            logger.warning(f"{e}")
+            return True
+        print_pack_summary("Imported", summary)
+        return True
+    return False
+
+
+def _cmd_providers(args):
+    """Handle provider CRUD: save/use/detect/remove/add/edit/set-model."""
+    if args.save_provider:
+        save_provider(args.save_provider)
+        return True
+    if args.use_provider:
+        use_provider(args.use_provider)
+        return True
+    if args.detect_provider:
+        detect_provider()
+        return True
+    if args.remove_provider:
+        remove_provider(args.remove_provider)
+        return True
+    if args.add_provider:
+        _cmd_add_provider_chain(args)
+        return True
+    if args.edit_provider:
+        edit_provider(args.edit_provider, args.set_model, args.set_url,
+                      args.set_key, args.set_wire_api, args.set_reasoning,
+                      args.set_name)
+        return True
+    if args.set_model and not args.edit_provider:
+        set_model(args.set_model)
+        return True
+    return False
+
+
+def _cmd_add_provider_chain(args):
+    """--add-provider with optional --use-after-add / --droid-after-add chaining."""
+    added_name = add_provider(args.add_provider, args.api_key)
+    if args.droid_after_add:
+        # Chain: add -> import into Droid Factory with same key.
+        data = load_providers()
+        profile = data.get("profiles", {}).get(added_name)
+        if profile:
+            import droid_provider_adapter as droid
+            droid.import_codex_provider(
+                _droid_home_from_args(args),
+                added_name,
+                profile,
+                api_key_env=getattr(args, "droid_api_key_env", None),
+                with_key=getattr(args, "droid_with_key", False),
+            )
+            print(f"Droid provider imported: {added_name}")
+    if args.use_after_add:
+        # Chain: add -> switch active provider.
+        use_provider(added_name)
+
+
+def _cmd_doctor_and_list(args):
+    """Handle --doctor, --providers (list), --search, --history."""
+    if args.doctor:
+        doctor()
+        return True
+    if args.providers == PROVIDERS_LIST_SENTINEL:
+        providers_list()
+        return True
+    if args.search:
+        try:
+            results = search_sessions(args.search, project=args.project)
+        except ValueError as e:
+            logger.warning(f"{e}")
+            return True
+        print_search_results(results)
+        return True
+    if args.history:
+        print_history(args.history_limit)
+        return True
+    return False
+
+
+def _cmd_sync_interactive(args):
+    """Handle --sync-host (run server) and --sync-pull/--sync-push (interactive client)."""
+    if args.sync_host:
+        from codex_sync import start_server, get_local_ip, stop_server
+        server, pin, port = start_server(port=args.sync_port)
+        ip = get_local_ip()
+        print(f"\n=== Codex Sync Server ===")
+        print(f"  Address: http://{ip}:{port}")
+        print(f"  Dashboard: http://{ip}:{port}/dashboard")
+        print(f"  PIN: {pin}")
+        print(f"\nPress Ctrl+C to stop.\n")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nStopping sync server...")
+            stop_server(server)
+        return True
+
+    if args.sync_pull or args.sync_push:
+        _cmd_sync_transfer(args)
+        return True
+    return False
+
+
+def _cmd_sync_transfer(args):
+    """Interactive pull/push menu against a sync peer."""
+    from codex_sync import (
+        _client_get_json, _client_post_json, _providers_summary, _provider_full,
+        _get_sessions_list, _get_session_jsonl,
+    )
+    import base64
+    try:
+        peer = parse_sync_peer(args.sync_pull or args.sync_push)
+    except ValueError as e:
+        logger.warning(f"{e}")
+        return
+    host = peer["host"]
+    port = peer["port"]
+    scheme = peer["scheme"]
+    pin = args.sync_pin or input("Enter PIN: ").strip().upper()
+    mode = "pull" if args.sync_pull else "push"
+    base_url = f"{scheme}://{host}:{port}"
+    print(f"\n=== Codex Sync ({mode}) ===")
+    print(f"  Target: {scheme}://{host}:{port}")
+    try:
+        manifest = _client_get_json(f"{base_url}/api/manifest", pin)
+        print(f"  Connected! {manifest['session_count']} sessions, {manifest['provider_count']} providers\n")
+    except Exception as e:
+        print(f"  Connection failed: {e}")
+        return
+    print("  [1] Pull providers")
+    print("  [2] Pull sessions")
+    print("  [3] Push providers")
+    print("  [4] Push sessions")
+    print("  [0] Exit")
+    choice = input("\n  Choose: ").strip()
+    if choice == "1":
+        data = _client_get_json(f"{base_url}/api/providers", pin)
+        for p in data.get("providers", []):
+            print(f"  {p['name']}: {p['model']} ({p['auth_mode']}, key={'yes' if p['has_key'] else 'no'})")
+    elif choice == "2":
+        data = _client_get_json(f"{base_url}/api/sessions", pin)
+        for s in data.get("sessions", [])[:20]:
+            updated = datetime.datetime.fromtimestamp(s["updated_at_ms"] / 1000).strftime("%Y-%m-%d %H:%M") if s.get("updated_at_ms") else "?"
+            print(f"  {s['id'][:12]}... | {s['title'][:40]} | {s['model_provider']} | {updated}")
+    elif choice == "3":
+        providers, _ = _providers_summary()
+        names = [p["name"] for p in providers]
+        if not names:
+            print("  No local providers to push.")
+        else:
+            for n in names:
+                print(f"  {n}")
+            sel = input("  Push which (comma-separated)? ").strip()
+            if sel:
+                for name in [n.strip() for n in sel.split(",") if n.strip()]:
+                    prof = _provider_full(name)
+                    if not prof:
+                        print(f"  {name}: not found")
+                        continue
+                    result = _client_post_json(f"{base_url}/api/upload/provider", pin, prof)
+                    print(f"  {name}: {result}")
+    elif choice == "4":
+        sessions = _get_sessions_list()
+        if not sessions:
+            print("  No local sessions to push.")
+        else:
+            for s in sessions[:20]:
+                updated = datetime.datetime.fromtimestamp(s["updated_at_ms"] / 1000).strftime("%Y-%m-%d %H:%M") if s.get("updated_at_ms") else "?"
+                print(f"  {s['id'][:12]}... | {s['title'][:40]} | {s['model_provider']} | {updated}")
+            sel = input("  Push which IDs (comma-separated)? ").strip()
+            if sel:
+                session_map = {s["id"]: s for s in sessions}
+                for sid in [s.strip() for s in sel.split(",") if s.strip()]:
+                    meta = session_map.get(sid)
+                    if not meta:
+                        print(f"  {sid}: not found")
+                        continue
+                    jsonl_data = _get_session_jsonl(sid)
+                    if jsonl_data is None:
+                        print(f"  {sid}: rollout not found")
+                        continue
+                    payload = {"meta": meta, "jsonl": base64.b64encode(jsonl_data).decode("ascii")}
+                    result = _client_post_json(f"{base_url}/api/upload/session", pin, payload)
+                    print(f"  {sid}: {result}")
+
+
+def _cmd_threads(args, conn):
+    """Handle thread-level commands: --list, --pin-list, --unpin-all, --pin-top, transform."""
+    if args.list:
+        list_threads(conn)
+        return True
+    if args.pin_list:
+        list_pinned(conn)
+        return True
+    if args.unpin_all:
+        unpin_all()
+        return True
+    if args.pin_top:
+        pin_top_threads(conn, args.pin_top, args.project)
+        return True
+    return False
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -3375,6 +3623,8 @@ def main():
         return
     _check_openai_auth_sync()
     _check_active_provider_saved()
+
+    # Validate --providers / --sessions / --without-keys usage against the command.
     provider_filter = None
     session_filter = None
     if args.providers not in (None, PROVIDERS_LIST_SENTINEL):
@@ -3400,234 +3650,23 @@ def main():
         logger.warning("--sessions is only valid with --export-pack or --import-pack.")
         return
 
-    if args.restore:
-        restore_backup(args.restore)
+    # Route to command handlers (each returns True if it handled a command).
+    if _cmd_backup_restore(args):
+        return
+    if _cmd_pack(args, provider_filter, session_filter):
+        return
+    if _cmd_providers(args):
+        return
+    if _cmd_doctor_and_list(args):
+        return
+    if _cmd_sync_interactive(args):
         return
 
-    if args.restore_zip:
-        restore_from_zip(args.restore_zip)
-        return
-
-    if args.backup:
-        full_backup()
-        return
-
-    if args.fix_dates:
-        fix_dates()
-        return
-
-    if args.export_pack:
-        try:
-            summary = export_pack(
-                args.export_pack,
-                scope=args.scope,
-                provider_names=provider_filter,
-                session_ids=session_filter,
-                without_keys=args.without_keys,
-            )
-        except ValueError as e:
-            logger.warning(f"{e}")
-            return
-        print_pack_summary("Exported", summary)
-        return
-
-    if args.import_pack:
-        try:
-            summary = import_pack(
-                args.import_pack,
-                scope=args.scope,
-                provider_names=provider_filter,
-                session_ids=session_filter,
-            )
-        except ValueError as e:
-            logger.warning(f"{e}")
-            return
-        print_pack_summary("Imported", summary)
-        return
-
-    if args.search:
-        try:
-            results = search_sessions(args.search, project=args.project)
-        except ValueError as e:
-            logger.warning(f"{e}")
-            return
-        print_search_results(results)
-        return
-
-    if args.history:
-        print_history(args.history_limit)
-        return
-
-    if args.providers == PROVIDERS_LIST_SENTINEL:
-        providers_list()
-        return
-
-    if args.save_provider:
-        save_provider(args.save_provider)
-        return
-
-    if args.use_provider:
-        use_provider(args.use_provider)
-        return
-
-    if args.detect_provider:
-        detect_provider()
-        return
-
-    if args.remove_provider:
-        remove_provider(args.remove_provider)
-        return
-
-    if args.add_provider:
-        added_name = add_provider(args.add_provider, args.api_key)
-        if args.droid_after_add:
-            # Chain: add -> import into Droid Factory with same key.
-            data = load_providers()
-            profile = data.get("profiles", {}).get(added_name)
-            if profile:
-                import droid_provider_adapter as droid
-                droid.import_codex_provider(
-                    _droid_home_from_args(args),
-                    added_name,
-                    profile,
-                    api_key_env=getattr(args, "droid_api_key_env", None),
-                    with_key=getattr(args, "droid_with_key", False),
-                )
-                print(f"Droid provider imported: {added_name}")
-        if args.use_after_add:
-            # Chain: add -> switch active provider.
-            use_provider(added_name)
-        return
-
-    if args.edit_provider:
-        edit_provider(args.edit_provider, args.set_model, args.set_url,
-                      args.set_key, args.set_wire_api, args.set_reasoning,
-                      args.set_name)
-        return
-
-    if args.set_model and not args.edit_provider:
-        set_model(args.set_model)
-        return
-
-    if args.doctor:
-        doctor()
-        return
-
-    if args.sync_host:
-        from codex_sync import start_server, get_local_ip, stop_server
-        server, pin, port = start_server(port=args.sync_port)
-        ip = get_local_ip()
-        print(f"\n=== Codex Sync Server ===")
-        print(f"  Address: http://{ip}:{port}")
-        print(f"  Dashboard: http://{ip}:{port}/dashboard")
-        print(f"  PIN: {pin}")
-        print(f"\nPress Ctrl+C to stop.\n")
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            print("\nStopping sync server...")
-            stop_server(server)
-        return
-
-    if args.sync_pull or args.sync_push:
-        from codex_sync import (
-            _client_get_json, _client_post_json, _providers_summary, _provider_full,
-            _get_sessions_list, _get_session_jsonl,
-        )
-        import base64
-        try:
-            peer = parse_sync_peer(args.sync_pull or args.sync_push)
-        except ValueError as e:
-            logger.warning(f"{e}")
-            return
-        host = peer["host"]
-        port = peer["port"]
-        scheme = peer["scheme"]
-        pin = args.sync_pin or input("Enter PIN: ").strip().upper()
-        mode = "pull" if args.sync_pull else "push"
-        base_url = f"{scheme}://{host}:{port}"
-        print(f"\n=== Codex Sync ({mode}) ===")
-        print(f"  Target: {scheme}://{host}:{port}")
-        try:
-            manifest = _client_get_json(f"{base_url}/api/manifest", pin)
-            print(f"  Connected! {manifest['session_count']} sessions, {manifest['provider_count']} providers\n")
-        except Exception as e:
-            print(f"  Connection failed: {e}")
-            return
-        print("  [1] Pull providers")
-        print("  [2] Pull sessions")
-        print("  [3] Push providers")
-        print("  [4] Push sessions")
-        print("  [0] Exit")
-        choice = input("\n  Choose: ").strip()
-        if choice == "1":
-            data = _client_get_json(f"{base_url}/api/providers", pin)
-            for p in data.get("providers", []):
-                print(f"  {p['name']}: {p['model']} ({p['auth_mode']}, key={'yes' if p['has_key'] else 'no'})")
-        elif choice == "2":
-            data = _client_get_json(f"{base_url}/api/sessions", pin)
-            for s in data.get("sessions", [])[:20]:
-                updated = datetime.datetime.fromtimestamp(s["updated_at_ms"] / 1000).strftime("%Y-%m-%d %H:%M") if s.get("updated_at_ms") else "?"
-                print(f"  {s['id'][:12]}... | {s['title'][:40]} | {s['model_provider']} | {updated}")
-        elif choice == "3":
-            providers, _ = _providers_summary()
-            names = [p["name"] for p in providers]
-            if not names:
-                print("  No local providers to push.")
-            else:
-                for n in names:
-                    print(f"  {n}")
-                sel = input("  Push which (comma-separated)? ").strip()
-                if sel:
-                    for name in [n.strip() for n in sel.split(",") if n.strip()]:
-                        prof = _provider_full(name)
-                        if not prof:
-                            print(f"  {name}: not found")
-                            continue
-                        result = _client_post_json(f"{base_url}/api/upload/provider", pin, prof)
-                        print(f"  {name}: {result}")
-        elif choice == "4":
-            sessions = _get_sessions_list()
-            if not sessions:
-                print("  No local sessions to push.")
-            else:
-                for s in sessions[:20]:
-                    updated = datetime.datetime.fromtimestamp(s["updated_at_ms"] / 1000).strftime("%Y-%m-%d %H:%M") if s.get("updated_at_ms") else "?"
-                    print(f"  {s['id'][:12]}... | {s['title'][:40]} | {s['model_provider']} | {updated}")
-                sel = input("  Push which IDs (comma-separated)? ").strip()
-                if sel:
-                    session_map = {s["id"]: s for s in sessions}
-                    for sid in [s.strip() for s in sel.split(",") if s.strip()]:
-                        meta = session_map.get(sid)
-                        if not meta:
-                            print(f"  {sid}: not found")
-                            continue
-                        jsonl_data = _get_session_jsonl(sid)
-                        if jsonl_data is None:
-                            print(f"  {sid}: rollout not found")
-                            continue
-                        payload = {"meta": meta, "jsonl": base64.b64encode(jsonl_data).decode("ascii")}
-                        result = _client_post_json(f"{base_url}/api/upload/session", pin, payload)
-                        print(f"  {sid}: {result}")
-        return
-
+    # Thread-level commands need a DB connection.
     conn = get_db_conn()
     if conn is not None:
         try:
-            if args.list:
-                list_threads(conn)
-                return
-
-            if args.pin_list:
-                list_pinned(conn)
-                return
-
-            if args.unpin_all:
-                unpin_all()
-                return
-
-            if args.pin_top:
-                pin_top_threads(conn, args.pin_top, args.project)
+            if _cmd_threads(args, conn):
                 return
 
             if not args.from_provider or not args.to_provider:
