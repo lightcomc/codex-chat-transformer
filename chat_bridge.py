@@ -3263,7 +3263,7 @@ def _canonical_droid_provider(provider, model):
         return known[lower]
     if "anthropic" in lower or "claude" in lower:
         return "anthropic"
-    if "openai" in lower or "neurogate" in lower:
+    if "openai" in lower:
         return "openai"
 
     model_text = str(model or "").strip().lower()

@@ -2453,7 +2453,6 @@ def _args_have_droid_command(args):
     return any([
         getattr(args, "droid_models", False),
         getattr(args, "droid_doctor", False),
-        getattr(args, "droid_add_neurogate", False),
         bool(getattr(args, "droid_import_provider", None)),
         bool(getattr(args, "droid_use", None)),
         bool(getattr(args, "droid_remove_model", None)),
@@ -2551,28 +2550,6 @@ def handle_droid_command(args):
                     "ok": report["ok"],
                     "model_count": report["model_count"],
                     "legacy_count": report["legacy_count"],
-                },
-            )
-            return True
-
-        if args.droid_add_neurogate:
-            summary = droid.add_neurogate_models(
-                home,
-                api_key_env=args.droid_api_key_env or "NEUROGATE_API_KEY",
-                api_key=args.api_key if args.droid_with_key else None,
-            )
-            print("Droid NeuroGate models updated.")
-            print(f"  Added: {summary['added']}")
-            print(f"  Updated: {summary['updated']}")
-            print(f"  Path: {summary['path']}")
-            record_history(
-                "droid_model_added",
-                details={
-                    "kind": "neurogate",
-                    "added": summary["added"],
-                    "updated": summary["updated"],
-                    "models": summary["models"],
-                    "path": str(summary["path"]),
                 },
             )
             return True
@@ -3320,7 +3297,6 @@ def build_parser():
     parser.add_argument("--set-name", metavar="NAME", help="Rename provider (with --edit-provider)")
     parser.add_argument("--droid-models", action="store_true", help="List Droid Factory models without printing secrets")
     parser.add_argument("--droid-doctor", action="store_true", help="Read-only health check of Droid Factory models")
-    parser.add_argument("--droid-add-neurogate", action="store_true", help="Add or update managed NeuroGate models in Droid Factory")
     parser.add_argument("--droid-import-provider", metavar="NAME", help="Import a saved Codex provider into Droid Factory")
     parser.add_argument("--droid-use", metavar="MODEL_ID", help="Set the active Droid Factory model")
     parser.add_argument("--droid-remove-model", metavar="MODEL_ID", help="Remove a managed model from Droid Factory local settings")

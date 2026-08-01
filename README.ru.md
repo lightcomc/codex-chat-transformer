@@ -153,13 +153,12 @@ python codex_chat_transformer.py --detect-provider
 ```bash
 python codex_chat_transformer.py --droid-models
 python codex_chat_transformer.py --droid-doctor
-python codex_chat_transformer.py --droid-add-neurogate
-python codex_chat_transformer.py --droid-use custom:NeuroGate-GPT-5.5-1 --set-reasoning medium
 python codex_chat_transformer.py --droid-import-provider OpenRouter --droid-api-key-env OPENROUTER_API_KEY
+python codex_chat_transformer.py --droid-use custom:OpenRouter --set-reasoning medium
 python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
 ```
 
-Все записи Droid идут в `%USERPROFILE%\.factory\settings.local.json`. Существующие `settings.json`, legacy `config.json` и Factory auth-файлы не трогаются. По умолчанию API-ключи пишутся как ссылки на переменные окружения, например `${NEUROGATE_API_KEY}`; прямую запись ключа нужно явно включить через `--droid-with-key --api-key ...`.
+Все записи Droid идут в `%USERPROFILE%\.factory\settings.local.json`. Существующие `settings.json`, legacy `config.json` и Factory auth-файлы не трогаются. По умолчанию API-ключи пишутся как ссылки на переменные окружения, например `${OPENROUTER_API_KEY}`; прямую запись ключа нужно явно включить через `--droid-with-key --api-key ...`.
 
 ### Chat Bridge: сессии Codex <-> Droid [Экспериментальный]
 
@@ -344,7 +343,7 @@ GUI — тонкая обёртка над CLI (`import codex_chat_transformer a
 
 ```json
 {
-  "name": "NeuroGate API",
+  "name": "My API",
   "model": "gpt-5.5",
   "base_url": "https://api.example.com/v1",
   "wire_api": "responses",

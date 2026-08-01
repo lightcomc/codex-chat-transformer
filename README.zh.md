@@ -153,13 +153,12 @@ CLI（启动时交互提示）和 GUI（启动时弹出对话框）均支持。�
 ```bash
 python codex_chat_transformer.py --droid-models
 python codex_chat_transformer.py --droid-doctor
-python codex_chat_transformer.py --droid-add-neurogate
-python codex_chat_transformer.py --droid-use custom:NeuroGate-GPT-5.5-1 --set-reasoning medium
 python codex_chat_transformer.py --droid-import-provider OpenRouter --droid-api-key-env OPENROUTER_API_KEY
+python codex_chat_transformer.py --droid-use custom:OpenRouter --set-reasoning medium
 python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
 ```
 
-Droid 写入目标是 `%USERPROFILE%\.factory\settings.local.json`。现有 `settings.json`、legacy `config.json` 和 Factory auth 文件保持不变。默认情况下 API key 会写成环境变量引用，例如 `${NEUROGATE_API_KEY}`；直接写入 key 需要显式使用 `--droid-with-key --api-key ...`。
+Droid 写入目标是 `%USERPROFILE%\.factory\settings.local.json`。现有 `settings.json`、legacy `config.json` 和 Factory auth 文件保持不变。默认情况下 API key 会写成环境变量引用，例如 `${OPENROUTER_API_KEY}`；直接写入 key 需要显式使用 `--droid-with-key --api-key ...`。
 
 ### Chat Bridge: Codex <-> Droid Sessions [Experimental]
 
@@ -344,7 +343,7 @@ GUI 是 CLI 的轻量封装（`import codex_chat_transformer as ct`），无代�
 
 ```json
 {
-  "name": "NeuroGate API",
+  "name": "My API",
   "model": "gpt-5.5",
   "base_url": "https://api.example.com/v1",
   "wire_api": "responses",

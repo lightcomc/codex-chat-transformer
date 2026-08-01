@@ -868,7 +868,7 @@ def write_temp_droid_session(home, session_id="droid-old", title="Droid Old Chat
     jsonl_path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
     settings_path.write_text(
         json.dumps({
-            "model": "custom:NeuroGate-GPT-5.5-1",
+            "model": "custom:Stub-GPT-5.5-1",
             "reasoningEffort": "medium",
             "providerLock": "openai",
             "providerLockTimestamp": "2025-01-02T03:04:05.000Z",
@@ -891,7 +891,7 @@ def test_chat_bridge_droid_session_to_bridge_preserves_messages_and_tools():
     assert bridge["source"]["session_id"] == "droid-old", f"source id should come from session_start: {bridge['source']}"
     assert bridge["session"]["title"] == "Droid Old Chat", "title should come from session_start"
     assert bridge["session"]["provider"] == "openai", "providerLock should become bridge provider"
-    assert bridge["session"]["model"] == "custom:NeuroGate-GPT-5.5-1", "Droid model should become bridge model"
+    assert bridge["session"]["model"] == "custom:Stub-GPT-5.5-1", "Droid model should become bridge model"
     assert bridge["work_context"]["current"]["confidence"] == "unknown", "Droid git context should be unknown in v1"
     assert bridge["work_context"]["timeline_complete"] is False, "Droid timeline should be explicitly incomplete"
     assert [m["role"] for m in bridge["messages"][:3]] == ["user", "assistant", "tool"], f"unexpected roles: {bridge['messages']}"
@@ -1024,7 +1024,7 @@ def test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_o
             preserve_timestamps=True,
             pin_old=True,
             old_before_ms=1767225600000,
-            target_provider="NeuroGate_API",
+            target_provider="Stub_API",
             target_model="gpt-5.5",
         )
 
@@ -1044,7 +1044,7 @@ def test_chat_bridge_droid_to_codex_import_creates_consistent_rollout_and_pins_o
         assert meta["payload"]["id"] == row["id"], "rollout session id should match DB id"
         assert meta["payload"]["model_provider"] == row["model_provider"], "provider should match DB"
         assert meta["payload"]["model"] == row["model"], "model should match DB"
-        assert row["model_provider"] == "NeuroGate_API", f"Codex import should use target provider for sidebar visibility: {dict(row)}"
+        assert row["model_provider"] == "Stub_API", f"Codex import should use target provider for sidebar visibility: {dict(row)}"
         assert row["model"] == "gpt-5.5", f"Codex import should use target model: {dict(row)}"
         assert row["created_at_ms"] == 1735787045000, f"created timestamp should be preserved, got {row['created_at_ms']}"
         assert row["updated_at_ms"] == 1735787049000, f"updated timestamp should be preserved, got {row['updated_at_ms']}"
@@ -2297,7 +2297,7 @@ def test_chat_bridge_desktop_compat_session_meta_keeps_target_model():
         "codex-model",
         chat_bridge._ms("2026-05-28T10:00:00Z"),
         chat_bridge._ms("2026-05-28T10:00:01Z"),
-        target_provider="NeuroGate_API",
+        target_provider="Stub_API",
         target_model="gpt-5.5",
         codex_desktop_compat=True,
     )
@@ -2305,7 +2305,7 @@ def test_chat_bridge_desktop_compat_session_meta_keeps_target_model():
     session_meta = events[0]["payload"]
     turn_context = next(event["payload"] for event in events if event.get("type") == "turn_context")
 
-    assert session_meta["model_provider"] == "NeuroGate_API", f"session_meta provider should match active Codex config: {session_meta}"
+    assert session_meta["model_provider"] == "Stub_API", f"session_meta provider should match active Codex config: {session_meta}"
     assert session_meta["model"] == "gpt-5.5", f"session_meta model should match active Codex config so Codex Desktop does not null it: {session_meta}"
     assert turn_context["model"] == "gpt-5.5", f"turn_context model should match session_meta model: {turn_context}"
 
@@ -2658,7 +2658,7 @@ def test_chat_bridge_droid_raw_replay_from_codex_archive_preserves_native_events
             },
         ]
         droid_jsonl.write_text("".join(json.dumps(event) + "\n" for event in raw_events), encoding="utf-8")
-        droid_settings.write_text(json.dumps({"model": "custom:NeuroGate-GPT-5.5-1", "providerLock": "openai"}), encoding="utf-8")
+        droid_settings.write_text(json.dumps({"model": "custom:Stub-GPT-5.5-1", "providerLock": "openai"}), encoding="utf-8")
         droid_bridge = chat_bridge.droid_session_to_bridge(droid_jsonl, droid_settings)
 
         codex_summary = chat_bridge.import_bridge_to_codex(
@@ -2778,7 +2778,7 @@ def test_chat_bridge_droid_thinking_preserves_encrypted_reasoning_for_codex():
             },
         ]
         jsonl_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
-        settings_path.write_text(json.dumps({"model": "custom:NeuroGate-GPT-5.5-1", "providerLock": "openai", "reasoningEffort": "high"}), encoding="utf-8")
+        settings_path.write_text(json.dumps({"model": "custom:Stub-GPT-5.5-1", "providerLock": "openai", "reasoningEffort": "high"}), encoding="utf-8")
 
         bridge = chat_bridge.droid_session_to_bridge(jsonl_path, settings_path)
         reasoning_parts = [part for message in bridge["messages"] for part in message.get("parts", []) if part.get("type") == "reasoning"]
@@ -2820,7 +2820,7 @@ def test_chat_bridge_codex_to_droid_round_trip_preserves_unknown_role_and_source
             "title": "Round Trip Lossless",
             "created_at": "2026-05-28T10:00:00Z",
             "updated_at": "2026-05-28T10:00:03Z",
-            "provider": "NeuroGate_API",
+            "provider": "Stub_API",
             "model": "gpt-5.5",
         },
         "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"cwd": r"C:\Research\nothing", "confidence": "observed"}, "timeline_complete": False, "snapshots": []},
@@ -3123,7 +3123,7 @@ def test_chat_bridge_doctor_treats_canonical_droid_provider_as_equivalent():
     import chat_bridge
 
     codex_bridge = {
-        "session": {"provider": "NeuroGate_API", "model": "gpt-5.5"},
+        "session": {"provider": "Stub_API", "model": "gpt-5.5"},
         "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"git_branch": "", "git_sha": ""}},
         "messages": [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
         "compactions": [],
@@ -3148,14 +3148,14 @@ def test_chat_bridge_doctor_categorizes_expected_format_differences():
     import chat_bridge
 
     codex_bridge = {
-        "session": {"provider": "NeuroGate_API", "model": "gpt-5.5"},
+        "session": {"provider": "Stub_API", "model": "gpt-5.5"},
         "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"git_branch": "feature", "git_sha": "a" * 40}},
         "messages": [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
         "compactions": [],
         "source_events": [],
     }
     droid_bridge = {
-        "session": {"provider": "openai", "model": "custom:NeuroGate-GPT-5.5-1"},
+        "session": {"provider": "openai", "model": "custom:Stub-GPT-5.5-1"},
         "work_context": {"primary_cwd": r"C:\Research\nothing", "current": {"git_branch": "main", "git_sha": "a" * 40}},
         "messages": [{"role": "user", "parts": [{"type": "text", "text": "hello"}]}],
         "compactions": [{"summary_text": "archived"}],
@@ -3924,20 +3924,20 @@ def test_chat_bridge_codex_to_droid_maps_custom_model_settings():
         (factory_home / "settings.json").write_text(json.dumps({
             "customModels": [
                 {
-                    "id": "custom:NeuroGate-GPT-5.5-1",
+                    "id": "custom:Stub-GPT-5.5-1",
                     "model": "gpt-5.5",
-                    "displayName": "NeuroGate GPT-5.5",
+                    "displayName": "Stub GPT-5.5",
                     "provider": "openai",
                     "reasoningEffort": "medium",
                 }
             ],
-            "sessionDefaultSettings": {"model": "custom:NeuroGate-GPT-5.5-1", "reasoningEffort": "medium"},
+            "sessionDefaultSettings": {"model": "custom:Stub-GPT-5.5-1", "reasoningEffort": "medium"},
         }), encoding="utf-8")
 
         summary = chat_bridge.import_bridge_to_droid(bridge, factory_home=factory_home, preserve_timestamps=True)
         settings = json.loads(Path(summary["droid_settings_path"]).read_text(encoding="utf-8"))
 
-    assert settings["model"] == "custom:NeuroGate-GPT-5.5-1", f"Droid session should use matching custom model id: {settings}"
+    assert settings["model"] == "custom:Stub-GPT-5.5-1", f"Droid session should use matching custom model id: {settings}"
     assert settings["providerLock"] == "openai", f"Droid provider lock should use the custom model provider: {settings}"
     assert settings["reasoningEffort"] == "medium", f"Droid reasoning effort should follow the custom model/default: {settings}"
 
@@ -3954,7 +3954,7 @@ def test_chat_bridge_codex_to_droid_maps_profile_provider_to_droid_backend():
             "title": "Profile Provider",
             "created_at": "2026-05-28T10:00:00Z",
             "updated_at": "2026-05-28T10:00:01Z",
-            "provider": "NeuroGate_API",
+            "provider": "Stub_API",
             "model": "gpt-5.5",
             "reasoning_effort": "xhigh",
         },
@@ -4015,7 +4015,6 @@ def test_droid_cli_flags_registered():
     args = parser.parse_args([
         "--droid-models",
         "--droid-doctor",
-        "--droid-add-neurogate",
         "--droid-import-provider", "SavedProv",
         "--droid-use", "custom:model-one",
         "--droid-remove-model", "custom:model-two",
@@ -4025,7 +4024,6 @@ def test_droid_cli_flags_registered():
     ])
     assert args.droid_models is True
     assert args.droid_doctor is True
-    assert args.droid_add_neurogate is True
     assert args.droid_import_provider == "SavedProv"
     assert args.droid_use == "custom:model-one"
     assert args.droid_remove_model == "custom:model-two"
@@ -4832,13 +4830,23 @@ def test_chat_bridge_cli_mirror_apply_stale_droid_source_does_not_backup_and_rec
 def test_droid_history_redacts_key():
     original, tmp_dir = setup_temp_codex_home()
     try:
+        # Seed a saved Codex provider so --droid-import-provider has something to copy.
+        (ct.CODEX_DIR / "config.toml").write_text(
+            'model_provider = "RedactProv"\nmodel = "gpt-5.5"\n\n[model_providers.RedactProv]\nname = "RedactProv"\nbase_url = "https://redact.invalid/v1"\nwire_api = "responses"\n',
+            encoding="utf-8",
+        )
+        (ct.CODEX_DIR / "auth.json").write_text(
+            json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-droid-secret"}),
+            encoding="utf-8",
+        )
+        ct.save_provider("RedactProv")
+
         with tempfile.TemporaryDirectory() as td:
             factory_home = Path(td)
             args = argparse.Namespace(
                 droid_models=False,
                 droid_doctor=False,
-                droid_add_neurogate=True,
-                droid_import_provider=None,
+                droid_import_provider="RedactProv",
                 droid_use=None,
                 droid_remove_model=None,
                 droid_settings=str(factory_home / "settings.json"),
@@ -4858,7 +4866,7 @@ def test_droid_history_redacts_key():
             assert handled is True, "Droid command should short-circuit main flow"
             assert "sk-droid-secret" not in stdout.getvalue(), "CLI output should not print raw keys"
             assert "sk-droid-secret" not in history_raw, "history must not record Droid secrets"
-            assert "droid_model_added" in history_raw, "expected Droid history action"
+            assert "droid_provider_imported" in history_raw, "expected Droid history action"
             assert "sk-droid-secret" in settings_raw, "with-key path should write the requested key to temp settings"
     finally:
         restore_temp_codex_home(original, tmp_dir)
@@ -5056,179 +5064,6 @@ def test_droid_load_factory_context_reports_missing_optional_sources_and_reads_l
         assert legacy["apiKey"] == "${LEGACY_KEY}"
         assert legacy["source"] == "config.json"
         assert ctx_with_legacy["sources"]["legacy_config"].endswith("config.json")
-
-
-def test_droid_add_neurogate_is_idempotent_and_uses_env_key():
-    with tempfile.TemporaryDirectory() as td:
-        home = Path(td)
-        summary1 = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
-        summary2 = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
-        ctx = droid.load_factory_context(home)
-        models = ctx["models"]
-        ids = [model["id"] for model in models]
-
-        assert summary1["added"] == 3, f"first add should create three models: {summary1}"
-        assert summary1["updated"] == 0, f"first add should not count updates for new file: {summary1}"
-        assert summary2["added"] == 0, f"second add should be idempotent: {summary2}"
-        assert summary2["updated"] == 0, f"second add should not rewrite identical models: {summary2}"
-        assert ids == [
-            "custom:NeuroGate-GPT-5.5-1",
-            "custom:NeuroGate-GPT-5.4-2",
-            "custom:NeuroGate-GPT-5.4-Mini-3",
-        ], f"expected the managed NeuroGate models in order: {ids}"
-        expected_payloads = [
-            ("gpt-5.5", "NeuroGate GPT-5.5", 1),
-            ("gpt-5.4", "NeuroGate GPT-5.4", 2),
-            ("gpt-5.4-mini", "NeuroGate GPT-5.4 Mini", 3),
-        ]
-        for model, expected in zip(models, expected_payloads):
-            model_name, display_name, index = expected
-            assert model["model"] == model_name
-            assert model["displayName"] == display_name
-            assert model["baseUrl"] == "https://api.neurogate.space/v1"
-            assert model["provider"] == "openai"
-            assert model["apiKey"] == "${NEUROGATE_API_KEY}"
-            assert model["reasoningEffort"] == "medium"
-            assert model["managed"]
-            assert model["raw"]["index"] == index
-            assert model["raw"]["maxOutputTokens"] == 128000
-            assert model["raw"]["noImageSupport"] is False
-            assert model["raw"]["managedBy"] == droid.MANAGED_BY
-        assert ctx["settings"]["model"] == "custom:NeuroGate-GPT-5.5-1"
-        assert ctx["settings"]["reasoningEffort"] == "medium"
-        assert ctx["settings"]["modelFavorites"] == ids
-        assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:NeuroGate-GPT-5.5-1"
-        assert ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "medium"
-
-        raw = (home / "settings.local.json").read_text(encoding="utf-8")
-        assert "${NEUROGATE_API_KEY}" in raw, "expected env var reference in local settings"
-        assert summary1["backup_path"].exists(), f"backup should be created on first write: {summary1}"
-        assert summary2["backup_path"].exists(), f"backup should be created on repeated write: {summary2}"
-        assert summary1["backup_path"] != summary2["backup_path"], "rapid writes should get unique backups"
-
-
-def test_droid_add_neurogate_preserves_existing_selection_defaults():
-    with tempfile.TemporaryDirectory() as td:
-        home = Path(td)
-        droid.write_local_settings(
-            home,
-            {
-                "model": "custom:keep-me",
-                "reasoningEffort": "low",
-                "sessionDefaultSettings": {
-                    "model": "custom:keep-me",
-                    "reasoningEffort": "low",
-                },
-                "customModels": [
-                    {
-                        "id": "custom:keep-me",
-                        "model": "keep-me",
-                        "displayName": "Keep Me",
-                        "baseUrl": "https://keep.invalid/v1",
-                        "provider": "openai",
-                        "apiKey": "${KEEP_KEY}",
-                    }
-                ],
-            },
-        )
-
-        summary = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
-        ctx = droid.load_factory_context(home)
-
-        assert summary["added"] == 3
-        assert ctx["settings"]["model"] == "custom:keep-me"
-        assert ctx["settings"]["reasoningEffort"] == "low"
-        assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:keep-me"
-        assert ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "low"
-        assert "custom:NeuroGate-GPT-5.5-1" in ctx["settings"]["modelFavorites"]
-
-
-def test_droid_add_neurogate_preserves_base_selection_defaults():
-    with tempfile.TemporaryDirectory() as td:
-        home = Path(td)
-        (home / "settings.json").write_text(
-            json.dumps(
-                {
-                    "model": "custom:base-existing",
-                    "reasoningEffort": "low",
-                    "sessionDefaultSettings": {
-                        "model": "custom:base-existing",
-                        "reasoningEffort": "low",
-                    },
-                    "customModels": [
-                        {
-                            "id": "custom:base-existing",
-                            "model": "base-existing",
-                            "displayName": "Base Existing",
-                            "baseUrl": "https://base.invalid/v1",
-                            "provider": "openai",
-                            "apiKey": "${BASE_KEY}",
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        summary = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
-        ctx = droid.load_factory_context(home)
-        ids = [model["id"] for model in ctx["models"]]
-
-        assert summary["added"] == 3
-        assert ctx["settings"]["model"] == "custom:base-existing"
-        assert ctx["settings"]["reasoningEffort"] == "low"
-        assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:base-existing"
-        assert ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "low"
-        assert "custom:base-existing" in ids, "base custom model should remain effective after local add"
-        assert "custom:NeuroGate-GPT-5.5-1" in ids
-        assert "custom:NeuroGate-GPT-5.5-1" in ctx["settings"]["modelFavorites"]
-
-
-def test_droid_add_neurogate_preserves_base_model_when_local_models_empty():
-    with tempfile.TemporaryDirectory() as td:
-        home = Path(td)
-        (home / "settings.json").write_text(
-            json.dumps(
-                {
-                    "model": "custom:base-existing",
-                    "reasoningEffort": "low",
-                    "modelFavorites": ["custom:base-existing"],
-                    "sessionDefaultSettings": {
-                        "model": "custom:base-existing",
-                        "reasoningEffort": "low",
-                    },
-                    "customModels": [
-                        {
-                            "id": "custom:base-existing",
-                            "model": "base-existing",
-                            "displayName": "Base Existing",
-                            "baseUrl": "https://base.invalid/v1",
-                            "provider": "openai",
-                            "apiKey": "${BASE_KEY}",
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        (home / "settings.local.json").write_text(
-            json.dumps({"customModels": [], "modelFavorites": []}),
-            encoding="utf-8",
-        )
-
-        summary = droid.add_neurogate_models(home, api_key_env="NEUROGATE_API_KEY")
-        ctx = droid.load_factory_context(home)
-        ids = [model["id"] for model in ctx["models"]]
-
-        assert summary["added"] == 3
-        assert ctx["settings"]["model"] == "custom:base-existing"
-        assert ctx["settings"]["reasoningEffort"] == "low"
-        assert ctx["settings"]["sessionDefaultSettings"]["model"] == "custom:base-existing"
-        assert ctx["settings"]["sessionDefaultSettings"]["reasoningEffort"] == "low"
-        assert "custom:base-existing" in ids, "base model should be copied into local before adding NeuroGate"
-        assert "custom:NeuroGate-GPT-5.5-1" in ids
-        assert "custom:base-existing" in ctx["settings"]["modelFavorites"]
-        assert "custom:NeuroGate-GPT-5.5-1" in ctx["settings"]["modelFavorites"]
 
 
 def test_droid_use_model_updates_top_level_and_session_defaults():
@@ -7004,10 +6839,6 @@ if __name__ == "__main__":
     test("droid normalize_current_model supports aliases and rejects invalid rows", test_droid_normalize_current_model_supports_alias_fields_and_invalid_rows)
     test("droid effective settings merges local over base", test_droid_effective_settings_merges_local_over_base)
     test("droid load_factory_context reports missing optional sources and reads legacy config", test_droid_load_factory_context_reports_missing_optional_sources_and_reads_legacy_config)
-    test("droid add_neurogate is idempotent and uses env key", test_droid_add_neurogate_is_idempotent_and_uses_env_key)
-    test("droid add_neurogate preserves existing selection defaults", test_droid_add_neurogate_preserves_existing_selection_defaults)
-    test("droid add_neurogate preserves base selection defaults", test_droid_add_neurogate_preserves_base_selection_defaults)
-    test("droid add_neurogate preserves base model when local models empty", test_droid_add_neurogate_preserves_base_model_when_local_models_empty)
     test("droid use_model updates top-level and session defaults", test_droid_use_model_updates_top_level_and_session_defaults)
     test("droid remove_model only removes local managed model", test_droid_remove_model_only_removes_local_managed_model)
     test("droid remove_model repoints effective base selection", test_droid_remove_model_repoints_effective_base_selection)

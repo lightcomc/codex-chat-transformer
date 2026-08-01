@@ -153,13 +153,12 @@ The tool can also manage Factory Droid custom models/endpoints without rewriting
 ```bash
 python codex_chat_transformer.py --droid-models
 python codex_chat_transformer.py --droid-doctor
-python codex_chat_transformer.py --droid-add-neurogate
-python codex_chat_transformer.py --droid-use custom:NeuroGate-GPT-5.5-1 --set-reasoning medium
 python codex_chat_transformer.py --droid-import-provider OpenRouter --droid-api-key-env OPENROUTER_API_KEY
+python codex_chat_transformer.py --droid-use custom:OpenRouter --set-reasoning medium
 python codex_chat_transformer.py --droid-remove-model custom:OpenRouter
 ```
 
-Droid writes go to `~/.factory/settings.local.json`. Existing `settings.json`, legacy `config.json`, and Factory auth files remain untouched. By default API keys are written as environment variable references such as `${NEUROGATE_API_KEY}`; direct key writes require `--droid-with-key --api-key ...`.
+Droid writes go to `~/.factory/settings.local.json`. Existing `settings.json`, legacy `config.json`, and Factory auth files remain untouched. By default API keys are written as environment variable references such as `${OPENROUTER_API_KEY}`; direct key writes require `--droid-with-key --api-key ...`.
 
 ### Chat Bridge: Codex <-> Droid Sessions [Experimental]
 
@@ -347,7 +346,7 @@ Place a JSON file next to the app — it's auto-detected. If no API key is prese
 
 ```json
 {
-  "name": "NeuroGate API",
+  "name": "My API",
   "model": "gpt-5.5",
   "base_url": "https://api.example.com/v1",
   "wire_api": "responses",

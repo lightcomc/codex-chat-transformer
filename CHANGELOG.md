@@ -38,9 +38,9 @@
 - `--doctor` now reports provider profile health and treats `openai` + `chatgpt` auth as valid without an API key.
 
 ### Factory Droid provider management
-- Added `--droid-models`, `--droid-doctor`, `--droid-add-neurogate`, `--droid-import-provider`, `--droid-use`, and `--droid-remove-model`.
+- Added `--droid-models`, `--droid-doctor`, `--droid-import-provider`, `--droid-use`, and `--droid-remove-model`.
 - Droid writes go to `settings.local.json`; existing `settings.json`, legacy `config.json`, and Factory auth files are left untouched.
-- API keys default to environment variable references such as `${NEUROGATE_API_KEY}`; direct key writes require `--droid-with-key --api-key ...`.
+- API keys default to environment variable references such as `${OPENAI_API_KEY}`; direct key writes require `--droid-with-key --api-key ...`.
 - Droid doctor reports legacy `config.json` model count without failing healthy current `customModels` because legacy BYOK configs can still work.
 
 ### Chat Bridge

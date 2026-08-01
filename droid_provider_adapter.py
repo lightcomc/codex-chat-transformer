@@ -317,31 +317,6 @@ def _next_available_model_id(models, base_model_id, display_name):
         suffix += 1
 
 
-def neurogate_models(api_key_env="NEUROGATE_API_KEY", api_key=None):
-    api_key_value = api_key if api_key is not None else f"${{{api_key_env}}}"
-    models = [
-        ("custom:NeuroGate-GPT-5.5-1", "gpt-5.5", "NeuroGate GPT-5.5", 1),
-        ("custom:NeuroGate-GPT-5.4-2", "gpt-5.4", "NeuroGate GPT-5.4", 2),
-        ("custom:NeuroGate-GPT-5.4-Mini-3", "gpt-5.4-mini", "NeuroGate GPT-5.4 Mini", 3),
-    ]
-    return [
-        {
-            "id": model_id,
-            "model": model_name,
-            "displayName": display_name,
-            "index": index,
-            "baseUrl": "https://api.neurogate.space/v1",
-            "provider": "openai",
-            "apiKey": api_key_value,
-            "maxOutputTokens": 128000,
-            "reasoningEffort": "medium",
-            "noImageSupport": False,
-            "managedBy": MANAGED_BY,
-        }
-        for model_id, model_name, display_name, index in models
-    ]
-
-
 def load_factory_context(factory_home=None, settings_path=None):
     home = Path(factory_home).expanduser().resolve() if factory_home is not None else factory_home_from_settings(settings_path)
     settings_file = Path(settings_path).expanduser().resolve() if settings_path is not None else (home / SETTINGS_NAME)
@@ -378,74 +353,6 @@ def load_factory_context(factory_home=None, settings_path=None):
             "settings_local": str(local_file) if local_file.exists() else "",
             "legacy_config": str(legacy_file) if legacy_file.exists() else "",
         },
-    }
-
-
-def add_neurogate_models(factory_home=None, api_key_env="NEUROGATE_API_KEY", api_key=None):
-    home = Path(factory_home).expanduser().resolve() if factory_home is not None else FACTORY_DIR
-    ctx = load_factory_context(home)
-    _, local_settings = _local_settings(home)
-    local_settings = copy.deepcopy(local_settings or {})
-    custom_models = []
-    for source_model in copy.deepcopy(ctx["base_settings"].get("customModels") or []):
-        if isinstance(source_model, dict):
-            custom_models.append(source_model)
-    for source_model in copy.deepcopy(local_settings.get("customModels") or []):
-        if not isinstance(source_model, dict):
-            continue
-        index = _model_index(custom_models, source_model.get("id"))
-        if index == -1:
-            custom_models.append(source_model)
-        else:
-            custom_models[index] = source_model
-
-    favorites = []
-    for favorite in (ctx["base_settings"].get("modelFavorites") or []):
-        if favorite not in favorites:
-            favorites.append(favorite)
-    for favorite in (local_settings.get("modelFavorites") or []):
-        if favorite not in favorites:
-            favorites.append(favorite)
-    managed_models = neurogate_models(api_key_env=api_key_env, api_key=api_key)
-    added = 0
-    updated = 0
-
-    for model in managed_models:
-        index = _model_index(custom_models, model["id"])
-        if index == -1:
-            custom_models.append(copy.deepcopy(model))
-            added += 1
-        elif custom_models[index] != model:
-            custom_models[index] = copy.deepcopy(model)
-            updated += 1
-
-    model_ids = [model["id"] for model in managed_models]
-    for model_id in model_ids:
-        if model_id not in favorites:
-            favorites.append(model_id)
-
-    local_settings["customModels"] = custom_models
-    local_settings["modelFavorites"] = favorites
-    session_defaults = copy.deepcopy(ctx["settings"].get("sessionDefaultSettings") or {})
-
-    if not ctx["settings"].get("model"):
-        local_settings["model"] = model_ids[0]
-    if not ctx["settings"].get("reasoningEffort"):
-        local_settings["reasoningEffort"] = "medium"
-    if not session_defaults.get("model"):
-        session_defaults["model"] = model_ids[0]
-    if not session_defaults.get("reasoningEffort"):
-        session_defaults["reasoningEffort"] = "medium"
-    if session_defaults:
-        local_settings["sessionDefaultSettings"] = session_defaults
-
-    result = write_local_settings(home, local_settings)
-    return {
-        "added": added,
-        "updated": updated,
-        "models": model_ids,
-        "path": result["path"],
-        "backup_path": result["backup_path"],
     }
 
 
